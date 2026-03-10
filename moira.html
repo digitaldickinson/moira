@@ -1,0 +1,3132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Moira Newsroom System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        .drag-over { border-top: 4px solid #3b82f6 !important; }
+        /* Presenter Script formatting */
+        .script-text { white-space: pre-wrap; line-height: 1.6; }
+        /* OBS Playout tally indicators */
+        .obs-tally-program { box-shadow: 0 0 14px 2px rgba(220, 38, 38, 0.5); border-color: #dc2626 !important; }
+        .obs-tally-preview { box-shadow: 0 0 14px 2px rgba(37, 99, 235, 0.5); border-color: #2563eb !important; }
+    </style>
+</head>
+<body class="bg-gray-50 h-screen flex flex-col overflow-hidden text-slate-800">
+
+    <!-- Discrete UI Containers -->
+    <div id="header-container" class="shrink-0"></div>
+    <div id="main-container" class="flex-1 overflow-auto"></div>
+    <div id="modal-container" class="relative z-50"></div>
+
+    <!-- OBS WebSocket v5.x (loaded as classic script so global is available inside the module) -->
+    <script src="https://cdn.jsdelivr.net/npm/obs-websocket-js@5.0.4/dist/obs-ws.js"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, collection, query, where, onSnapshot, updateDoc, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // ==========================================
+        // 1. CONSTANTS & CONFIGURATION
+        // ==========================================
+        const DEFAULT_FORMATS = ["READ", "WRAP", "VOICER", "CLIP", "OOV", "ULAY", "OOV/CLIP", "ULAY/CLIP", "OVO", "FLOAT", "LIVE"];
+        const DEFAULT_ROLES = ["Producer", "Reporter", "Presenter"];
+        const STALE_LOCK_MS = 1000 * 10; // 10 Seconds
+
+        const INITIAL_META = {
+            order: [], staff: [], formats: DEFAULT_FORMATS, roles: DEFAULT_ROLES,
+            showStartTime: null, activeStoryId: null,
+            isTXMode: false, isRehearsalMode: false,
+            rundownLocked: false, editorStaffId: null,
+            txStartedAt: null, txTargetDuration: null,
+            activeStoryStartedAt: null,
+            isCued: false,
+            txClockTime: '', 
+            rxClockTime: '',
+
+            // --- POSSIBLE AUTOMATION/PLAYOUT META FOR FUTURE MESSING AROUND  ---
+            stagedStoryId: null,    // The ID of the next story that automation should prepare
+            cuedChannel: null,      // Tracks if the media is loaded in 'A' or 'B' playout
+            automationStatus: 'off', // 'off', 'ready', 'playing', or 'error'
+            lastMediaFiredAt: null,  // Timestamp of the last hardware 'Play' command
+            mediaRootOverride: ''    // Optional path for local studio media folders
+        };
+
+        const TAB_ACTIVE = "bg-blue-600 text-white shadow-sm";
+        const TAB_INACTIVE = "text-slate-600 hover:bg-slate-200 hover:text-slate-900";
+
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'moira-default';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        let firebaseConfig = null;
+        try {
+            const savedConfigStr = localStorage.getItem('moira_firebase_config');
+            if (savedConfigStr) firebaseConfig = JSON.parse(savedConfigStr);
+            else if (typeof window.MOIRA_CONFIG !== 'undefined') firebaseConfig = window.MOIRA_CONFIG;
+            else if (typeof __firebase_config !== 'undefined') firebaseConfig = JSON.parse(__firebase_config);
+        } catch(e) { console.error("Config error", e); }
+        
+        let app, auth, db;
+        let txTimerInterval = null;
+
+        // --- OBS WebSocket instance & config ---
+        const obsWs = new OBSWebSocket();
+        let obsConfig = { ip: '127.0.0.1', port: '4455', pass: '', base: '' };
+        let obsTelemetryInterval = null;
+
+        function loadObsConfig() {
+            obsConfig.ip   = localStorage.getItem('OBS_IP')           || '127.0.0.1';
+            obsConfig.port = localStorage.getItem('OBS_PORT')          || '4455';
+            obsConfig.pass = localStorage.getItem('OBS_PASSWORD')      || '';
+            obsConfig.base = localStorage.getItem('OBS_BASE_FOLDER')   || '';
+        }
+
+        function saveObsConfig() {
+            localStorage.setItem('OBS_IP',          document.getElementById('obs-set-ip')?.value   || obsConfig.ip);
+            localStorage.setItem('OBS_PORT',        document.getElementById('obs-set-port')?.value || obsConfig.port);
+            localStorage.setItem('OBS_PASSWORD',    document.getElementById('obs-set-pass')?.value || obsConfig.pass);
+            localStorage.setItem('OBS_BASE_FOLDER', document.getElementById('obs-set-base')?.value || obsConfig.base);
+            loadObsConfig();
+        }
+
+        const getPaths = (id) => ({
+            bulletins: ['artifacts', id, 'public', 'data', 'bulletins'],
+            stories: ['artifacts', id, 'public', 'data', 'rundown_stories']
+        });
+        const paths = getPaths(appId);
+
+        // ==========================================
+        // 2. CENTRAL STATE OBJECT
+        // ==========================================
+        const savedRoomName = localStorage.getItem('moira_room_name') || 'Main';
+        const savedBulletinId = localStorage.getItem('moira_bulletin_id') || 'bulletin-primary';
+
+        let state = {
+            mode: "newsroom", 
+            localMode: true,
+            connectionState: 'offline', 
+            roomDisplayName: savedRoomName,
+            currentBulletinId: savedBulletinId,
+            sessionId: crypto.randomUUID(), 
+            myStaffId: null,
+            meta: { ...INITIAL_META },
+            storiesMap: {},
+            obs: {
+                connected: false,
+                isTaking: false,
+                program: '',   // scene name, e.g. 'VT A'
+                preview: '',
+                deckA: { state: 'STOPPED', cursor: 0, duration: 0, loadedStoryId: null },
+                deckB: { state: 'STOPPED', cursor: 0, duration: 0, loadedStoryId: null },
+                clipQueue: [],  // storyIds with mediaFiles, in rundown order
+                clipIndex: -1,  // index into clipQueue of the clip currently on program deck
+                log: []        // [{ time, type, msg }]
+            },
+            ui: {
+                draggedStoryId: null,
+                inlineEditingId: null,
+                editingStoryId: null,
+                pendingConflict: null,
+                lastScrolledStoryId: null,
+                isStaffModalOpen: false,
+                isSettingsModalOpen: false,
+                settingsTab: 'connection',
+                // Presenter must be INSIDE ui
+                presenter: {
+                    mirrorX: false,
+                    mirrorY: false,
+                    autoScroll: false,
+                    scrollSpeed: 40,
+                    zenMode: false,
+                    fontScale: 1,
+                    lineHeight: 1.6,
+                    focusMode: 'rundown',
+                    pausedByUser: false,
+                    presenterMode: 'autocue',  // 'autocue' | 'presenter'
+                    expandedStoryId: null
+                },
+                showPlayout: true
+            }
+        };
+
+        // Unified Guard Helper
+        const canMutate = () => state.localMode || (!!auth && !!auth.currentUser);
+
+        // ==========================================
+        // 3. STARTUP & FIREBASE INIT
+        // ==========================================
+        async function boot() {
+            state.myStaffId = localStorage.getItem('moira_my_staff_id');
+            if (firebaseConfig) state.connectionState = 'connecting';
+            // Start heartbeat — updates lastSeen every 30s while checked in
+            setInterval(() => {
+                if (state.myStaffId) {
+                    updateStaffInCloud(staff => staff.map(s =>
+                        s.id === state.myStaffId ? { ...s, lastSeen: Date.now() } : s
+                    ));
+                }
+            }, 30000);
+            
+            // Load OBS config and attempt connection
+            loadObsConfig();
+            connectObs();
+            
+            if (firebaseConfig) {
+                try {
+                    app = initializeApp(firebaseConfig);
+                    auth = getAuth(app);
+                    db = getFirestore(app);
+
+                    if (initialAuthToken) await signInWithCustomToken(auth, initialAuthToken);
+                    else await signInAnonymously(auth);
+
+                    onAuthStateChanged(auth, user => {
+                        if (user) {
+                            state.localMode = false;
+                            seedCloudIfEmpty().then(() => setupListeners());
+                        } else {
+                            state.connectionState = 'offline';
+                            render();
+                        }
+                    });
+                } catch (e) {
+                    state.connectionState = 'error';
+                    render();
+                }
+            } else {
+                seedLocalData(); 
+            }
+            bindGlobalEvents();
+        }
+
+       async function switchRoom(newRoomName) {
+            const name = newRoomName.trim() || 'Main';
+            const sanitizedId = name.toLowerCase() === 'main' ? 'bulletin-primary' : 'bulletin-' + name.toLowerCase().replace(/[^a-z0-9]/g, '-');
+            
+            if (state.currentBulletinId === sanitizedId) return;
+
+            if (state.ui.editingStoryId) unlockStory(state.ui.editingStoryId);
+
+            state.roomDisplayName = name;
+            state.currentBulletinId = sanitizedId;
+            state.storiesMap = {};
+            state.meta = { ...INITIAL_META };
+            state.ui.draggedStoryId = null;
+            state.ui.editingStoryId = null;
+            state.ui.pendingConflict = null;
+
+            // Clear identity — myStaffId from old room won't exist in new room
+            state.myStaffId = null;
+            localStorage.removeItem('moira_my_staff_id');
+
+            localStorage.setItem('moira_room_name', name);
+            localStorage.setItem('moira_bulletin_id', sanitizedId);
+
+            // ← render() removed from here — seedLocalData/seedCloudIfEmpty will render
+
+            if (canMutate() && !state.localMode) {
+                await seedCloudIfEmpty();
+                setupListeners();
+            } else if (state.localMode) {
+                seedLocalData();
+            }
+        }
+
+
+        function seedLocalData() {
+            if (!state.localMode) return;
+            // Fix: ensure room-specific data is loaded correctly
+            if (loadLocalState()) {
+                render();
+                return;
+            }
+
+            const localId = crypto.randomUUID();
+            state.storiesMap[localId] = {
+                bulletinId: state.currentBulletinId,
+                slug: "BREAKING NEWS: SYSTEM ONLINE",
+                script: `Good evening, welcome to the Moira Newsroom System.\nYou are currently in the [${state.roomDisplayName}] room in Local Mode.\n\n[CAM 1]\nThis is a demonstration script showing an instruction block.`,
+                format: "OVO",
+                presenterId: "",
+                reporterId: "",
+                mediaFile: "",
+                duration: 15,
+                completed: false,
+                lockedBySession: null,
+                lockedByName: null,
+                lockedAt: null,
+                rev: 1
+            };
+            state.meta = { ...INITIAL_META, order: [localId, 'marker-line'] };
+            render();
+        }
+
+        async function seedCloudIfEmpty() {
+            if (!canMutate() || state.localMode) return;
+            const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const docSnap = await transaction.get(bullRef);
+                    if (docSnap.exists()) return; 
+
+                    const firstStoryId = crypto.randomUUID();
+                    const firstStoryRef = doc(db, ...paths.stories, firstStoryId);
+                    transaction.set(bullRef, { ...INITIAL_META, order: [firstStoryId, 'marker-line'] });
+                    transaction.set(firstStoryRef, {
+                        bulletinId: state.currentBulletinId,
+                        slug: "TOP STORY",
+                        script: `Good evening. Welcome to the news from ${state.roomDisplayName}...`,
+                        format: "OVO",
+                        presenterId: "",
+                        reporterId: "",
+                        mediaFile: "",
+                        duration: 30,
+                        completed: false,
+                        lockedBySession: null,
+                        lockedByName: null,
+                        lockedAt: null,
+                        rev: 1
+                    });
+                });
+            } catch(e) { 
+                console.error("Cloud seed failed", e); 
+                state.connectionState = 'error';
+                render();
+            }
+        }
+
+        // ==========================================
+        // 4. DATA SYNCHRONIZATION
+        // ==========================================
+        let unsubBulletin = null;
+        let unsubStories = null;
+
+        function setupListeners() {
+            if (!canMutate() || state.localMode) return;
+
+            if (unsubBulletin) unsubBulletin();
+            if (unsubStories) unsubStories();
+
+            unsubBulletin = onSnapshot(doc(db, ...paths.bulletins, state.currentBulletinId), 
+                (docSnap) => {
+                    state.connectionState = 'connected';
+                    if (docSnap.exists()) state.meta = { ...INITIAL_META, ...docSnap.data() };
+                    render();
+                },
+                (err) => { state.connectionState = 'error'; render(); }
+            );
+
+            // Scoped listener per current room ID
+            const storiesQuery = query(
+                collection(db, ...paths.stories),
+                where("bulletinId", "==", state.currentBulletinId)
+            );
+
+            unsubStories = onSnapshot(storiesQuery, 
+                (querySnapshot) => {
+                    const newMap = { ...state.storiesMap };
+                    querySnapshot.docChanges().forEach((change) => {
+                        const data = change.doc.data();
+                        if (change.type === "removed") delete newMap[change.doc.id];
+                        else newMap[change.doc.id] = data;
+                    });
+                    state.storiesMap = newMap;
+                    render();
+                },
+                (err) => { state.connectionState = 'error'; render(); }
+            );
+        }
+
+        // ==========================================
+        // 5. CORE ACTIONS (Mutators)
+        // ==========================================
+        async function lockStory(id) {
+            if (!canMutate()) return;
+            const userName = getMyName();
+            const now = Date.now();
+            if (state.localMode) {
+                if (state.storiesMap[id]) {
+                    state.storiesMap[id].lockedBySession = state.sessionId;
+                    state.storiesMap[id].lockedByName = userName;
+                    state.storiesMap[id].lockedAt = now;
+                }
+                render();
+                return;
+            }
+            try {
+                const storyRef = doc(db, ...paths.stories, id);
+                await runTransaction(db, async (transaction) => {
+                    const snap = await transaction.get(storyRef);
+                    if (!snap.exists()) return;
+                    const data = snap.data();
+                    const isStale = data.lockedAt && (now - data.lockedAt > STALE_LOCK_MS);
+                    if (!data.lockedBySession || isStale) {
+                        transaction.update(storyRef, { lockedBySession: state.sessionId, lockedByName: userName, lockedAt: now });
+                    }
+                });
+            } catch(e) { console.error("Lock failed", e); }
+        }
+
+        async function unlockStory(id) {
+            if (!canMutate()) return;
+            const story = state.storiesMap[id];
+            if (!story || story.lockedBySession !== state.sessionId) return;
+
+            if (state.localMode) {
+                if (state.storiesMap[id]) {
+                    state.storiesMap[id].lockedBySession = null;
+                    state.storiesMap[id].lockedByName = null;
+                    state.storiesMap[id].lockedAt = null;
+                }
+                render();
+                return;
+            }
+            try {
+                await updateDoc(doc(db, ...paths.stories, id), { lockedBySession: null, lockedByName: null, lockedAt: null });
+            } catch(e) { console.error("Unlock failed", e); }
+        }
+
+        async function saveStory(id, newData) {
+            if (state.localMode) {
+                newData.rev = (state.storiesMap[id]?.rev || 0) + 1;
+                state.storiesMap[id] = { ...state.storiesMap[id], ...newData };
+                state.ui.editingStoryId = null;
+                render();
+                return;
+            }
+            if (!canMutate()) return;
+            const storyRef = doc(db, ...paths.stories, id);
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const docSnap = await transaction.get(storyRef);
+                    if (!docSnap.exists()) throw "Story missing";
+                    const serverData = docSnap.data();
+                    if (serverData.rev !== newData.rev) {
+                        state.ui.pendingConflict = { storyId: id, serverData, localData: newData };
+                        throw "Revision conflict";
+                    }
+                    newData.rev = serverData.rev + 1;
+                    transaction.update(storyRef, { ...newData, lockedBySession: null, lockedByName: null, lockedAt: null });
+                });
+                state.ui.editingStoryId = null;
+            } catch(e) {
+                if (e === "Revision conflict") render();
+                else console.error("Save failed", e);
+            }
+        }
+
+        async function toggleStoryComplete(id) {
+            if (!canMutate()) return;
+            const current = !!state.storiesMap[id]?.completed;
+            if (state.localMode) {
+                state.storiesMap[id].completed = !current;
+                render();
+                return;
+            }
+            try {
+                await updateDoc(doc(db, ...paths.stories, id), { completed: !current });
+            } catch(e) { console.error("Toggle failed", e); }
+        }
+
+        async function reorderStory(draggedId, targetId) {
+            if (state.localMode) {
+                let order = state.meta.order.filter(id => id !== draggedId);
+                const targetIdx = order.indexOf(targetId);
+                order.splice(targetIdx !== -1 ? targetIdx : order.length, 0, draggedId);
+                state.meta.order = order;
+                render();
+                return;
+            }
+            if (!canMutate()) return;
+            const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const snap = await transaction.get(bullRef);
+                    if (!snap.exists()) return;
+                    let order = snap.data().order.filter(id => id !== draggedId);
+                    const targetIdx = order.indexOf(targetId);
+                    order.splice(targetIdx !== -1 ? targetIdx : order.length, 0, draggedId);
+                    transaction.update(bullRef, { order });
+                });
+            } catch(e) { console.error("Reorder failed", e); }
+        }
+
+        async function updateBulletinMeta(updates) {
+            if (state.localMode) {
+                state.meta = { ...state.meta, ...updates };
+                render();
+                return;
+            }
+            if (!canMutate()) return;
+            try {
+                await updateDoc(doc(db, ...paths.bulletins, state.currentBulletinId), updates);
+            } catch(e) { console.error("Bulletin update failed", e); }
+        }
+
+      async function updateStudioMode(targetMode) {
+            if (!canMutate()) return;
+
+            const order = state.meta.order || [];
+            const markerIdx = order.indexOf('marker-line');
+            const storyIds = markerIdx > -1 ? order.slice(0, markerIdx) : order;
+            const firstStoryId = storyIds[0] || null;
+
+            // Build the active order (no floated stories) for OBS loading
+            const activeOrder = storyIds.filter(id => !state.storiesMap[id]?.isFloated);
+
+            let updates = {
+                isTXMode: false,
+                isRehearsalMode: false,
+                isCued: true,                    // always cued
+                showStartTime: null,
+                txStartedAt: null,
+                txTargetDuration: null,
+                activeStoryStartedAt: null,
+                activeStoryId: firstStoryId      // always default to first story
+            };
+
+            if (targetMode === 'tx' || targetMode === 'rehearsal') {
+                updates.isTXMode = targetMode === 'tx';
+                updates.isRehearsalMode = targetMode === 'rehearsal';
+                updates.showStartTime = Date.now();
+                updates.txStartedAt = Date.now();
+                updates.activeStoryStartedAt = Date.now();
+                updates.txTargetDuration = storyIds.reduce(
+                    (sum, id) => sum + (state.storiesMap[id]?.duration || 0), 0
+                );
+            }
+
+            if (state.localMode) {
+                state.meta = { ...state.meta, ...updates };
+                render();
+            } else {
+                try {
+                    await updateDoc(doc(db, ...paths.bulletins, state.currentBulletinId), updates);
+                } catch(e) { console.error('Mode update failed', e); }
+            }
+
+            // On TX/Rehearsal start, load first two media clips into the decks
+            if (targetMode === 'tx' || targetMode === 'rehearsal') {
+                obsInitialLoad(activeOrder);
+            }
+        }
+
+
+
+
+
+      async function shiftActiveStory(direction) {
+            if (!canMutate()) return;
+            const rawOrder = state.meta.order;
+            const markerIdx = rawOrder.indexOf('marker-line');
+            const activeOrder = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder).filter(id => !state.storiesMap[id]?.isFloated);
+
+            if (activeOrder.length === 0) return;
+
+            let nextId = null;
+            if (!state.meta.activeStoryId) {
+                nextId = direction > 0 ? activeOrder[0] : null;
+            } else {
+                const currentIdx = activeOrder.indexOf(state.meta.activeStoryId);
+                const nextIdx = currentIdx + direction;
+                if (nextIdx >= 0 && nextIdx < activeOrder.length) {
+                    nextId = activeOrder[nextIdx];
+                } else {
+                    nextId = null;
+                }
+            }
+
+            const updates = {
+                activeStoryId: nextId,
+                activeStoryStartedAt: nextId ? Date.now() : null
+            };
+
+            if (state.localMode) {
+                state.meta.activeStoryId = nextId;
+                state.meta.activeStoryStartedAt = updates.activeStoryStartedAt;
+                render();
+            } else {
+                try {
+                    await updateDoc(doc(db, ...paths.bulletins, state.currentBulletinId), updates);
+                } catch(e) { console.error('Shift failed', e); }
+            }
+        }
+
+
+
+        async function addStory() {
+            if (!canMutate()) return;
+
+            const newId = crypto.randomUUID();
+            const newStory = {
+                bulletinId: state.currentBulletinId,
+                slug: "NEW STORY",
+                script: "",
+                format: (state.meta.formats?.[0]) || "READ",
+                presenterId: "",
+                reporterId: "",
+                mediaFile: "",
+                duration: 10,
+                isFloated: false,
+                completed: false,
+                lockedBySession: null,
+                lockedByName: null,
+                lockedAt: null,
+                rev: 1
+            };
+
+            if (state.localMode) {
+                state.storiesMap[newId] = newStory;
+                insertStoryIntoOrder(newId);
+                render();
+                return;
+            }
+
+            const storyRef = doc(db, ...paths.stories, newId);
+            const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const bullDoc = await transaction.get(bullRef);
+                    if (!bullDoc.exists()) throw "Bulletin missing";
+                    
+                    let newOrder = [...(bullDoc.data().order || [])];
+                    const markerIdx = newOrder.indexOf('marker-line');
+                    if (markerIdx > -1) newOrder.splice(markerIdx, 0, newId);
+                    else newOrder.push(newId, 'marker-line');
+
+                    transaction.set(storyRef, newStory);
+                    transaction.update(bullRef, { order: newOrder });
+                });
+            } catch(e) { console.error("Add story failed:", e); }
+        }
+
+        async function toggleFloat(id) {
+            if (!canMutate()) return;
+            const current = !!state.storiesMap[id]?.isFloated;
+            if (state.localMode) {
+                state.storiesMap[id].isFloated = !current;
+                render();
+                return;
+            }
+            try {
+                await updateDoc(doc(db, ...paths.stories, id), { isFloated: !current });
+            } catch(e) { console.error('Float toggle failed', e); }
+        }
+
+
+
+        async function deleteStory(id) {
+            if (!canMutate()) return;
+            if (!confirm("Are you sure you want to delete this story?")) return;
+
+            if (state.localMode) {
+                delete state.storiesMap[id];
+                state.meta.order = state.meta.order.filter(itemId => itemId !== id);
+                render();
+                return;
+            }
+
+            const storyRef = doc(db, ...paths.stories, id);
+            const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const bullDoc = await transaction.get(bullRef);
+                    if (!bullDoc.exists()) return;
+                    let order = bullDoc.data().order.filter(itemId => itemId !== id);
+                    transaction.delete(storyRef);
+                    transaction.update(bullRef, { order });
+                });
+            } catch(e) { console.error("Delete failed:", e); }
+        }
+
+        async function updateStaffInCloud(mutatorFn) {
+            if (state.localMode) {
+                state.meta = { ...state.meta, staff: mutatorFn(state.meta.staff || []) };
+                render();
+                return;
+            }
+            if (!canMutate()) return;
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+                    const docSnap = await transaction.get(bullRef);
+                    if (docSnap.exists()) {
+                        transaction.update(bullRef, { staff: mutatorFn(docSnap.data().staff || []) });
+                    }
+                });
+            } catch(e) { console.error("Staff transaction failed:", e); }
+        }
+
+        // ==========================================
+        // 6. HELPER FUNCTIONS
+        // ==========================================
+        function getMyName() {
+            const me = (state.meta.staff || []).find(s => s.id === state.myStaffId);
+            return me ? `${me.name} (${me.role})` : 'An Anonymous Producer';
+        }
+
+        // Parse "HH:MM:SS" or "HH:MM" into total seconds from midnight
+        function parseClockTime(str) {
+            if (!str) return null;
+            const parts = str.split(':').map(Number);
+            if (parts.some(isNaN)) return null;
+            if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+            if (parts.length === 2) return parts[0] * 3600 + parts[1] * 60;
+            return null;
+        }
+
+        // Format total seconds from midnight as "HH:MM:SS"
+        function formatClockTime(totalSeconds) {
+            const h = Math.floor(totalSeconds / 3600).toString().padStart(2, '0');
+            const m = Math.floor((totalSeconds % 3600) / 60).toString().padStart(2, '0');
+            const s = (totalSeconds % 60).toString().padStart(2, '0');
+            return `${h}:${m}:${s}`;
+        }
+
+
+        function insertStoryIntoOrder(id) {
+            const markerIdx = state.meta.order.indexOf('marker-line');
+            if (markerIdx > -1) state.meta.order.splice(markerIdx, 0, id);
+            else state.meta.order.push(id, 'marker-line');
+        }
+
+        function escapeHTML(str) {
+            if (!str) return '';
+            const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+            return str.toString().replace(/[&<>"']/g, c => map[c]);
+        }
+
+        function formatDuration(seconds) {
+            const m = Math.floor(seconds / 60).toString().padStart(2, '0');
+            const s = (seconds % 60).toString().padStart(2, '0');
+            return `${m}:${s}`;
+        }
+
+        // Parse all [CLIP:m:ss] tags from a script string and return total clip seconds.
+        // e.g. "[CLIP:0:35]" -> 35,  "[CLIP:1:20]" -> 80,  multiple tags are summed.
+        function parseClipTags(script) {
+            if (!script) return 0;
+            let total = 0;
+            const re = /\[CLIP:(\d+):(\d{2})\]/gi;
+            let match;
+            while ((match = re.exec(script)) !== null) {
+                total += parseInt(match[1], 10) * 60 + parseInt(match[2], 10);
+            }
+            return total;
+        }
+
+        function formatPresenterScript(script) {
+            if (!script) return '[ NO SCRIPT CONTENT ]';
+            const escaped = escapeHTML(script);
+            // Convert line breaks to <br> first so layout is preserved
+            const lined = escaped.replace(/\n/g, '<br>');
+            // Replace tags — each gets its own block line with a break before and after,
+            // collapsing any adjacent <br> so we never get double blank lines
+            return lined
+                .replace(/\[CLIP:(\d+):(\d{2})\]/gi,
+                    '<br><span class="bg-amber-500 text-white px-4 py-2 rounded-lg font-black uppercase tracking-widest text-4xl inline-block shadow-sm my-3">$&</span><br>')
+                .replace(/\[(?!CLIP:)(.*?)\]/g,
+                    '<br><span class="bg-slate-200 text-slate-900 px-4 py-2 rounded-lg font-black uppercase tracking-widest text-4xl inline-block shadow-sm my-3">$&</span><br>')
+                // Collapse runs of <br> down to at most two (one blank line)
+                .replace(/(<br>\s*){3,}/g, '<br><br>');
+        }
+
+        function renderStatusBadge(label, icon, colorClass) {
+            return `<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium ${colorClass} ml-1">
+                <i class="fa-solid ${icon}"></i> ${label}
+            </span>`;
+        }
+
+       function saveLocalState() {
+            if (!state.localMode) return;
+            try {
+                const key = `moira_local_room_${state.currentBulletinId}`;
+                const cleanedStoriesMap = {};
+                for (const [id, story] of Object.entries(state.storiesMap)) {
+                    cleanedStoriesMap[id] = {
+                        ...story,
+                        lockedBySession: null,
+                        lockedByName: null,
+                        lockedAt: null
+                    };
+                }
+                localStorage.setItem(key, JSON.stringify({
+                    storiesMap: cleanedStoriesMap,
+                    meta: state.meta
+                }));
+            } catch(e) {}
+        }
+
+
+     function loadLocalState() {
+            const storageKey = `moira_local_room_${state.currentBulletinId}`;
+            try {
+                const str = localStorage.getItem(storageKey);
+                if (!str) return false;
+                const saved = JSON.parse(str);
+                if (saved.storiesMap && saved.meta) {
+                    state.storiesMap = saved.storiesMap;
+                    // Merge saved meta with INITIAL_META to ensure new flags exist
+                    state.meta = { ...INITIAL_META, ...saved.meta };
+                    
+                    // IMPORTANT: If you saved UI state, you must also ensure 
+                    // the 'presenter' object exists in the current session
+                    return true;
+                }
+            } catch(e) {}
+            return false;
+        }
+
+        // ==========================================
+        // 7. RENDERING ENGINE
+        // ==========================================
+        function render() {
+             const mainContainer = document.getElementById('main-container');
+             const savedScroll = mainContainer ? mainContainer.scrollTop : 0;
+
+            // Only re-render header if not in an active timed session
+            // to prevent clock flicker on every render() call
+            const inActiveSession = state.meta.isTXMode || state.meta.isRehearsalMode;
+            document.getElementById('header-container').innerHTML = renderHeader();
+
+            const isZen = state.mode === 'presenter' && state.ui.presenter.zenMode;
+            document.getElementById('header-container').innerHTML = isZen ? '' : renderHeader();
+
+            // Suppress DOM rebuilds while user is actively typing anywhere in the app.
+            // Firestore snapshots arriving mid-keystroke would otherwise wipe inputs.
+            const activeEl = document.activeElement;
+            const userIsTyping = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA') && activeEl.id !== 'header-room-input';
+
+            if (!state.ui.draggedStoryId && !state.ui.inlineEditingId && !userIsTyping) {
+                let mainHtml = '';
+                if (state.mode === 'newsroom') mainHtml = renderNewsroom();
+                else if (state.mode === 'presenter') mainHtml = renderPresenter();
+                else if (state.mode === 'director') mainHtml = renderDirector();
+                document.getElementById('main-container').innerHTML = mainHtml;
+            }
+
+            if (!userIsTyping) {
+                document.getElementById('modal-container').innerHTML = renderModals();
+            }
+
+            // TX Timer housekeeping
+            if ((state.meta.isTXMode || state.meta.isRehearsalMode) && state.meta.txStartedAt) {
+                if (!txTimerInterval) startTXTimer();
+            } else if (txTimerInterval) {
+                clearInterval(txTimerInterval);
+                txTimerInterval = null;
+            }
+            // Immediately repopulate displays after every render to prevent --:-- flash
+            if (state.meta.isTXMode || state.meta.isRehearsalMode) updateClockDisplays();
+
+
+            const newMainContainer = document.getElementById('main-container');
+            if (state.mode === 'presenter' && state.meta.activeStoryId && state.ui.lastScrolledStoryId !== state.meta.activeStoryId) {
+                const activeEl = document.getElementById(`presenter-story-${state.meta.activeStoryId}`);
+                if (activeEl && newMainContainer) {
+                    const containerRect = newMainContainer.getBoundingClientRect();
+                    const elRect = activeEl.getBoundingClientRect();
+                    newMainContainer.scrollTop += elRect.top - containerRect.top;
+                    state.ui.lastScrolledStoryId = state.meta.activeStoryId;
+                }
+            } else if (!state.ui.draggedStoryId && newMainContainer) {
+                newMainContainer.scrollTop = savedScroll;
+            }
+             saveLocalState();
+        }
+
+           function startTXTimer() {
+                updateClockDisplays();
+                txTimerInterval = setInterval(updateClockDisplays, 1000);
+            }
+
+        // ==========================================
+        // OBS PLAYOUT ENGINE
+        // ==========================================
+
+        function obsLog(msg, type = 'info') {
+            const time = new Date().toISOString().split('T')[1].substring(0, 12);
+            state.obs.log.unshift({ time, type, msg });
+            if (state.obs.log.length > 80) state.obs.log.pop();
+            // Patch log DOM directly to avoid full re-render
+            const el = document.getElementById('obs-log-container');
+            if (el) el.innerHTML = renderObsLog();
+        }
+
+        async function connectObs() {
+            try {
+                if (state.obs.connected) {
+                    state.obs.connected = false;
+                    try { await obsWs.disconnect(); } catch(e) {}
+                }
+                await obsWs.connect(`ws://${obsConfig.ip}:${obsConfig.port}`, obsConfig.pass, { rpcVersion: 1 });
+                state.obs.connected = true;
+                obsLog(`Connected to OBS at ws://${obsConfig.ip}:${obsConfig.port}`, 'success');
+                updateObsConnectionBadge();
+                await obsSetupEnvironment();
+                await obsSyncState();
+                startObsTelemetry();
+            } catch(err) {
+                state.obs.connected = false;
+                obsLog(`OBS connection failed: ${err.message}`, 'error');
+                updateObsConnectionBadge();
+                setTimeout(connectObs, 8000);
+            }
+        }
+
+        obsWs.on('ConnectionClosed', () => {
+            if (state.obs.connected) {
+                state.obs.connected = false;
+                obsLog('OBS connection closed unexpectedly. Retrying in 8s...', 'error');
+                updateObsConnectionBadge();
+                setTimeout(connectObs, 8000);
+            }
+        });
+
+        obsWs.on('CurrentProgramSceneChanged', (ev) => {
+            state.obs.program = ev.sceneName;
+            updateObsTallies();
+        });
+
+        obsWs.on('CurrentPreviewSceneChanged', (ev) => {
+            state.obs.preview = ev.sceneName;
+            updateObsTallies();
+        });
+
+        function updateObsConnectionBadge() {
+            const badge = document.getElementById('obs-conn-badge');
+            if (!badge) return;
+            if (state.obs.connected) {
+                badge.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-200';
+                badge.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> OBS Connected';
+            } else {
+                badge.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-red-100 text-red-700 border border-red-200';
+                badge.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span> OBS Offline';
+            }
+        }
+
+        async function obsSetupEnvironment() {
+            try {
+                const modeRes = await obsWs.call('GetStudioModeEnabled');
+                if (!modeRes.studioModeEnabled) {
+                    await obsWs.call('SetStudioModeEnabled', { studioModeEnabled: true });
+                    obsLog('Enabled Studio Mode in OBS', 'success');
+                }
+                const { scenes } = await obsWs.call('GetSceneList');
+                const sceneNames = scenes.map(s => s.sceneName);
+                for (const name of ['VT A', 'VT B', 'Lower Third']) {
+                    if (!sceneNames.includes(name)) {
+                        await obsWs.call('CreateScene', { sceneName: name });
+                        obsLog(`Created OBS scene: ${name}`, 'success');
+                    }
+                }
+                const { inputs } = await obsWs.call('GetInputList');
+                const inputNames = inputs.map(i => i.inputName);
+                const safeSettings = { is_local_file: true, close_when_inactive: false, restart_on_activate: false, clear_on_media_end: false };
+                for (const [scene, inputName] of [['VT A', 'VT A Player'], ['VT B', 'VT B Player']]) {
+                    if (!inputNames.includes(inputName)) {
+                        await obsWs.call('CreateInput', { sceneName: scene, inputName, inputKind: 'ffmpeg_source', inputSettings: safeSettings });
+                        obsLog(`Created OBS input: ${inputName}`, 'success');
+                    } else {
+                        await obsWs.call('SetInputSettings', { inputName, inputSettings: { close_when_inactive: false, restart_on_activate: false, clear_on_media_end: false } });
+                        const { sceneItems } = await obsWs.call('GetSceneItemList', { sceneName: scene });
+                        if (!sceneItems.some(i => i.sourceName === inputName)) {
+                            await obsWs.call('CreateSceneItem', { sceneName: scene, sourceName: inputName });
+                        }
+                    }
+                }
+                // Nest Lower Third into both VT scenes
+                for (const parent of ['VT A', 'VT B']) {
+                    const { sceneItems } = await obsWs.call('GetSceneItemList', { sceneName: parent });
+                    if (!sceneItems.some(i => i.sourceName === 'Lower Third')) {
+                        await obsWs.call('CreateSceneItem', { sceneName: parent, sourceName: 'Lower Third' });
+                        obsLog(`Nested Lower Third into ${parent}`, 'success');
+                    }
+                }
+                // Ensure Lower Third has a text source
+                if (!inputNames.includes('Lower Third Text')) {
+                    try {
+                        await obsWs.call('CreateInput', { sceneName: 'Lower Third', inputName: 'Lower Third Text', inputKind: 'text_gdiplus', inputSettings: { text: 'Standby' } });
+                    } catch(e) {
+                        await obsWs.call('CreateInput', { sceneName: 'Lower Third', inputName: 'Lower Third Text', inputKind: 'text_ft2_source_v2', inputSettings: { text: 'Standby' } });
+                    }
+                    obsLog('Created Lower Third Text source', 'success');
+                }
+                // Auto-route scenes
+                const prog = await obsWs.call('GetCurrentProgramScene');
+                let curProg = prog.sceneName;
+                if (curProg !== 'VT A' && curProg !== 'VT B') {
+                    await obsWs.call('SetCurrentProgramScene', { sceneName: 'VT A' });
+                    curProg = 'VT A';
+                }
+                const expectedPrev = curProg === 'VT A' ? 'VT B' : 'VT A';
+                await obsWs.call('SetCurrentPreviewScene', { sceneName: expectedPrev });
+                obsLog('OBS environment validated and routed.', 'success');
+            } catch(err) {
+                obsLog(`OBS setup error: ${err.message}`, 'error');
+            }
+        }
+
+        async function obsSyncState() {
+            try {
+                const prog = await obsWs.call('GetCurrentProgramScene');
+                const prev = await obsWs.call('GetCurrentPreviewScene');
+                state.obs.program = prog.sceneName;
+                state.obs.preview = prev.sceneName;
+                updateObsTallies();
+            } catch(e) {}
+        }
+
+        function updateObsTallies() {
+            const deckA = document.getElementById('obs-deck-A');
+            const deckB = document.getElementById('obs-deck-B');
+            const lblA  = document.getElementById('obs-tally-label-A');
+            const lblB  = document.getElementById('obs-tally-label-B');
+            if (!deckA || !deckB) return;
+
+            const base = 'bg-white border-2 rounded-xl p-4 flex flex-col gap-3 transition-all duration-300 ';
+            deckA.className = base + (state.obs.program === 'VT A' ? 'obs-tally-program border-red-400' : state.obs.preview === 'VT A' ? 'obs-tally-preview border-blue-400' : 'border-slate-200');
+            deckB.className = base + (state.obs.program === 'VT B' ? 'obs-tally-program border-red-400' : state.obs.preview === 'VT B' ? 'obs-tally-preview border-blue-400' : 'border-slate-200');
+
+            if (lblA) lblA.innerHTML = state.obs.program === 'VT A' ? '<span class="text-red-600 font-black tracking-widest text-xs">PROGRAM</span>' : state.obs.preview === 'VT A' ? '<span class="text-blue-600 font-bold tracking-widest text-xs">PREVIEW</span>' : '<span class="text-slate-400 text-xs">STANDBY</span>';
+            if (lblB) lblB.innerHTML = state.obs.program === 'VT B' ? '<span class="text-red-600 font-black tracking-widest text-xs">PROGRAM</span>' : state.obs.preview === 'VT B' ? '<span class="text-blue-600 font-bold tracking-widest text-xs">PREVIEW</span>' : '<span class="text-slate-400 text-xs">STANDBY</span>';
+        }
+
+        function obsFormatTime(ms) {
+            ms = Math.max(0, parseInt(ms) || 0);
+            if (ms === 0) return '00:00:00';
+            const totalSeconds = Math.floor(ms / 1000);
+            const h = Math.floor(totalSeconds / 3600);
+            const m = Math.floor((totalSeconds % 3600) / 60);
+            const s = totalSeconds % 60;
+            return `${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
+        }
+
+        function startObsTelemetry() {
+            if (obsTelemetryInterval) clearInterval(obsTelemetryInterval);
+            obsTelemetryInterval = setInterval(async () => {
+                if (!state.obs.connected) return;
+                try {
+                    for (const [deck, inputName] of [['A', 'VT A Player'], ['B', 'VT B Player']]) {
+                        const res = await obsWs.call('GetMediaInputStatus', { inputName });
+                        const d = state.obs['deck' + deck];
+                        d.cursor   = res.mediaCursor   || 0;
+                        d.duration = res.mediaDuration || 0;
+                        d.state    = res.mediaState ? res.mediaState.replace('OBS_MEDIA_STATE_', '') : 'UNKNOWN';
+                        updateObsDeckDisplay(deck, d);
+                    }
+                } catch(e) { /* silently drop telemetry errors */ }
+            }, 250);
+        }
+
+        function updateObsDeckDisplay(deck, d) {
+            const timeEl  = document.getElementById('obs-time-'  + deck);
+            const stateEl = document.getElementById('obs-state-' + deck);
+            const durEl   = document.getElementById('obs-dur-'   + deck);
+            if (!timeEl) return;
+
+            const isProgram = (deck === 'A' && state.obs.program === 'VT A') || (deck === 'B' && state.obs.program === 'VT B');
+            const baseClasses = 'font-mono text-lg font-bold px-3 py-1 rounded transition-all ';
+
+            if (isProgram && d.duration > 0) {
+                const remaining = Math.max(0, d.duration - d.cursor);
+                timeEl.innerText = '-' + obsFormatTime(remaining);
+                if (remaining > 0 && remaining <= 10000) {
+                    timeEl.className = baseClasses + 'bg-red-600 text-white animate-pulse';
+                } else if (remaining > 0 && remaining <= 30000) {
+                    timeEl.className = baseClasses + 'bg-yellow-100 text-yellow-800 border border-yellow-400';
+                } else {
+                    timeEl.className = baseClasses + 'bg-red-50 text-red-600';
+                }
+            } else {
+                timeEl.innerText = obsFormatTime(d.cursor);
+                timeEl.className = baseClasses + 'bg-slate-100 text-slate-700';
+            }
+            if (stateEl) stateEl.innerText = d.state;
+            if (durEl)   durEl.innerText   = obsFormatTime(d.duration);
+        }
+
+        async function obsMediaAction(deck, action) {
+            const inputName = deck === 'A' ? 'VT A Player' : 'VT B Player';
+            try {
+                await obsWs.call('TriggerMediaInputAction', { inputName, mediaAction: action });
+            } catch(e) { obsLog(`Media action failed: ${e.message}`, 'error'); }
+        }
+
+        async function obsSetCursor(deck, ms) {
+            const inputName = deck === 'A' ? 'VT A Player' : 'VT B Player';
+            try {
+                await obsWs.call('SetMediaInputCursor', { inputName, mediaCursor: ms });
+            } catch(e) { obsLog(`Cue failed: ${e.message}`, 'error'); }
+        }
+
+        async function obsUpdateL3Text() {
+            const el = document.getElementById('obs-l3-text');
+            if (!el) return;
+            try {
+                await obsWs.call('SetInputSettings', { inputName: 'Lower Third Text', inputSettings: { text: el.value } });
+                obsLog(`L3 text updated: "${el.value}"`, 'success');
+            } catch(e) { obsLog(`L3 text update failed: ${e.message}`, 'error'); }
+        }
+
+        async function obsToggleL3(visible) {
+            try {
+                for (const sceneName of ['VT A', 'VT B']) {
+                    const { sceneItems } = await obsWs.call('GetSceneItemList', { sceneName });
+                    const l3 = sceneItems.find(i => i.sourceName === 'Lower Third');
+                    if (l3) await obsWs.call('SetSceneItemEnabled', { sceneName, sceneItemId: l3.sceneItemId, sceneItemEnabled: visible });
+                }
+                obsLog(`Lower Third ${visible ? 'SHOWN' : 'HIDDEN'}`, 'info');
+            } catch(e) { obsLog(`L3 toggle failed: ${e.message}`, 'error'); }
+        }
+
+        async function obsReconcileL3() {
+            try {
+                const getState = async (sceneName) => {
+                    const { sceneItems } = await obsWs.call('GetSceneItemList', { sceneName });
+                    const l3 = sceneItems.find(i => i.sourceName === 'Lower Third');
+                    return l3 ? l3.sceneItemEnabled : null;
+                };
+                const [stA, stB] = await Promise.all([getState('VT A'), getState('VT B')]);
+                if (stA !== null && stB !== null && stA !== stB) {
+                    obsLog('L3 mismatch detected — forcing hidden as fail-safe.', 'warn');
+                    await obsToggleL3(false);
+                }
+            } catch(e) { obsLog('L3 reconciliation error: ' + e.message, 'error'); }
+        }
+
+        async function obsExecuteTake() {
+            if (!state.obs.connected || state.obs.isTaking) return;
+            state.obs.isTaking = true;
+            const btn = document.getElementById('obs-btn-take');
+            if (btn) btn.disabled = true;
+            obsLog('Initiating Verified Take...', 'info');
+            try {
+                await obsReconcileL3();
+
+                // Capture which deck is outgoing (currently program) BEFORE the transition.
+                // After the take it becomes the free deck we'll load the next clip onto.
+                const outgoingScene  = state.obs.program; // e.g. 'VT A'
+                const outgoingDeck   = outgoingScene === 'VT A' ? 'A' : outgoingScene === 'VT B' ? 'B' : null;
+
+                const isANext        = state.obs.preview === 'VT A';
+                const previewPlayer  = isANext ? 'VT A Player' : 'VT B Player';
+                const programPlayer  = isANext ? 'VT B Player' : 'VT A Player';
+
+                await obsWs.call('TriggerMediaInputAction', { inputName: previewPlayer, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY' });
+
+                let isPlaying = false;
+                for (let i = 0; i < 30; i++) {
+                    const { mediaState } = await obsWs.call('GetMediaInputStatus', { inputName: previewPlayer });
+                    if (mediaState === 'OBS_MEDIA_STATE_PLAYING') { isPlaying = true; break; }
+                    await new Promise(r => setTimeout(r, 100));
+                }
+                if (!isPlaying) throw new Error(`Timeout: ${previewPlayer} did not reach PLAYING state.`);
+
+                obsLog('Playback verified. Applying 250ms pre-roll buffer...', 'info');
+                await new Promise(r => setTimeout(r, 250));
+
+                await obsWs.call('TriggerStudioModeTransition');
+                obsLog('Transition fired.', 'success');
+
+                // Capture queue state BEFORE the setTimeout so we use consistent values.
+                // Deck assignment is fixed by parity (see obsInitialLoad):
+                //   clipIndex 0 was on Deck A, 1 on Deck B, 2 on Deck A, etc.
+                // The clip being taken now is clipIndex+1; the deck that will be
+                // freed (outgoing) is the one that held clipIndex (even=A, odd=B).
+                const queue = state.obs.clipQueue;
+                const takenIndex = state.obs.clipIndex + 1;  // index of clip just taken to air
+                const freeDeck   = takenIndex % 2 === 0 ? 'B' : 'A'; // outgoing deck after this take
+
+                setTimeout(async () => {
+                    try {
+                        await obsWs.call('TriggerMediaInputAction', { inputName: programPlayer, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE' });
+                        await obsWs.call('SetMediaInputCursor', { inputName: programPlayer, mediaCursor: 0 });
+                        obsLog('Outgoing deck cued to 0.', 'info');
+                    } catch(e) {}
+
+                    // Advance queue index and pre-load the clip after next onto the freed deck.
+                    // nextIndex = takenIndex + 2 because takenIndex+1 is already staged
+                    // on the other deck from the previous load cycle.
+                    if (queue && takenIndex < queue.length) {
+                        state.obs.clipIndex = takenIndex;
+                        const nextIndex = takenIndex + 2;
+                        if (nextIndex < queue.length) {
+                            obsLog(`Queue [${takenIndex+1}/${queue.length}] taken. Loading clip ${nextIndex+1} onto Deck ${freeDeck}.`, 'info');
+                            obsLoadDeck(freeDeck, queue[nextIndex]);
+                        } else {
+                            obsLog(`Queue [${takenIndex+1}/${queue.length}] taken. Last clip — no further auto-load.`, 'info');
+                        }
+                    }
+                }, 3000);
+
+            } catch(err) {
+                obsLog(`Verified Take failed: ${err.message}`, 'error');
+            } finally {
+                state.obs.isTaking = false;
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        function renderObsLog() {
+            if (state.obs.log.length === 0) return '<span class="text-slate-400 italic">No OBS events yet.</span>';
+            return state.obs.log.map(e => {
+                const col = e.type === 'error' ? 'text-red-500' : e.type === 'success' ? 'text-emerald-600' : e.type === 'warn' ? 'text-amber-600' : 'text-slate-500';
+                const prefix = e.type === 'error' ? '[ERR]' : e.type === 'success' ? '[OK]' : e.type === 'warn' ? '[WARN]' : '[INFO]';
+                return `<div class="${col}"><span class="text-slate-300 mr-1">${e.time}</span><span class="font-bold mr-1">${prefix}</span>${e.msg}</div>`;
+            }).join('');
+        }
+
+        function renderObsDeck(deck) {
+            const d = state.obs['deck' + deck];
+            const isProgram = (deck === 'A' && state.obs.program === 'VT A') || (deck === 'B' && state.obs.program === 'VT B');
+            const isPreview = (deck === 'A' && state.obs.preview === 'VT A') || (deck === 'B' && state.obs.preview === 'VT B');
+            const tallyLabel = isProgram
+                ? '<span class="text-red-600 font-black tracking-widest text-xs">PROGRAM</span>'
+                : isPreview
+                    ? '<span class="text-blue-600 font-bold tracking-widest text-xs">PREVIEW</span>'
+                    : '<span class="text-slate-400 text-xs">STANDBY</span>';
+            const borderClass = isProgram ? 'obs-tally-program border-red-400' : isPreview ? 'obs-tally-preview border-blue-400' : 'border-slate-200';
+            const timeClass   = 'font-mono text-lg font-bold px-3 py-1 rounded bg-slate-100 text-slate-700 transition-all';
+
+            const loadedStory = d.loadedStoryId ? state.storiesMap[d.loadedStoryId] : null;
+            const labelContent = loadedStory
+                ? `<span class="font-bold text-slate-800 text-sm truncate">${escapeHTML(loadedStory.slug)}</span>
+                   <span class="text-xs text-slate-400 font-mono truncate">${escapeHTML(loadedStory.mediaFile)}</span>`
+                : `<span class="text-slate-400 text-xs italic">No clip loaded</span>`;
+
+            return `
+                <div id="obs-deck-${deck}" class="bg-white border-2 rounded-xl p-4 flex flex-col gap-3 transition-all duration-300 ${borderClass}">
+                    <div class="flex justify-between items-center">
+                        <span class="font-bold text-slate-700 bg-slate-100 px-3 py-1 rounded text-sm font-mono tracking-widest">CLIP ${deck}</span>
+                        <div id="obs-tally-label-${deck}">${tallyLabel}</div>
+                        <div id="obs-time-${deck}" class="${timeClass}">00:00:00</div>
+                    </div>
+                    <div id="obs-deck-label-${deck}" class="flex flex-col gap-0.5 min-w-0 bg-slate-50 border border-slate-100 rounded px-3 py-2">
+                        ${labelContent}
+                    </div>
+
+                    <div class="flex justify-center gap-2">
+                        <button data-obs-action="play"  data-deck="${deck}" class="p-2 rounded border transition-colors bg-green-500 border-green-600 hover:bg-green-400 text-white" title="Play">
+                            <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd"/></svg>
+                        </button>
+                        <button data-obs-action="pause" data-deck="${deck}" class="p-2 rounded border transition-colors bg-amber-400 border-amber-500 hover:bg-amber-300 text-white" title="Pause">
+                            <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"/></svg>
+                        </button>
+                        <button data-obs-action="stop"  data-deck="${deck}" class="p-2 rounded border transition-colors bg-red-500 border-red-600 hover:bg-red-400 text-white" title="Stop">
+                            <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clip-rule="evenodd"/></svg>
+                        </button>
+                        <button data-obs-action="cue"   data-deck="${deck}" class="p-2 rounded border transition-colors bg-blue-500 border-blue-600 hover:bg-blue-400 text-white" title="Cue to 0">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 19l-7-7 7-7m8 14l-7-7 7-7"/></svg>
+                        </button>
+                    </div>
+                    <div class="bg-slate-50 border border-slate-100 rounded px-3 py-1.5 text-xs font-mono text-slate-500 flex justify-between">
+                        <span>State: <span id="obs-state-${deck}" class="text-slate-800 font-bold">${d.state}</span></span>
+                        <span>Dur: <span id="obs-dur-${deck}" class="text-slate-800">${obsFormatTime(d.duration)}</span></span>
+                    </div>
+                </div>`;
+        }
+
+        // Core loader: explicitly target a specific deck letter ('A' or 'B').
+        // No scene-state inference — caller decides which deck.
+        async function obsLoadDeck(deck, storyId) {
+            if (!state.obs.connected) return;
+            if (!deck || !storyId) return;
+            const story = state.storiesMap[storyId];
+            if (!story?.mediaFile) return;
+
+            let base = obsConfig.base.split('\\').join('/');
+            if (base && !base.endsWith('/')) base += '/';
+            const fullPath = base + story.mediaFile;
+            const inputName = deck === 'A' ? 'VT A Player' : 'VT B Player';
+
+            // Update state and deck label immediately so the UI reflects what's loading
+            state.obs['deck' + deck].loadedStoryId = storyId;
+            updateObsDeckLabel(deck);
+
+            obsLog(`Loading "${story.mediaFile}" → Deck ${deck}`, 'info');
+            try {
+                await obsWs.call('SetInputSettings', { inputName, inputSettings: { local_file: fullPath } });
+                await obsWs.call('TriggerMediaInputAction', { inputName, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY' });
+
+                let duration = 0;
+                for (let i = 0; i < 8; i++) {
+                    await new Promise(r => setTimeout(r, 250));
+                    const status = await obsWs.call('GetMediaInputStatus', { inputName });
+                    if (status.mediaDuration > 0) { duration = status.mediaDuration; break; }
+                }
+
+                await obsWs.call('TriggerMediaInputAction', { inputName, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE' });
+                await obsWs.call('SetMediaInputCursor', { inputName, mediaCursor: 0 });
+
+                if (duration > 0) {
+                    obsLog(`Deck ${deck} ready: "${story.mediaFile}" (${obsFormatTime(duration)})`, 'success');
+                } else {
+                    obsLog(`Deck ${deck}: duration timeout — check file path.`, 'warn');
+                }
+            } catch(e) {
+                obsLog(`Load failed for Deck ${deck}: ${e.message}`, 'error');
+            }
+        }
+
+        // Patch the deck's story label in-place without a full re-render
+        function updateObsDeckLabel(deck) {
+            const labelEl = document.getElementById('obs-deck-label-' + deck);
+            if (!labelEl) return;
+            const d = state.obs['deck' + deck];
+            const story = d.loadedStoryId ? state.storiesMap[d.loadedStoryId] : null;
+            if (story) {
+                labelEl.innerHTML = `
+                    <span class="font-bold text-slate-800 text-sm truncate">${escapeHTML(story.slug)}</span>
+                    <span class="text-xs text-slate-400 font-mono truncate">${escapeHTML(story.mediaFile)}</span>`;
+            } else {
+                labelEl.innerHTML = `<span class="text-slate-400 text-xs italic">No clip loaded</span>`;
+            }
+        }
+
+        // Called on TX/Rehearsal start.
+        //
+        // Deck assignment is always fixed:
+        //   queue[0] -> Deck A,  queue[1] -> Deck B,  queue[2] -> Deck A,  etc.
+        //
+        // VT TAKE plays whatever is on the OBS PREVIEW scene, so we route OBS here:
+        //   VT A = preview  (Deck A / clip[0] goes to air on first VT TAKE)
+        //   VT B = program  (Deck B / clip[1] staged, goes to air on second VT TAKE)
+        //
+        // After each take obsExecuteTake loads queue[clipIndex+2] onto the outgoing deck.
+        // clipIndex tracks the last clip taken to air (-1 = nothing taken yet).
+        async function obsInitialLoad(activeOrder) {
+            if (!state.obs.connected) return;
+
+            const queue = activeOrder.filter(id => !!state.storiesMap[id]?.mediaFile);
+            state.obs.clipQueue = queue;
+            state.obs.clipIndex = -1;
+
+            if (queue.length === 0) {
+                obsLog('No media clips found in running order.', 'info');
+                return;
+            }
+
+            // Route OBS: VT A = preview so first VT TAKE plays Deck A (clip[0])
+            try {
+                await obsWs.call('SetCurrentProgramScene', { sceneName: 'VT B' });
+                await obsWs.call('SetCurrentPreviewScene', { sceneName: 'VT A' });
+                state.obs.program = 'VT B';
+                state.obs.preview = 'VT A';
+                updateObsTallies();
+                obsLog('OBS routed: VT A = preview, VT B = program.', 'info');
+            } catch(e) {
+                obsLog(`OBS routing failed: ${e.message}`, 'error');
+                return;
+            }
+
+            obsLog(`Clip queue: ${queue.length} clip(s). Loading...`, 'info');
+            await obsLoadDeck('A', queue[0]);
+            if (queue[1]) await obsLoadDeck('B', queue[1]);
+
+            obsLog(`Ready. Deck A: "${state.storiesMap[queue[0]]?.mediaFile}" | Deck B: "${state.storiesMap[queue[1]]?.mediaFile || 'empty'}"`, 'success');
+        }
+
+        // ==========================================
+        // END OBS PLAYOUT ENGINE
+        // ==========================================
+
+        function renderDirector() {
+            const rawOrder = state.meta.order || [];
+            const markerIdx = rawOrder.indexOf('marker-line');
+            const order = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
+                .filter(id => !state.storiesMap[id]?.isFloated);
+
+            const activeIdx = order.indexOf(state.meta.activeStoryId);
+            const curId = activeIdx > -1 ? state.meta.activeStoryId : order[0] || null;
+            const cur = curId ? state.storiesMap[curId] : null;
+
+            const nxtId = activeIdx > -1 && activeIdx + 1 < order.length ? order[activeIdx + 1] : (activeIdx === -1 && order.length > 1 ? order[1] : null);
+            const nxt = nxtId ? state.storiesMap[nxtId] : null;
+
+            const isLive = state.meta.isTXMode;
+            const isRehearsal = state.meta.isRehearsalMode;
+            const statusBg = isLive ? 'bg-red-600' : isRehearsal ? 'bg-amber-500' : 'bg-slate-700';
+
+            return `
+                <div class="max-w-6xl mx-auto p-6 pb-12 flex flex-col gap-6">
+
+                    <!-- Header -->
+                    <div class="flex justify-between items-center">
+                        <h2 class="text-3xl font-bold text-slate-800"><i class="fa-solid fa-sliders mr-3 text-slate-400"></i>Control Room</h2>
+                        <div class="flex items-center gap-3">
+                            <span id="obs-conn-badge" class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold ${state.obs.connected ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' : 'bg-red-100 text-red-700 border border-red-200'}">
+                                <span class="w-1.5 h-1.5 rounded-full ${state.obs.connected ? 'bg-emerald-500' : 'bg-red-500 animate-pulse'}"></span>
+                                ${state.obs.connected ? 'OBS Connected' : 'OBS Offline'}
+                            </span>
+                            <div class="px-5 py-2 rounded-xl text-white font-black tracking-widest text-sm shadow-lg ${statusBg}">
+                                ${isLive ? 'ON AIR' : isRehearsal ? 'REHEARSAL' : 'STUDIO'}
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Story cards: ON AIR + PREVIEW NEXT -->
+                    <div class="grid grid-cols-2 gap-6">
+                        <div class="bg-white border-2 rounded-2xl flex flex-col overflow-hidden shadow-sm ${isLive ? 'border-red-300' : 'border-slate-200'}">
+                            <div class="${statusBg} text-white font-bold text-lg px-6 py-3 tracking-widest flex justify-between items-center">
+                                <span>ON AIR</span>
+                                ${cur ? `<span class="font-mono bg-black/20 px-2 py-0.5 rounded text-sm">${formatDuration(cur.duration)}</span>` : ''}
+                            </div>
+                            <div class="p-6 flex-1 text-center flex flex-col justify-center min-h-[100px]">
+                                ${cur ? `<h3 class="text-3xl font-black text-slate-800 uppercase">${escapeHTML(cur.slug)}</h3><p class="text-slate-400 italic mt-2 text-sm truncate">${escapeHTML(cur.script?.split('\n')[0] || '')}</p>` : '<span class="text-slate-400">No Active Story</span>'}
+                            </div>
+                        </div>
+                        <div class="bg-white border-2 rounded-2xl flex flex-col overflow-hidden shadow-sm ${!nxt ? 'border-red-800' : 'border-blue-200'}">
+                            <div class="${!nxt ? 'bg-red-900' : 'bg-blue-100'} ${!nxt ? 'text-white' : 'text-blue-800'} font-bold text-lg px-6 py-3 tracking-widest flex justify-between items-center">
+                                <span>${!nxt ? 'END OF PROGRAMME' : 'PREVIEW NEXT'}</span>
+                                ${nxt ? `<span class="font-mono bg-blue-200 px-2 py-0.5 rounded text-sm">${formatDuration(nxt.duration)}</span>` : ''}
+                            </div>
+                            <div class="p-6 flex-1 text-center flex flex-col justify-center min-h-[100px]">
+                                ${nxt ? `<h3 class="text-3xl font-black text-slate-800 uppercase">${escapeHTML(nxt.slug)}</h3>` : '<span class="text-2xl font-black text-red-800 tracking-widest uppercase">Programme End</span>'}
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Clip Playout section -->
+                    <div class="bg-slate-50 border border-slate-200 rounded-2xl p-5">
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="font-bold text-slate-700 tracking-widest text-sm uppercase"><i class="fa-solid fa-film mr-2 text-slate-400"></i>Clip Playout</h3>
+                            <button data-obs-action="reconnect" class="text-xs text-slate-400 hover:text-blue-600 transition-colors font-mono">↺ Reconnect OBS</button>
+                        </div>
+
+                        <!-- Decks + Lower Thirds (collapsible) -->
+                        ${state.ui.showPlayout && state.obs.connected ? `
+                        <div class="grid grid-cols-2 gap-4 mb-4">
+                            ${renderObsDeck('A')}
+                            ${renderObsDeck('B')}
+                        </div>
+                        <div class="flex items-center gap-3 bg-white border border-slate-200 rounded-xl px-4 py-3">
+                            <span class="text-xs font-black uppercase tracking-widest text-slate-500 shrink-0">Lower Third</span>
+                            <input type="text" id="obs-l3-text" placeholder="Enter lower third text..." class="flex-1 border border-slate-200 rounded px-3 py-1.5 text-sm focus:border-blue-400 focus:outline-none">
+                            <button data-obs-action="l3-update" class="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded text-xs font-bold transition-colors">Update</button>
+                            <div class="w-px h-6 bg-slate-200"></div>
+                            <button data-obs-action="l3-show" class="bg-blue-50 text-blue-600 border border-blue-300 hover:bg-blue-600 hover:text-white px-3 py-1.5 rounded text-xs font-bold transition-colors">SHOW</button>
+                            <button data-obs-action="l3-hide" class="bg-red-50 text-red-500 border border-red-300 hover:bg-red-500 hover:text-white px-3 py-1.5 rounded text-xs font-bold transition-colors">HIDE</button>
+                        </div>
+                        <details class="mt-3">
+                            <summary class="text-xs font-bold text-slate-400 uppercase tracking-widest cursor-pointer select-none hover:text-slate-600 transition-colors">OBS System Log</summary>
+                            <div id="obs-log-container" class="mt-2 bg-white border border-slate-200 rounded-lg p-3 font-mono text-xs space-y-0.5 max-h-32 overflow-y-auto">
+                                ${renderObsLog()}
+                            </div>
+                        </details>
+                        ` : ''}
+                    </div>
+
+                    <!-- Take bar -->
+                    <div class="bg-slate-800 rounded-2xl p-6 flex justify-between items-center gap-4 shadow-xl">
+                        <button data-action="undo-take" class="flex-1 py-5 bg-red-600 hover:bg-red-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center"><i class="fa-solid fa-rotate-left mr-2"></i>Previous</button>
+                        <button data-action="take-next" class="flex-1 py-5 bg-green-600 hover:bg-green-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center">Take Next <i class="fa-solid fa-forward-step ml-2"></i></button>
+                        <button id="obs-btn-take" data-obs-action="take" class="flex-1 py-5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-center">&#9654; Take Clip</button>
+                    </div>
+
+                </div>`;
+        }
+
+          function updateClockDisplays() {
+                const el = document.getElementById('tx-timer-display');
+                if (el && state.meta.showStartTime) {
+                    const diff = Math.max(0, Math.floor((Date.now() - state.meta.showStartTime) / 1000));
+                    const m = Math.floor(diff / 60).toString().padStart(2, '0');
+                    const s = (diff % 60).toString().padStart(2, '0');
+                    el.innerText = `${m}:${s}`;
+                }
+
+                const bt = document.getElementById('backtime-display');
+                if (!bt || !state.meta.txStartedAt) return;
+
+                const order = state.meta.order || [];
+                const markerIdx = order.indexOf('marker-line');
+                const cutoff = markerIdx > -1 ? markerIdx : order.length;
+                const activeIdx = order.indexOf(state.meta.activeStoryId);
+
+                // Use TX/RX clock times if both set, otherwise sum all story durations
+                const txSecs = parseClockTime(state.meta.txClockTime);
+                const rxSecs = parseClockTime(state.meta.rxClockTime);
+                const liveTxDuration = (txSecs !== null && rxSecs !== null)
+                    ? (rxSecs - txSecs) * 1000
+                    : order
+                        .slice(0, cutoff)
+                        .filter(id => !state.storiesMap[id]?.isFloated)
+                        .reduce((sum, id) => sum + (state.storiesMap[id]?.duration || 0), 0) * 1000;
+
+                // Time remaining in current story
+                let currentStoryRemaining = 0;
+                if (state.meta.activeStoryId && state.meta.activeStoryStartedAt) {
+                    const currentDuration = (state.storiesMap[state.meta.activeStoryId]?.duration || 0) * 1000;
+                    const elapsedOnStory = Date.now() - state.meta.activeStoryStartedAt;
+                    currentStoryRemaining = Math.max(0, currentDuration - elapsedOnStory);
+                }
+
+                // Remaining stories after active, excluding floated
+                const nextIds = order
+                    .slice(activeIdx > -1 ? activeIdx + 1 : 0, cutoff)
+                    .filter(id => !state.storiesMap[id]?.isFloated);
+                const remainingMs = nextIds.reduce((sum, id) => sum + (state.storiesMap[id]?.duration || 0) * 1000, 0);
+
+                const projectedEnd = Date.now() + currentStoryRemaining + remainingMs;
+                const scheduledEnd = state.meta.txStartedAt + liveTxDuration;
+                const backtimeMs = scheduledEnd - projectedEnd;
+                const isLight = backtimeMs >= 0;
+                const backtimeSecs = Math.round(Math.abs(backtimeMs) / 1000);
+
+                const AMBER_ZONE = 30;
+                let btColour;
+                if (!isLight) btColour = 'text-red-500';                          // overrun — red
+                else if (backtimeSecs <= AMBER_ZONE) btColour = 'text-amber-500'; // tight — amber
+                else btColour = 'text-emerald-500';                               // comfortable — green
+                bt.className = `font-mono text-lg font-bold ${btColour}`;
+                bt.innerText = `${isLight ? '−' : '+'}${formatDuration(backtimeSecs)}`;
+            }
+
+            let lastTimestamp = 0;
+            function autoscrollLoop(timestamp) {
+                if (!lastTimestamp) lastTimestamp = timestamp;
+                const deltaTime = (timestamp - lastTimestamp) / 1000;
+                lastTimestamp = timestamp;
+
+                const container = document.getElementById('main-container');
+                if (state.mode === 'presenter' && state.ui.presenter.autoScroll && !state.ui.presenter.pausedByUser && container) {
+                    // Increment scroll position based on pixels per second
+                    container.scrollTop += state.ui.presenter.scrollSpeed * deltaTime;
+                }
+                requestAnimationFrame(autoscrollLoop);
+            }
+            requestAnimationFrame(autoscrollLoop);
+
+
+
+
+            
+
+
+
+        function renderHeader() {
+            const staffCount = (state.meta.staff || []).length;
+            let statusBanner = `<span class="text-slate-400 font-medium text-sm mr-4">OFF AIR</span>`;
+
+            if (state.meta.isTXMode) {
+                statusBanner = `
+                    <div class="flex items-center gap-3 bg-red-900/10 px-4 py-1.5 rounded-lg border border-red-200 mr-2">
+                        <span class="w-2.5 h-2.5 bg-red-600 rounded-full animate-pulse"></span>
+                        <span class="font-bold text-red-600 tracking-widest text-sm uppercase">TX LIVE</span>
+                        <span id="tx-timer-display" class="font-mono text-red-700 font-bold ml-2">00:00</span>
+                        <span class="text-slate-300 mx-1">|</span>
+                        <span class="text-xs text-slate-500 uppercase tracking-wide">BT</span>
+                        <span id="backtime-display" class="font-mono text-lg font-bold text-slate-400">--:--</span>
+                    </div>`;
+            } else if (state.meta.isRehearsalMode) {
+                statusBanner = `
+                    <div class="flex items-center gap-3 bg-amber-900/10 px-4 py-1.5 rounded-lg border border-amber-200 mr-2 shadow-inner">
+                        <span class="w-2.5 h-2.5 bg-amber-500 rounded-full shadow-[0_0_8px_#f59e0b]"></span>
+                        <span class="font-bold text-amber-600 tracking-widest text-sm uppercase">REHEARSAL</span>
+                        <span id="tx-timer-display" class="font-mono text-amber-700 font-bold ml-2">00:00</span>
+                        <span class="text-slate-300 mx-1">|</span>
+                        <span class="text-xs text-slate-500 uppercase tracking-wide">BT</span>
+                        <span id="backtime-display" class="font-mono text-lg font-bold text-slate-400">--:--</span>
+                    </div>`;
+            }
+
+
+            let connectionBadge = '';
+            if (state.connectionState === 'connecting') connectionBadge = renderStatusBadge('Connecting', 'fa-circle-notch fa-spin', 'bg-blue-100 text-blue-800 border border-blue-200');
+            else if (state.connectionState === 'connected') connectionBadge = renderStatusBadge('Synced', 'fa-cloud-arrow-up', 'bg-emerald-100 text-emerald-800 border border-emerald-200');
+            else if (state.connectionState === 'error') connectionBadge = renderStatusBadge('Sync Error', 'fa-triangle-exclamation', 'bg-red-100 text-red-800 border border-red-200');
+            else connectionBadge = renderStatusBadge('Local Mode', 'fa-hard-drive', 'bg-amber-100 text-amber-800 border border-amber-200');
+
+            return `
+                <div class="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
+                    <div class="flex items-center gap-4">
+                        <h1 class="text-xl font-bold tracking-tight text-slate-800"><i class="fa-solid fa-satellite-dish text-blue-500 mr-2"></i>Moira</h1>
+                        <div class="flex bg-slate-100 p-1 rounded-lg ml-4">
+                            <button data-action="set-mode" data-val="newsroom" class="px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${state.mode === 'newsroom' ? TAB_ACTIVE : TAB_INACTIVE}">Newsroom</button>
+                            <button data-action="set-mode" data-val="presenter" class="px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${state.mode === 'presenter' ? TAB_ACTIVE : TAB_INACTIVE}">${state.mode === 'presenter' ? (state.ui.presenter.presenterMode === 'autocue' ? 'Autocue' : 'Presenter') : 'Presenter'}</button>
+                            <button data-action="set-mode" data-val="director" class="px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${state.mode === 'director' ? TAB_ACTIVE : TAB_INACTIVE}">Studio</button>
+                        </div>
+                        <button data-action="open-staff-modal" class="ml-2 flex items-center px-3 py-1.5 rounded-md text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-blue-600 transition-colors">
+                            <i class="fa-solid fa-users mr-1"></i> Staff ${staffCount > 0 ? `<span class="ml-1.5 bg-blue-100 text-blue-700 text-[10px] font-bold px-1.5 py-0.5 rounded-full">${staffCount}</span>` : ''}
+                        </button>
+                        ${(()=>{
+                            const me = (state.meta.staff||[]).find(s=>s.id===state.myStaffId);
+                            const isEditor = state.meta.editorStaffId === state.myStaffId;
+                            const locked = state.meta.rundownLocked;
+                            if (!me) return `<span class="text-xs text-slate-400 italic px-2">Not checked in</span>`;
+                            return `<span class="flex items-center gap-1.5 bg-blue-50 border border-blue-200 text-blue-800 px-3 py-1 rounded-full text-xs font-bold">
+                                <span class="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_4px_#10b981]"></span>
+                                ${escapeHTML(me.name)}
+                                <span class="opacity-60 font-normal">${escapeHTML(me.role)}</span>
+                                ${isEditor ? `<span class="ml-1 bg-amber-400 text-amber-900 px-1.5 py-0.5 rounded text-[10px] font-black uppercase tracking-wide">Editor</span>` : ''}
+                            </span>
+`;
+                        })()}
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <div class="flex items-center bg-slate-100 p-1 rounded-lg border border-slate-200 mr-2">
+                            <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-2">Newsroom</span>
+                            <input type="text" id="header-room-input" value="${escapeHTML(state.roomDisplayName)}" class="bg-white border border-slate-300 rounded px-2 py-1 text-sm font-bold text-slate-800 w-24 outline-none focus:border-blue-500">
+                            <button data-action="join-room" class="ml-1 bg-slate-800 hover:bg-slate-700 text-white px-2 py-1 rounded text-sm font-medium transition-colors shadow-sm">Join</button>
+                        </div>
+                        <div class="flex items-center border-r border-slate-200 pr-4 mr-1">
+                            ${statusBanner}
+                            <button data-action="header-tx-toggle" class="px-4 py-1.5 rounded-md text-sm font-bold shadow-sm transition-colors ${state.meta.isTXMode ? 'bg-slate-800 text-white hover:bg-slate-700' : state.meta.isRehearsalMode ? 'bg-amber-500 text-white hover:bg-amber-600' : 'bg-red-50 text-red-600 border border-red-200 hover:bg-red-100'}">
+                                ${state.meta.isTXMode ? 'End TX' : state.meta.isRehearsalMode ? 'End Rehearsal' : 'Start TX'}
+                            </button>
+                        </div>
+                        <button data-action="open-settings-modal" class="text-slate-400 hover:text-slate-600 transition-colors ml-1" title="System Settings"><i class="fa-solid fa-gear text-lg"></i></button>
+                        ${connectionBadge}
+                    </div>
+                </div>`;
+        }
+
+
+        function renderNewsroom() {
+            let totalDuration = 0;
+            let isBelowLine = false;
+
+            // Calculate per-story clock times if TX time is set
+            const txSecs = parseClockTime(state.meta.txClockTime);
+            const rxSecs = parseClockTime(state.meta.rxClockTime);
+            let runningOffset = 0;
+            const storyStartTimes = {};
+            (state.meta.order || []).forEach(id => {
+                if (id === 'marker-line') return;
+                const story = state.storiesMap[id];
+                if (!story) return;
+                storyStartTimes[id] = runningOffset;
+                if (!story.isFloated) runningOffset += story.duration || 0;
+            });
+
+            const isRundownLocked = state.meta.rundownLocked && state.meta.editorStaffId !== state.myStaffId;
+            const isEditor = state.meta.editorStaffId === state.myStaffId;
+            const editorName = (state.meta.staff||[]).find(s=>s.id===state.meta.editorStaffId)?.name || 'Editor';
+
+            const rows = (state.meta.order || []).map(id => {
+                if (id === 'marker-line') {
+                    isBelowLine = true;
+                    return `<tr class="bg-red-50 border-y-4 border-red-200 shadow-inner" data-story-id="${id}" draggable="true">
+                        <td class="px-4 py-3 text-center text-red-400 cursor-grab active:cursor-grabbing w-10 bg-red-100 hover:text-red-500 transition-colors"><i class="fa-solid fa-grip-lines"></i></td>
+                        <td colspan="9" class="px-4 py-3"><span class="text-sm font-black tracking-widest uppercase text-red-900"><i class="fa-solid fa-arrow-down text-red-500 mr-2"></i> End of programme</span></td>
+                    </tr>`;
+                }
+                const story = state.storiesMap[id];
+                if (!story) return '';
+                if (!isBelowLine && !story.isFloated) totalDuration += story.duration || 0;
+                const isActive = state.meta.activeStoryId === id && (state.meta.isTXMode || state.meta.isRehearsalMode);
+                const isComplete = story.completed;
+                const isLocked = story.lockedBySession && story.lockedBySession !== state.sessionId;
+
+                let rowClasses = 'border-b border-slate-200 transition-colors ';
+                if (isBelowLine) rowClasses += 'bg-slate-100 opacity-80 ';
+                else if (isActive) rowClasses += state.meta.isTXMode ? 'bg-red-50 border-l-4 border-l-red-500 ' : 'bg-amber-50 border-l-4 border-l-amber-500 ';
+                else if (isComplete) rowClasses += 'opacity-60 bg-gray-50 ';
+                else if (story.mediaFile) rowClasses += 'bg-yellow-50 hover:bg-yellow-100 ';
+                else rowClasses += 'bg-white hover:bg-slate-50 ';
+                if (story.isFloated && !isBelowLine) rowClasses += 'opacity-50 ';
+
+                const pres = (state.meta.staff || []).find(s => s.id === story.presenterId)?.name || '';
+                const rep = (state.meta.staff || []).find(s => s.id === story.reporterId)?.name || '';
+
+                // Clock time for this story
+                let clockCell = '<td class="px-3 py-1.5 text-xs font-mono text-slate-400 w-20">--:--:--</td>';
+                if (!isBelowLine && txSecs !== null && !story.isFloated) {
+                    const storyClock = txSecs + (storyStartTimes[id] || 0);
+                    clockCell = `<td class="px-3 py-1.5 text-xs font-mono text-slate-600 w-20 font-bold">${formatClockTime(storyClock)}</td>`;
+                } else if (!isBelowLine && story.isFloated) {
+                    clockCell = `<td class="px-3 py-1.5 text-xs font-mono text-slate-300 w-20 line-through">floated</td>`;
+                }
+
+                return `<tr class="${rowClasses}" data-story-id="${id}" draggable="true">
+                    <td class="px-3 py-1.5 text-center w-10 ${isRundownLocked ? 'text-slate-200 cursor-not-allowed' : 'text-slate-400 cursor-grab active:cursor-grabbing hover:text-blue-500'}"><i class="fa-solid fa-grip-vertical"></i></td>
+                    <td class="px-3 py-1.5 font-semibold w-1/4">
+                        ${isActive ? `<span class="inline-block w-2 h-2 ${state.meta.isTXMode ? 'bg-red-500' : 'bg-amber-400'} rounded-full animate-pulse mr-2"></span>` : ''}
+                        ${story.mediaFile ? '<i class="fa-solid fa-photo-film text-amber-500 mr-2"></i>' : ''}
+                        <span data-action="inline-edit-slug" data-id="${id}" class="inline-block cursor-text hover:bg-slate-100/50 px-1 -mx-1 rounded transition-colors" title="Click to edit slug in place">
+                            ${escapeHTML(story.slug)}
+                        </span>
+                        ${isLocked ? '<i class="fa-solid fa-lock text-red-500 ml-2"></i>' : ''}
+                        ${story.isFloated ? `<span class="ml-2 text-[10px] font-bold bg-amber-100 text-amber-700 border border-amber-200 px-1.5 py-0.5 rounded uppercase tracking-wide">Floated</span>` : ''}
+                    </td>
+                    <td class="px-3 py-1.5 text-sm w-24"><span class="bg-slate-100 border px-2 py-0.5 rounded text-xs font-mono font-bold">${escapeHTML(story.format)}</span></td>
+                    <td class="px-3 py-1.5 w-32"><div class="text-xs font-bold text-blue-700">${escapeHTML(pres)}</div><div class="text-xs text-slate-600">${escapeHTML(rep)}</div></td>
+                    <td class="px-3 py-1.5 text-sm w-24 font-mono">${story.isFloated ? `<span class="line-through text-slate-400">${formatDuration(story.duration)}</span>` : formatDuration(story.duration)}</td>
+                    ${clockCell}
+                    <td class="px-3 py-1.5 text-sm italic truncate max-w-xs">${escapeHTML(story.script || 'No script...')}</td>
+                    <td class="px-3 py-1.5 text-center w-16">
+                        <button data-action="toggle-complete" data-id="${id}" class="text-lg ${isComplete ? 'text-emerald-500' : 'text-slate-300'} transition-colors">
+                            <i class="fa-solid fa-circle-check"></i>
+                        </button>
+                    </td>
+                    <td class="px-3 py-1.5 text-center w-16">
+                        <button data-action="toggle-float" data-id="${id}" class="text-lg ${story.isFloated ? 'text-amber-500' : 'text-slate-300'} transition-colors" title="${story.isFloated ? 'Un-float story' : 'Float story'}">
+                            <i class="fa-solid fa-circle-pause"></i>
+                        </button>
+                    </td>
+                    <td class="px-3 py-1.5 text-right w-20">
+                        <button data-action="edit-story" data-id="${id}" class="p-1.5 text-slate-400 hover:text-blue-600"><i class="fa-solid fa-pen text-xs"></i></button>
+                        ${!isRundownLocked ? `<button data-action="delete-story" data-id="${id}" class="p-1.5 text-slate-400 hover:text-red-600"><i class="fa-solid fa-trash text-xs"></i></button>` : ''}
+                    </td>
+                </tr>`;
+            }).join('');
+
+            // TX/RX bar
+            const txRxBar = `
+                <div class="flex items-center gap-6 bg-slate-100 border border-slate-200 text-slate-700 px-6 py-3 rounded-xl mb-4">
+                    <span class="text-xs font-black uppercase tracking-widest text-slate-400">Timing</span>
+                    <div class="flex items-center gap-2">
+                        <label class="text-xs font-bold uppercase tracking-wide text-slate-500">TX</label>
+                        <input type="text" id="tx-clock-input" value="${escapeHTML(state.meta.txClockTime || '')}" 
+                            placeholder="18:00:00"
+                            class="bg-white border border-slate-300 rounded px-3 py-1.5 text-sm font-mono text-slate-800 w-28 outline-none focus:border-blue-400 placeholder-slate-400">
+                        <button data-action="save-tx-time" class="bg-white hover:bg-slate-200 border border-slate-300 text-slate-700 px-3 py-1.5 rounded text-xs font-bold transition-colors">Set</button>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <label class="text-xs font-bold uppercase tracking-wide text-slate-500">RX</label>
+                        <input type="text" id="rx-clock-input" value="${escapeHTML(state.meta.rxClockTime || '')}" 
+                            placeholder="18:28:30"
+                            class="bg-white border border-slate-300 rounded px-3 py-1.5 text-sm font-mono text-slate-800 w-28 outline-none focus:border-blue-400 placeholder-slate-400">
+                        <button data-action="save-rx-time" class="bg-white hover:bg-slate-200 border border-slate-300 text-slate-700 px-3 py-1.5 rounded text-xs font-bold transition-colors">Set</button>
+                    </div>
+                    ${txSecs !== null && rxSecs !== null ? `
+                        <div class="ml-4 flex items-center gap-2 border-l border-slate-300 pl-4">
+                            <span class="text-xs text-slate-500 uppercase tracking-wide">Programme</span>
+                            <span class="font-mono font-bold text-slate-800">${formatDuration(rxSecs - txSecs)}</span>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <span class="text-xs text-slate-500 uppercase tracking-wide">TRT</span>
+                            ${(()=>{
+                                const progSecs = rxSecs - txSecs;
+                                const diff = totalDuration - progSecs;
+                                const absDiff = Math.abs(diff);
+                                const colour = diff > 0 ? 'text-red-500' : absDiff <= 30 ? 'text-amber-500' : 'text-emerald-600';
+                                const sign = diff > 0 ? '+' : '−';
+                                const label = diff === 0 ? formatDuration(totalDuration) : `${formatDuration(totalDuration)} <span class="text-sm font-normal">(${sign}${formatDuration(absDiff)})</span>`;
+                                return `<span class="font-mono font-bold ${colour}">${label}</span>`;
+                            })()}
+                        </div>
+                    ` : ''}
+                    <div class="ml-auto flex items-center gap-2">
+                        ${state.meta.rundownLocked ? `<span class="flex items-center gap-1.5 text-xs font-bold px-2.5 py-1 rounded-full border ${isEditor ? 'bg-amber-50 border-amber-300 text-amber-700' : 'bg-red-50 border-red-200 text-red-600'}"><i class="fa-solid fa-lock text-xs"></i> ${isEditor ? 'You locked this' : `Locked by ${escapeHTML(editorName)}`}</span>` : ''}
+                        ${isEditor ? `<button data-action="toggle-rundown-lock" class="flex items-center gap-1.5 text-xs font-bold px-2.5 py-1.5 rounded-lg border transition-colors ${state.meta.rundownLocked ? 'bg-red-100 text-red-700 border-red-200 hover:bg-red-200' : 'bg-white text-slate-500 border-slate-300 hover:border-slate-400 hover:text-slate-700'}"><i class="fa-solid ${state.meta.rundownLocked ? 'fa-lock-open' : 'fa-lock'}"></i> ${state.meta.rundownLocked ? 'Unlock' : 'Lock'}</button>` : ''}
+                    </div>
+                </div>`;
+
+
+            return `<div class="max-w-7xl mx-auto p-6 pb-24">
+                <div class="flex justify-between items-end mb-4">
+                    <div class="flex items-center gap-3">
+                        <h2 class="text-2xl font-bold text-slate-800">Rundown</h2>
+                    </div>
+                    <div class="flex items-center gap-4">
+                        ${txSecs === null || rxSecs === null ? `<div class="text-sm font-medium text-slate-500">Total TRT: <span class="text-slate-800 font-mono text-lg bg-slate-200 px-2 py-1 rounded ml-1">${formatDuration(totalDuration)}</span></div>` : ''}
+                        <button data-action="add-story" ${isRundownLocked ? 'disabled title="Rundown is locked"' : ''} class="${isRundownLocked ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white'} px-5 py-2.5 rounded-lg font-medium transition-colors shadow-sm"><i class="fa-solid fa-plus mr-2"></i>Add Story</button>
+                        <button data-action="print-scripts" class="bg-slate-600 hover:bg-slate-700 text-white px-5 py-2.5 rounded-lg font-medium transition-colors shadow-sm">
+    <i class="fa-solid fa-print mr-2"></i>Print Scripts
+</button>
+
+                    </div>
+                </div>
+                ${txRxBar}
+                <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-slate-50 border-b border-slate-200 text-xs uppercase tracking-wider text-slate-500">
+                                <th class="px-4 py-3 w-10 text-center"><i class="fa-solid fa-arrows-up-down"></i></th>
+                                <th class="px-4 py-3">Slug</th>
+                                <th class="px-4 py-3">Fmt</th>
+                                <th class="px-4 py-3">Staff</th>
+                                <th class="px-4 py-3">Dur</th>
+                                <th class="px-4 py-3">Clock</th>
+                                <th class="px-4 py-3">Preview</th>
+                                <th class="px-4 py-3 text-center">Done</th>
+                                <th class="px-4 py-3 text-center">Float</th>
+                                <th class="px-4 py-3 text-right">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="rundown-table-body">
+                            ${rows}
+                            <tr data-story-id="end-of-list" class="h-16 bg-transparent"><td colspan="10"></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>`;
+        }
+
+
+
+
+       function renderPresenter() {
+            const rawOrder = state.meta.order || [];
+            const markerIdx = rawOrder.indexOf('marker-line');
+            const storyIds = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
+                .filter(id => !state.storiesMap[id]?.isFloated);
+
+            if (storyIds.length === 0) {
+                return `<div class="flex h-full items-center justify-center bg-black text-slate-600 text-3xl font-light">Standing By...</div>`;
+            }
+
+            const pm = state.ui.presenter;
+            const isLive = state.meta.isTXMode;
+            const isRehearsal = state.meta.isRehearsalMode;
+
+            if (pm.presenterMode === 'autocue') {
+                return renderAutocue(storyIds);
+            } else {
+                return renderPresenterCards(storyIds);
+            }
+        }
+
+        // ── AUTOCUE MODE ─────────────────────────────────────────────────────
+        function renderAutocue(storyIds) {
+            const pm = state.ui.presenter;
+            const fontSize = Math.round(48 * pm.fontScale);
+            const scaleX = pm.mirrorX ? -1 : 1;
+            const scaleY = pm.mirrorY ? -1 : 1;
+            const transformStyle = `transform: scale(${scaleX}, ${scaleY}); transform-origin: center top;`;
+            const isLive = state.meta.isTXMode;
+            const isRehearsal = state.meta.isRehearsalMode;
+            const activeColour = isLive ? '#ef4444' : isRehearsal ? '#f59e0b' : '#3b82f6';
+
+            const storiesHtml = storyIds.map(id => {
+                const story = state.storiesMap[id];
+                if (!story) return '';
+                const isActive = state.meta.activeStoryId === id;
+                const clipSecs = parseClipTags(story.script);
+
+                return `
+                    <div id="presenter-story-${id}" class="mb-16">
+                        <div style="background:${isActive ? activeColour : '#1e293b'}; transition: background 0.4s;"
+                            class="w-full px-6 py-3 flex items-center gap-4 rounded-lg mb-6">
+                            <span class="text-white font-black text-lg tracking-widest uppercase opacity-60">${escapeHTML(story.format)}</span>
+                            <span class="text-white font-black text-2xl tracking-widest uppercase">${escapeHTML(story.slug)}</span>
+                            <span class="ml-auto text-white opacity-60 text-sm font-mono">${formatDuration(story.duration)}${clipSecs > 0 ? ' +' + formatDuration(clipSecs) + ' clip' : ''}</span>
+                        </div>
+                        <div style="font-size:${fontSize}px; line-height:1.7; opacity:${isActive ? 1 : 0.25}; transition: opacity 0.4s;"
+                            class="text-white font-medium tracking-wide">
+                            ${formatPresenterScript(story.script)}
+                        </div>
+                    </div>`;
+            }).join('');
+
+            // Controls bar — fixed at bottom
+            const speed = pm.scrollSpeed;
+            const activeIdx = storyIds.indexOf(state.meta.activeStoryId);
+            const atFirst = activeIdx <= 0;
+            const atLast = activeIdx === storyIds.length - 1;
+            const btnNav = 'px-4 py-2 rounded font-black text-sm tracking-widest transition-colors';
+            const btnNavOn = `${btnNav} bg-slate-700 hover:bg-slate-600 text-white`;
+            const btnNavOff = `${btnNav} bg-slate-900 text-slate-700 cursor-not-allowed`;
+
+            const controlsBar = `
+                <div class="fixed bottom-0 left-0 right-0 z-50 flex items-center justify-between px-6 py-3 bg-black/80 backdrop-blur-sm border-t border-slate-800">
+                    <div class="flex items-center gap-3">
+                        <span class="text-slate-500 text-xs font-bold uppercase tracking-widest">Size</span>
+                        <button data-action="presenter-font-down" class="w-8 h-8 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">−</button>
+                        <span class="text-white text-xs font-mono w-8 text-center">${fontSize}</span>
+                        <button data-action="presenter-font-up" class="w-8 h-8 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">+</button>
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <button data-action="presenter-story-prev" ${atFirst ? 'disabled' : ''} class="${atFirst ? btnNavOff : btnNavOn}">◀ Prev</button>
+                        <button data-action="presenter-scroll-toggle"
+                            class="px-6 py-2 rounded font-black text-sm tracking-widest transition-colors ${pm.autoScroll ? 'bg-white text-black hover:bg-slate-200' : 'bg-slate-700 text-white hover:bg-slate-600'}">
+                            ${pm.autoScroll ? '⏸ PAUSE' : '▶ SCROLL'}
+                        </button>
+                        <button data-action="presenter-story-next" ${atLast ? 'disabled' : ''} class="${atLast ? btnNavOff : btnNavOn}">Next ▶</button>
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <span class="text-slate-500 text-xs font-bold uppercase tracking-widest">Speed</span>
+                        <button data-action="presenter-speed-down" class="w-8 h-8 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">−</button>
+                        <span class="text-white text-xs font-mono w-8 text-center">${speed}</span>
+                        <button data-action="presenter-speed-up" class="w-8 h-8 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">+</button>
+                    </div>
+                </div>`;
+
+            return `
+                <div class="bg-black min-h-full overflow-hidden">
+                    <div id="presenter-transform-wrapper" style="${transformStyle}"
+                        class="transition-transform duration-300 pb-32">
+                        <div style="max-width:65%; margin:0 auto;" class="px-4">
+                            <div class="py-[40vh]">
+                                ${storiesHtml}
+                            </div>
+                        </div>
+                    </div>
+                    ${controlsBar}
+                </div>`;
+        }
+
+        // ── REFERENCE MODE ────────────────────────────────────────────────────
+        function renderPresenterCards(storyIds) {
+            const isLive = state.meta.isTXMode;
+            const isRehearsal = state.meta.isRehearsalMode;
+
+            // Calculate remaining programme time from active story onwards
+            const activeIdx = storyIds.indexOf(state.meta.activeStoryId);
+            const remaining = storyIds.slice(activeIdx > -1 ? activeIdx : 0)
+                .reduce((s, id) => s + (state.storiesMap[id]?.duration || 0), 0);
+
+            const expandedId = state.ui.presenter.expandedStoryId;
+
+            const cards = storyIds.map((id, idx) => {
+                const story = state.storiesMap[id];
+                if (!story) return '';
+                const isActive = state.meta.activeStoryId === id;
+                const isPast = activeIdx > -1 && idx < activeIdx;
+                const isNext = activeIdx > -1 && idx === activeIdx + 1;
+                const isExpanded = expandedId === id;
+                const clipSecs = parseClipTags(story.script);
+
+                let cardStyle = 'bg-white border border-slate-200';
+                let headerStyle = 'bg-slate-100 text-slate-600';
+                if (isActive) {
+                    cardStyle = `bg-white border-2 shadow-lg ${isLive ? 'border-red-500' : isRehearsal ? 'border-amber-500' : 'border-blue-500'}`;
+                    headerStyle = isLive ? 'bg-red-600 text-white' : isRehearsal ? 'bg-amber-500 text-white' : 'bg-blue-600 text-white';
+                } else if (isNext) {
+                    cardStyle = 'bg-white border-2 border-blue-200 shadow-sm';
+                    headerStyle = 'bg-blue-50 text-blue-800';
+                } else if (isPast) {
+                    cardStyle = 'bg-slate-50 border border-slate-100 opacity-40';
+                    headerStyle = 'bg-slate-100 text-slate-400';
+                }
+                if (isExpanded) cardStyle += ' ring-2 ring-offset-1 ring-slate-400';
+
+                return `
+                    <div id="ref-story-${id}" class="rounded-xl overflow-hidden ${cardStyle} cursor-pointer select-none"
+                        data-action="ref-toggle-expand" data-id="${id}">
+                        <div class="px-4 py-2 flex items-center justify-between ${headerStyle}">
+                            <div class="flex items-center gap-3">
+                                <span class="font-black text-xs tracking-widest uppercase">${escapeHTML(story.format)}</span>
+                                <span class="font-black text-base uppercase tracking-wide">${escapeHTML(story.slug)}</span>
+                                ${isActive ? `<span class="text-xs font-bold opacity-75">● ON AIR</span>` : ''}
+                                ${isNext ? `<span class="text-xs font-bold text-blue-600">NEXT</span>` : ''}
+                            </div>
+                            <div class="flex items-center gap-3 text-xs font-mono opacity-75">
+                                ${clipSecs > 0 ? `<span class="bg-amber-500 text-white px-1.5 py-0.5 rounded text-[10px] font-bold">CLIP +${formatDuration(clipSecs)}</span>` : ''}
+                                <span>${formatDuration(story.duration)}</span>
+                                <span class="ml-1 opacity-60">${isExpanded ? '▲' : '▼'}</span>
+                            </div>
+                        </div>
+                        ${isExpanded ? `
+                        <div class="px-5 py-4 bg-white">
+                            <p class="text-base text-slate-800 leading-relaxed whitespace-pre-wrap">${escapeHTML(story.script || 'No script.')}</p>
+                        </div>` : (isActive || isNext) ? `
+                        <div class="px-4 py-2">
+                            <p class="text-sm text-slate-500 leading-relaxed line-clamp-2 italic">${escapeHTML(story.script?.split('\n').find(l => l.trim()) || '')}</p>
+                        </div>` : ''}
+                    </div>`;
+            }).join('');
+
+            return `
+                <div class="bg-slate-100 min-h-full">
+                    <div class="px-4 pb-8 max-w-2xl mx-auto">
+                        <div class="py-4 flex items-center justify-between">
+                            <span class="text-slate-500 text-sm font-bold uppercase tracking-widest">Running Order</span>
+                            <div class="text-right">
+                                <div class="text-xs text-slate-400 uppercase tracking-widest">Remaining</div>
+                                <div class="font-mono font-black text-2xl ${remaining < 120 ? 'text-red-600' : 'text-slate-800'}">${formatDuration(remaining)}</div>
+                            </div>
+                        </div>
+                        <div class="flex flex-col gap-3">
+                            ${cards}
+                        </div>
+                    </div>
+                </div>`;
+        }
+
+
+
+        function renderModals() {
+            if (state.ui.editingStoryId && !state.ui.pendingConflict) return renderEditModal();
+            if (state.ui.isSettingsModalOpen) return renderSettingsModal();
+            if (state.ui.isStaffModalOpen) return renderStaffModal();
+            if (state.ui.pendingConflict) return renderConflictModal();
+            return '';
+        }
+
+        function renderEditModal() {
+            const story = state.storiesMap[state.ui.editingStoryId];
+            if (!story) return '';
+            const formats = state.meta.formats || DEFAULT_FORMATS;
+            const formatOptions = formats.map(f => `<option value="${f}" ${story.format === f ? 'selected' : ''}>${f}</option>`).join('');
+            const isLocked = story.lockedBySession && story.lockedBySession !== state.sessionId;
+            const staffOptions = (selectedId, roleFilter = null) => `<option value="">-- Unassigned --</option>` + state.meta.staff.filter(s => roleFilter ? s.role === roleFilter : true).map(s => `<option value="${s.id}" ${s.id === selectedId ? 'selected' : ''}>${escapeHTML(s.name)} (${escapeHTML(s.role)})</option>`).join('');
+
+            return `<div class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-[60]">
+                <div class="bg-white rounded-2xl shadow-2xl w-full max-w-3xl flex flex-col max-h-full overflow-hidden">
+                    <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50"><h3 class="text-xl font-bold text-slate-800"><i class="fa-solid fa-pen-to-square mr-2 text-blue-500"></i> Edit Story</h3><button data-action="cancel-edit" class="text-slate-400 hover:text-slate-600 text-2xl"><i class="fa-solid fa-xmark"></i></button></div>
+                    ${isLocked ? `<div class="bg-amber-100 border-b border-amber-200 px-6 py-3 flex items-center justify-between"><span class="text-amber-800 text-sm">Editing by ${escapeHTML(story.lockedByName)}.</span><button data-action="take-over-edit" class="text-xs bg-white text-amber-700 border px-3 py-1 rounded shadow-sm">Take Over</button></div>` : ''}
+                    <div class="p-6 overflow-y-auto flex-1 space-y-5">
+                        <input type="hidden" id="edit-rev" value="${story.rev}">
+                        <div class="grid grid-cols-4 gap-4"><div class="col-span-3"><label class="text-sm font-semibold block mb-1">Slug</label><input type="text" id="edit-slug" value="${escapeHTML(story.slug)}" class="w-full border rounded-lg px-4 py-2.5 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}></div><div class="col-span-1"><label class="text-sm font-semibold block mb-1">Format</label><select id="edit-format" class="w-full border rounded-lg px-4 py-2.5 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${formatOptions}</select></div></div>
+                        <div class="grid grid-cols-3 gap-4">
+                            <div><label class="text-sm font-semibold block mb-1">Presenter</label><select id="edit-presenter" class="w-full border rounded-lg px-4 py-2 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${staffOptions(story.presenterId, 'Presenter')}</select></div>
+                            <div><label class="text-sm font-semibold block mb-1">Reporter</label><select id="edit-reporter" class="w-full border rounded-lg px-4 py-2 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${staffOptions(story.reporterId, 'Reporter')}</select></div>
+                            <div>
+                                <label class="text-sm font-semibold block mb-1">Duration
+                                    ${parseClipTags(story.script) > 0 ? `<span id="edit-clip-hint" class="ml-2 text-xs font-normal text-amber-600 font-mono">+${formatDuration(parseClipTags(story.script))} clip</span>` : `<span id="edit-clip-hint" class="ml-2 text-xs font-normal text-slate-400 font-mono"></span>`}
+                                </label>
+                                <input type="text" id="edit-duration" value="${formatDuration(story.duration)}" class="w-full border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>
+                            </div>
+                        </div>
+                        <div><label class="text-sm font-semibold block mb-1">Media File</label><div class="flex gap-2"><input type="text" id="edit-media-file" value="${escapeHTML(story.mediaFile || '')}" class="flex-1 border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}><button data-action="browse-media" class="px-4 py-2 bg-slate-100 border rounded-lg text-sm font-medium hover:bg-slate-200" ${isLocked ? 'disabled' : ''}>Browse</button><input type="file" id="media-file-picker" class="hidden"></div></div>
+                        <div class="flex flex-col h-64">
+                            <div class="flex items-baseline justify-between mb-1">
+                                <label class="text-sm font-semibold">Presenter Script</label>
+                                <span id="edit-script-stats" class="text-xs font-mono text-slate-400">
+                                    ${(()=>{const w=(story.script||'').trim().replace(/\[.*?\]/g,'').trim().split(/\s+/).filter(Boolean).length;const s=Math.round(w/3);return w>0?`${w} words · ~${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')} read`:''})()}
+                                </span>
+                            </div>
+                            <textarea id="edit-script" class="w-full flex-1 border rounded-lg p-4 outline-none focus:border-blue-500 resize-none text-lg" ${isLocked ? 'disabled' : ''}
+                                oninput="(function(ta){
+                                    const raw=ta.value;
+                                    const m=raw.match(/\[CLIP:(\d+):(\d{2})\]/gi)||[];
+                                    const t=m.reduce((s,x)=>{const p=x.match(/\[CLIP:(\d+):(\d{2})\]/i);return s+(parseInt(p[1])*60+parseInt(p[2]));},0);
+                                    const h=document.getElementById('edit-clip-hint');
+                                    if(h)h.textContent=t>0?'+'+String(Math.floor(t/60)).padStart(2,'0')+':'+String(t%60).padStart(2,'0')+' clip':'';
+                                    const words=raw.trim().replace(/\[.*?\]/g,'').trim().split(/\s+/).filter(Boolean).length;
+                                    const secs=Math.round(words/3);
+                                    const st=document.getElementById('edit-script-stats');
+                                    if(st)st.textContent=words>0?words+' words · ~'+String(Math.floor(secs/60)).padStart(2,'0')+':'+String(secs%60).padStart(2,'0')+' read':'';
+                                })(this)"
+                            >${escapeHTML(story.script)}</textarea>
+                        </div>
+                    </div>
+                    <div class="px-6 py-4 border-t border-slate-200 bg-slate-50 flex justify-end gap-3"><button data-action="cancel-edit" class="px-5 py-2.5 rounded-lg text-slate-600 hover:bg-slate-200 transition-colors">${isLocked ? 'Close' : 'Cancel'}</button>${!isLocked ? `<button data-action="save-edit" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Save Changes</button>` : ''}</div>
+                </div>
+            </div>`;
+        }
+
+        function renderSettingsModal() {
+            let savedConfig = {};
+            try {
+                const str = localStorage.getItem('moira_firebase_config');
+                if (str) savedConfig = JSON.parse(str);
+            } catch(e) {}
+            
+            const currentFormats = (state.meta.formats || DEFAULT_FORMATS).join('\n');
+            const currentRoles = (state.meta.roles || DEFAULT_ROLES).join('\n');
+
+            const tabBtn = (id, label, icon) => `
+                <button data-action="set-settings-tab" data-val="${id}" class="flex-1 py-3 text-sm font-bold border-b-2 transition-colors flex items-center justify-center gap-2 ${state.ui.settingsTab === id ? 'border-blue-600 text-blue-600 bg-blue-50/50' : 'border-slate-200 text-slate-400 hover:text-slate-600'}">
+                    <i class="fa-solid ${icon}"></i> ${label}
+                </button>
+            `;
+
+            return `
+                <div class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-[70]">
+                    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl flex flex-col max-h-[90vh]">
+                        <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-2xl">
+                            <h3 class="text-xl font-bold text-slate-800"><i class="fa-solid fa-gear mr-2 text-slate-500"></i> System Settings</h3>
+                            <button data-action="close-settings-modal" class="text-slate-400 hover:text-slate-600 text-2xl"><i class="fa-solid fa-xmark"></i></button>
+                        </div>
+                        <div class="flex">
+                            ${tabBtn('connection', 'Connection', 'fa-network-wired')}
+                            ${tabBtn('editorial', 'Editorial', 'fa-pen-nib')}
+                            ${tabBtn('playout', 'Playout', 'fa-film')}
+                            ${tabBtn('about', 'About', 'fa-info-circle')}
+                            ${tabBtn('reset', 'Reset', 'fa-triangle-exclamation')}
+                        </div>
+                        <div class="p-6 overflow-y-auto flex-1">
+                            ${state.ui.settingsTab === 'connection' ? `
+                                <div class="space-y-6">
+                                    <div class="bg-blue-50 border border-blue-200 rounded-xl p-4">
+                                        <div class="flex justify-between items-start mb-2"><h4 class="font-bold text-blue-800">Cloud Sync</h4>${state.connectionState === 'connected' ? `<span class="text-[10px] font-bold uppercase tracking-wider bg-emerald-500 text-white px-2 py-1 rounded-md shadow-sm">Connected</span>` : ''}</div>
+                                        <textarea id="config-paste" rows="4" class="w-full border rounded-lg p-3 text-xs font-mono bg-white outline-none mb-4" placeholder="const firebaseConfig = { ... }"></textarea>
+                                        <div class="grid grid-cols-2 gap-4">
+                                            <div><label class="text-[10px] uppercase font-bold text-slate-500">apiKey</label><input type="text" id="config-apikey" value="${escapeHTML(savedConfig.apiKey || '')}" class="w-full border rounded-md px-3 py-2 text-sm font-mono outline-none"></div>
+                                            <div><label class="text-[10px] uppercase font-bold text-slate-500">authDomain</label><input type="text" id="config-authdomain" value="${escapeHTML(savedConfig.authDomain || '')}" class="w-full border rounded-md px-3 py-2 text-sm font-mono outline-none"></div>
+                                            <div><label class="text-[10px] uppercase font-bold text-slate-500">projectId</label><input type="text" id="config-projectid" value="${escapeHTML(savedConfig.projectId || '')}" class="w-full border rounded-md px-3 py-2 text-sm font-mono outline-none"></div>
+                                            <div><label class="text-[10px] uppercase font-bold text-slate-500">storageBucket</label><input type="text" id="config-storagebucket" value="${escapeHTML(savedConfig.storageBucket || '')}" class="w-full border rounded-md px-3 py-2 text-sm font-mono outline-none"></div>
+                                        </div>
+                                    </div>
+                                </div>` 
+                            : state.ui.settingsTab === 'editorial' ? `
+                                <div class="space-y-6">
+                                    <div class="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                                        <h4 class="font-bold text-slate-800 mb-2">Story Formats</h4>
+                                        <textarea id="settings-formats-input" rows="5" class="w-full border rounded-lg p-4 text-sm font-mono outline-none mb-6">${escapeHTML(currentFormats)}</textarea>
+                                        <h4 class="font-bold text-slate-800 mb-2">Staff Roles</h4>
+                                        <textarea id="settings-roles-input" rows="5" class="w-full border rounded-lg p-4 text-sm font-mono outline-none">${escapeHTML(currentRoles)}</textarea>
+
+                                    </div>
+                                </div>`
+                            : state.ui.settingsTab === 'playout' ? `
+                                <div class="space-y-4">
+                                    <div class="bg-slate-50 border border-slate-200 rounded-xl p-5 space-y-4">
+                                        <h4 class="font-bold text-slate-800 flex items-center gap-2"><i class="fa-solid fa-film text-slate-400"></i> OBS WebSocket Connection</h4>
+                                        <div class="grid grid-cols-2 gap-4">
+                                            <div>
+                                                <label class="text-xs font-bold text-slate-500 uppercase tracking-wide block mb-1">IP Address</label>
+                                                <input type="text" id="obs-set-ip" value="${escapeHTML(obsConfig.ip)}" placeholder="127.0.0.1" class="w-full border rounded-lg px-3 py-2 text-sm font-mono outline-none focus:border-blue-500">
+                                            </div>
+                                            <div>
+                                                <label class="text-xs font-bold text-slate-500 uppercase tracking-wide block mb-1">Port</label>
+                                                <input type="number" id="obs-set-port" value="${escapeHTML(obsConfig.port)}" placeholder="4455" class="w-full border rounded-lg px-3 py-2 text-sm font-mono outline-none focus:border-blue-500">
+                                            </div>
+                                            <div>
+                                                <label class="text-xs font-bold text-slate-500 uppercase tracking-wide block mb-1">WebSocket Password</label>
+                                                <input type="password" id="obs-set-pass" value="${escapeHTML(obsConfig.pass)}" class="w-full border rounded-lg px-3 py-2 text-sm font-mono outline-none focus:border-blue-500">
+                                            </div>
+                                            <div>
+                                                <label class="text-xs font-bold text-slate-500 uppercase tracking-wide block mb-1">Base Media Folder</label>
+                                                <input type="text" id="obs-set-base" value="${escapeHTML(obsConfig.base)}" placeholder="D:/Broadcast/Clips/" class="w-full border rounded-lg px-3 py-2 text-sm font-mono outline-none focus:border-blue-500">
+                                                <p class="text-xs text-slate-400 mt-1">Include trailing slash. Prepended to all media filenames.</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800">
+                                        <strong>Expected OBS scene structure:</strong> Scenes named <code class="bg-blue-100 px-1 rounded">VT A</code>, <code class="bg-blue-100 px-1 rounded">VT B</code>, and <code class="bg-blue-100 px-1 rounded">Lower Third</code> with corresponding media sources. Moira will auto-create these on connect if they don't exist.
+                                    </div>
+                                    <div class="bg-slate-50 border border-slate-200 rounded-xl p-5 flex items-center justify-between">
+                                        <div>
+                                            <p class="font-bold text-slate-700 text-sm">Show Clip Players</p>
+                                            <p class="text-xs text-slate-400 mt-0.5">Display the Clip A / Clip B deck panels in the director view.</p>
+                                        </div>
+                                        <button data-action="toggle-playout" class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${state.ui.showPlayout ? 'bg-blue-600' : 'bg-slate-300'}">
+                                            <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${state.ui.showPlayout ? 'translate-x-6' : 'translate-x-1'}"></span>
+                                        </button>
+                                    </div>
+                                </div>`
+                            : state.ui.settingsTab === 'reset' ? `
+                                <div class="space-y-6">
+                                    <div class="bg-red-50 border border-red-200 rounded-xl p-6">
+                                        <div class="flex items-center gap-3 mb-4">
+                                            <div class="w-10 h-10 bg-red-100 text-red-600 rounded-full flex items-center justify-center"><i class="fa-solid fa-triangle-exclamation"></i></div>
+                                            <h4 class="font-bold text-red-800 text-lg">Factory Reset</h4>
+                                        </div>
+                                        <p class="text-sm text-red-700 mb-6">This will permanently clear all local data including your newsroom, bulletin, staff identity, and Firebase configuration. The page will reload to a clean state.</p>
+                                        <button data-action="factory-reset" class="w-full px-4 py-3 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-bold transition-colors shadow-sm flex items-center justify-center gap-2">
+                                            <i class="fa-solid fa-skull"></i> Nuke Everything &amp; Reset
+                                        </button>
+                                    </div>
+                                </div>`
+                            : `
+                                <div class="p-4 space-y-6 text-center">
+                                    <div class="w-16 h-16 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-4"><i class="fa-solid fa-satellite-dish text-3xl"></i></div>
+                                    <h4 class="text-2xl font-bold text-slate-800">Moira</h4>
+                                    <p class="text-sm text-slate-500 font-medium tracking-tight">A lightweight broadcast bulletin management system designed for small newsrooms</p>
+                                    <div class="bg-slate-50 border border-slate-200 rounded-xl p-6 text-center">
+                                        <p class="text-slate-700 mb-4 leading-relaxed"><strong>Moira - Bulletin Manager</strong> is developed by <span class="text-slate-900 font-bold">Andy Dickinson</span> and is free and open source.</p>
+                                        <div class="h-px bg-slate-200 w-12 mx-auto mb-4"></div>
+                                        <p class="text-sm text-slate-500">It's named after BBC legend <a href="https://en.wikipedia.org/wiki/Moira_Stuart" target="_blank" class="text-blue-500 hover:underline font-bold decoration-2 underline-offset-2">Moira Stuart</a>.</p>
+                                    </div>
+                                    <div class="text-center text-[10px] text-slate-400 font-mono uppercase tracking-widest">v2.5 // Stable Management Build</div>
+                                </div>`}
+                        </div>
+                        <div class="px-6 py-4 border-t border-slate-200 bg-slate-50 rounded-b-2xl flex justify-between items-center">
+                            <div>
+                                ${state.ui.settingsTab === 'connection' ? `<button data-action="clear-settings" class="px-4 py-2 rounded-lg text-red-600 font-medium hover:bg-red-50" title="Remove Firebase config and work offline">Disconnect Firebase</button>` : ''}
+                                ${state.ui.settingsTab === 'playout' ? `<button data-action="obs-disconnect" class="px-4 py-2 rounded-lg text-red-600 font-medium hover:bg-red-50" title="Disconnect OBS WebSocket">Disconnect OBS</button>` : ''}
+                            </div>
+                            <button data-action="close-settings-modal" class="px-5 py-2.5 rounded-lg text-slate-600 hover:bg-slate-200">Close</button>
+                            <div>
+                                ${state.ui.settingsTab === 'connection' ? `<button data-action="save-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Save & Restart</button>` : ''}
+                                ${state.ui.settingsTab === 'playout' ? `<button data-action="save-obs-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Save & Reconnect OBS</button>` : ''}
+                                ${state.ui.settingsTab === 'editorial' ? `<button data-action="save-editorial-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Apply to Newsroom</button>` : ''}
+                            </div>
+                        </div>
+                    </div>
+                </div>`;
+        }
+
+        function renderStaffModal() {
+            const now = Date.now();
+            const ACTIVE_THRESHOLD = 2 * 60 * 1000; // 2 minutes
+
+            const staffRows = (state.meta.staff || []).map(s => {
+                const isMe = s.id === state.myStaffId;
+                const isEditor = s.id === state.meta.editorStaffId;
+                const isActive = s.lastSeen && (now - s.lastSeen) < ACTIVE_THRESHOLD;
+                const isCheckedIn = s.checkedIn;
+
+                let presenceDot, presenceLabel;
+                if (isActive) {
+                    presenceDot = `<span class="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_4px_#10b981] shrink-0"></span>`;
+                    presenceLabel = `<span class="text-[10px] text-emerald-600 font-bold">Online</span>`;
+                } else if (isCheckedIn) {
+                    presenceDot = `<span class="w-2.5 h-2.5 rounded-full bg-amber-400 shrink-0"></span>`;
+                    presenceLabel = `<span class="text-[10px] text-amber-600 font-bold">Away</span>`;
+                } else {
+                    presenceDot = `<span class="w-2.5 h-2.5 rounded-full bg-slate-300 border border-slate-400 shrink-0"></span>`;
+                    presenceLabel = `<span class="text-[10px] text-slate-400">Off duty</span>`;
+                }
+
+                return `
+                    <div class="flex items-center justify-between px-3 py-2.5 rounded-xl border ${isMe ? 'bg-blue-50 border-blue-200' : 'bg-white border-slate-200'}">
+                        <div class="flex items-center gap-2.5 min-w-0">
+                            ${presenceDot}
+                            <div class="min-w-0">
+                                <div class="flex items-center gap-2 flex-wrap">
+                                    <span class="font-bold text-sm ${isMe ? 'text-blue-800' : 'text-slate-800'}">${escapeHTML(s.name)}</span>
+                                    <span class="text-xs text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded font-medium">${escapeHTML(s.role)}</span>
+                                    ${isEditor ? `<span class="text-[10px] bg-amber-400 text-amber-900 px-1.5 py-0.5 rounded font-black uppercase tracking-wide">Editor</span>` : ''}
+                                    ${isMe ? `<span class="text-[10px] bg-blue-200 text-blue-800 px-1.5 py-0.5 rounded font-bold italic">You</span>` : ''}
+                                </div>
+                                ${presenceLabel}
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-1.5 shrink-0 ml-3">
+                            ${!isMe && !isCheckedIn ? `<button data-action="check-in" data-id="${s.id}" class="text-[10px] uppercase font-bold bg-white border border-slate-300 hover:border-blue-400 hover:text-blue-600 px-2 py-1 rounded transition-colors">That's me</button>` : ''}
+                            ${isMe ? `<button data-action="check-out" data-id="${s.id}" class="text-[10px] uppercase font-bold bg-white border border-blue-200 hover:border-red-300 text-blue-500 hover:text-red-500 px-2 py-1 rounded transition-colors">Not me</button>` : ''}
+                            ${isMe ? `<button data-action="set-editor" data-id="${s.id}" title="${isEditor ? 'Remove editor role' : 'Make me editor'}" class="text-[10px] uppercase font-bold px-2 py-1 rounded border transition-colors ${isEditor ? 'bg-amber-100 border-amber-300 text-amber-700 hover:bg-amber-200' : 'bg-white border-slate-200 text-slate-400 hover:border-amber-300 hover:text-amber-600'}"><i class="fa-solid fa-star mr-0.5"></i>${isEditor ? 'Editor' : 'Be Editor'}</button>` : ''}
+                            <button data-action="remove-staff" data-id="${s.id}" class="w-6 h-6 flex items-center justify-center text-slate-300 hover:text-red-500 transition-colors rounded"><i class="fa-solid fa-xmark text-xs"></i></button>
+                        </div>
+                    </div>`;
+            }).join('');
+
+            const roleOptions = (state.meta.roles || DEFAULT_ROLES).map(r => `<option value="${r}">${r}</option>`).join('');
+            const onlineCount = (state.meta.staff || []).filter(s => s.lastSeen && (now - s.lastSeen) < ACTIVE_THRESHOLD).length;
+
+            return `<div class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-[70]">
+                <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg flex flex-col max-h-[90vh]">
+                    <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-2xl">
+                        <div>
+                            <h3 class="text-xl font-bold text-slate-800"><i class="fa-solid fa-users mr-2 text-blue-500"></i>Staff On Duty</h3>
+                            ${onlineCount > 0 ? `<p class="text-xs text-emerald-600 font-medium mt-0.5"><span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 mr-1"></span>${onlineCount} online now</p>` : ''}
+                        </div>
+                        <button data-action="close-staff-modal" class="text-slate-400 hover:text-slate-600 text-2xl"><i class="fa-solid fa-xmark"></i></button>
+                    </div>
+                    <div class="p-4 overflow-y-auto flex-1 space-y-2">
+                        ${staffRows || '<p class="text-sm text-slate-400 italic text-center py-6">No staff added yet.</p>'}
+                    </div>
+                    <div class="p-4 border-t border-slate-200 bg-slate-50 rounded-b-2xl space-y-3">
+                        <div class="grid grid-cols-2 gap-2">
+                            <input type="text" id="new-staff-name" placeholder="Name..." class="border rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500">
+                            <select id="new-staff-role" class="border rounded-lg px-2 py-2 text-sm outline-none focus:border-blue-500 bg-white">${roleOptions}</select>
+                        </div>
+                        <button data-action="add-staff" class="w-full bg-slate-800 hover:bg-slate-700 text-white px-4 py-2 rounded-lg font-medium text-sm transition-colors">Add Staff Member</button>
+                        <details class="mt-1">
+                            <summary class="text-xs font-bold text-slate-400 uppercase tracking-widest cursor-pointer hover:text-slate-600">Bulk Import</summary>
+                            <div class="mt-2 space-y-2">
+                                <textarea id="bulk-staff-input" rows="3" placeholder="One name per line..." class="w-full border rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500 resize-none"></textarea>
+                                <button data-action="bulk-add-staff" class="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-medium text-sm transition-colors">Bulk Add Reporters</button>
+                            </div>
+                        </details>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function renderConflictModal() {
+            const slug = state.ui.pendingConflict ? state.ui.pendingConflict.serverData.slug : 'Story';
+            return `<div class="fixed inset-0 bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4 z-[80]">
+                <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+                    <h3 class="text-xl font-bold text-slate-800 mb-4">Conflict: ${escapeHTML(slug)}</h3>
+                    <p class="text-sm text-slate-600 mb-6">Another user has modified this story while you were editing. Would you like to overwrite their changes or discard your edits?</p>
+                    <div class="flex gap-3"><button data-action="resolve-conflict" data-val="overwrite" class="flex-1 bg-amber-500 text-white py-3 rounded-lg font-bold">Overwrite Server</button><button data-action="resolve-conflict" data-val="discard" class="flex-1 bg-slate-200 text-slate-700 py-3 rounded-lg font-bold">Discard Edits</button></div>
+                </div>
+            </div>`;
+        }
+
+        function parseScriptLines(script) {
+            const lines = (script || '').split('\n').filter(l => l.trim());
+            const rows = [];
+            lines.forEach(line => {
+                const trimmed = line.trim();
+                // Collect all [TAG] instances on this line
+                const tags = [];
+                const tagRegex = /\[([^\]]+)\]/g;
+                let m;
+                while ((m = tagRegex.exec(trimmed)) !== null) tags.push(m[1].toUpperCase());
+                // Strip all tags to get the spoken text
+                const spokenText = trimmed.replace(/\[[^\]]*\]/g, '').trim();
+                if (tags.length > 0 && spokenText) {
+                    // Tags alongside spoken text — direction left, script right on same row
+                    rows.push({ direction: tags.join(' / '), script: spokenText });
+                } else if (tags.length > 0) {
+                    // Direction-only line
+                    rows.push({ direction: tags.join(' / '), script: '' });
+                } else if (spokenText) {
+                    // Plain script line, no tags
+                    rows.push({ direction: '', script: spokenText });
+                }
+            });
+            return rows;
+        }
+
+        function printScripts() {
+            const order = state.meta.order || [];
+            const markerIdx = order.indexOf('marker-line');
+            const storyIds = (markerIdx > -1 ? order.slice(0, markerIdx) : order)
+                .filter(id => id !== 'marker-line' && state.storiesMap[id] && !state.storiesMap[id].isFloated);
+
+            if (storyIds.length === 0) { alert('No stories in the rundown to print.'); return; }
+
+            const txSecs   = parseClockTime(state.meta.txClockTime);
+            const rxSecs   = parseClockTime(state.meta.rxClockTime);
+            const totalDur = storyIds.reduce((s, id) => s + (state.storiesMap[id]?.duration || 0), 0);
+            const roomName = state.roomDisplayName || 'Bulletin';
+            const printDate = new Date().toLocaleString('en-GB', {
+                weekday: 'long', day: 'numeric', month: 'long',
+                year: 'numeric', hour: '2-digit', minute: '2-digit'
+            });
+
+            let runningOffset = 0;
+            let pageNum = 1; // page 1 = cover sheet
+
+            // ── COVER SHEET ───────────────────────────────────────────────────
+            const coverRows = storyIds.map((id, idx) => {
+                const story = state.storiesMap[id];
+                const clockTime = (txSecs !== null) ? formatClockTime(txSecs + runningOffset) : '--:--:--';
+                if (!story.isFloated) runningOffset += story.duration || 0;
+                const presenterName = story.presenterId
+                    ? (state.meta.staff || []).find(s => s.id === story.presenterId)?.name || '' : '';
+                const checked = story.completed
+                    ? '<span class="cover-checked">&#10003; CHECKED</span>' : '';
+                return `<tr class="${idx % 2 === 0 ? 'cover-row-even' : ''}">
+                    <td class="cover-num">${idx + 1}</td>
+                    <td class="cover-slug">${escapeHTML(story.slug.toUpperCase())} ${checked}</td>
+                    <td class="cover-format">${escapeHTML(story.format)}</td>
+                    <td class="cover-presenter">${escapeHTML(presenterName)}</td>
+                    <td class="cover-dur">${formatDuration(story.duration)}</td>
+                    <td class="cover-clock">${clockTime}</td>
+                </tr>`;
+            }).join('');
+
+            const coverSheet = `
+                <div class="cover-page">
+                    <div class="cover-head">
+                        <div>
+                            <div class="cover-bulletin">${escapeHTML(roomName.toUpperCase())}</div>
+                            <div class="cover-date">${escapeHTML(printDate)}</div>
+                        </div>
+                        <div class="cover-stats">
+                            ${txSecs !== null ? `<div class="cover-stat-item"><span class="cover-stat-label">TX</span><span class="cover-stat-val">${formatClockTime(txSecs)}</span></div>` : ''}
+                            ${rxSecs !== null ? `<div class="cover-stat-item"><span class="cover-stat-label">RX</span><span class="cover-stat-val">${formatClockTime(rxSecs)}</span></div>` : ''}
+                            <div class="cover-stat-item"><span class="cover-stat-label">TRT</span><span class="cover-stat-val">${formatDuration(totalDur)}</span></div>
+                            <div class="cover-stat-item"><span class="cover-stat-label">STORIES</span><span class="cover-stat-val">${storyIds.length}</span></div>
+                        </div>
+                    </div>
+                    <table class="cover-table">
+                        <thead>
+                            <tr>
+                                <th class="cover-num">#</th>
+                                <th class="cover-slug">SLUG</th>
+                                <th class="cover-format">FORMAT</th>
+                                <th class="cover-presenter">PRESENTER</th>
+                                <th class="cover-dur">DUR</th>
+                                <th class="cover-clock">TX TIME</th>
+                            </tr>
+                        </thead>
+                        <tbody>${coverRows}</tbody>
+                    </table>
+                    <div class="cover-footer">Page 1 of ${storyIds.length + 1}</div>
+                </div>`;
+
+            // ── STORY PAGES ───────────────────────────────────────────────────
+            runningOffset = 0;
+            const storyPages = storyIds.map((id, storyIndex) => {
+                pageNum++;
+                const story = state.storiesMap[id];
+                const clockTime = (txSecs !== null && !story.isFloated)
+                    ? formatClockTime(txSecs + runningOffset) : '--:--:--';
+                if (!story.isFloated) runningOffset += story.duration || 0;
+
+                const presenterName = story.presenterId
+                    ? (state.meta.staff || []).find(s => s.id === story.presenterId)?.name || '' : '';
+                const reporterName = story.reporterId
+                    ? (state.meta.staff || []).find(s => s.id === story.reporterId)?.name || '' : '';
+                const mediaDisplay = story.mediaFile ? story.mediaFile.replace(/.*[\/\\]/, '') : '';
+                const checkedBadge = story.completed
+                    ? '<span class="checked-badge">&#10003; EDITOR CHECKED</span>' : '';
+
+                const lines = parseScriptLines(story.script);
+                const lineRows = lines.length > 0 ? lines.map(line => {
+                    // Detect CLIP tags to render as a distinct VT cue block
+                    const clipMatch = line.direction && line.direction.match(/^CLIP:(\d+):(\d{2})$/);
+                    if (clipMatch) {
+                        const clipSecs = parseInt(clipMatch[1]) * 60 + parseInt(clipMatch[2]);
+                        return `<tr class="clip-row">
+                            <td class="dir-cell" colspan="2">
+                                <div class="clip-cue">
+                                    <span class="clip-cue-label">&#9646; VT CUE</span>
+                                    <span class="clip-cue-dur">${formatDuration(clipSecs)}</span>
+                                    ${mediaDisplay ? `<span class="clip-cue-file">${escapeHTML(mediaDisplay)}</span>` : ''}
+                                </div>
+                            </td>
+                        </tr>`;
+                    }
+                    return `<tr>
+                        <td class="dir-cell">${line.direction ? `<span class="dir-tag">${escapeHTML(line.direction)}</span>` : ''}</td>
+                        <td class="script-cell">${line.script ? escapeHTML(line.script) : ''}</td>
+                    </tr>`;
+                }).join('') : `<tr>
+                    <td class="dir-cell"></td>
+                    <td class="script-cell"><div class="no-script">&#9888; NO SCRIPT ENTERED</div></td>
+                </tr>`;
+
+                const isLastStory = storyIndex === storyIds.length - 1;
+
+                return `
+                <div class="story-page">
+                    <div class="page-number">p.${pageNum} of ${storyIds.length + 1} &nbsp;|&nbsp; ${escapeHTML(roomName.toUpperCase())} &nbsp;|&nbsp; Story ${storyIndex + 1} of ${storyIds.length}</div>
+                    <div class="story-header">
+                        <div class="story-meta-left">
+                            <div class="story-slug-row">
+                                <span class="story-slug">${escapeHTML(story.slug.toUpperCase())}</span>
+                                ${checkedBadge}
+                            </div>
+                            ${presenterName ? `<span class="presenter-name">${escapeHTML(presenterName.toUpperCase())}</span>` : ''}
+                            <div class="story-format-row">
+                                <span class="story-format">${escapeHTML(story.format)}</span>
+                                ${mediaDisplay ? `<span class="story-media">&#9654; ${escapeHTML(mediaDisplay)}</span>` : ''}
+                            </div>
+                        </div>
+                        <div class="story-meta-right">
+                            ${reporterName ? `<span class="meta-item">Rpt: ${escapeHTML(reporterName)}</span>` : ''}
+                            <span class="meta-item dur">${formatDuration(story.duration)}</span>
+                            <span class="meta-item clock">${clockTime}</span>
+                        </div>
+                    </div>
+                    <table class="script-table">
+                        <tbody>
+                            ${lineRows}
+                            ${isLastStory ? `<tr><td colspan="2" class="end-marker">/// END ///</td></tr>` : ''}
+                        </tbody>
+                    </table>
+                </div>`;
+            }).join('');
+
+            const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>${escapeHTML(roomName)} — Scripts</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Georgia', serif; font-size: 13pt; color: #000; background: #fff; }
+
+        /* ── COVER SHEET ── */
+        .cover-page {
+            padding: 48px 40px 40px;
+            page-break-after: always;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .cover-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            border-bottom: 4px solid #000;
+            padding-bottom: 20px;
+            margin-bottom: 28px;
+        }
+        .cover-bulletin {
+            font-size: 32pt;
+            font-weight: bold;
+            letter-spacing: 2px;
+        }
+        .cover-date {
+            font-size: 11pt;
+            color: #444;
+            margin-top: 6px;
+            font-family: 'Courier New', monospace;
+        }
+        .cover-stats {
+            display: flex;
+            gap: 24px;
+            align-items: flex-end;
+        }
+        .cover-stat-item {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+        }
+        .cover-stat-label {
+            font-size: 8pt;
+            font-family: monospace;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #888;
+        }
+        .cover-stat-val {
+            font-size: 18pt;
+            font-weight: bold;
+            font-family: 'Courier New', monospace;
+        }
+        .cover-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11pt;
+        }
+        .cover-table thead tr {
+            background: #000;
+            color: #fff;
+        }
+        .cover-table thead th {
+            padding: 8px 10px;
+            text-align: left;
+            font-family: monospace;
+            font-size: 9pt;
+            letter-spacing: 1px;
+        }
+        .cover-table td { padding: 9px 10px; border-bottom: 1px solid #e0e0e0; }
+        .cover-row-even td { background: #f9f9f9; }
+        .cover-num  { width: 5%; text-align: center; font-family: monospace; font-weight: bold; }
+        .cover-slug { width: 35%; font-weight: bold; }
+        .cover-format { width: 10%; font-family: monospace; font-size: 10pt; }
+        .cover-presenter { width: 22%; }
+        .cover-dur  { width: 10%; font-family: monospace; text-align: right; }
+        .cover-clock { width: 13%; font-family: monospace; font-weight: bold; text-align: right; }
+        .cover-checked {
+            font-size: 8pt; font-family: monospace; font-weight: bold;
+            color: #1a7a1a; background: #e8f5e8; border: 1px solid #aad8aa;
+            padding: 1px 5px; border-radius: 2px; margin-left: 8px;
+            vertical-align: middle;
+        }
+        .cover-footer {
+            margin-top: auto;
+            padding-top: 20px;
+            text-align: right;
+            font-size: 9pt;
+            font-family: monospace;
+            color: #999;
+            border-top: 1px solid #ddd;
+        }
+
+        /* ── STORY PAGES ── */
+        .story-page {
+            padding: 24px 40px 40px;
+            page-break-after: always;
+            min-height: 100vh;
+            orphans: 3;
+            widows: 3;
+        }
+        .page-number {
+            font-family: 'Courier New', monospace;
+            font-size: 8pt;
+            color: #999;
+            text-align: right;
+            margin-bottom: 10px;
+            letter-spacing: 0.5px;
+        }
+        .story-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            border-bottom: 3px solid #000;
+            padding-bottom: 12px;
+            margin-bottom: 18px;
+        }
+        .story-meta-left { display: flex; flex-direction: column; gap: 5px; }
+        .story-slug-row { display: flex; align-items: baseline; gap: 12px; }
+        .story-slug { font-size: 24pt; font-weight: bold; letter-spacing: 1px; }
+        .checked-badge {
+            font-size: 8pt; font-family: monospace; font-weight: bold;
+            color: #1a7a1a; background: #e8f5e8; border: 1px solid #aad8aa;
+            padding: 2px 7px; border-radius: 3px;
+        }
+        .presenter-name {
+            font-size: 13pt;
+            font-weight: bold;
+            letter-spacing: 2px;
+            color: #222;
+        }
+        .story-format-row { display: flex; align-items: center; gap: 10px; }
+        .story-format {
+            font-size: 10pt; font-family: monospace; background: #eee;
+            padding: 2px 8px; border-radius: 3px; display: inline-block;
+            color: #333; text-transform: uppercase;
+        }
+        .story-media {
+            font-family: 'Courier New', monospace; font-size: 9pt;
+            color: #555; background: #f8f8f8; border: 1px solid #ddd;
+            border-radius: 3px; padding: 2px 8px;
+        }
+        .story-meta-right {
+            display: flex; flex-direction: column;
+            align-items: flex-end; gap: 4px;
+            font-size: 11pt; font-family: monospace; color: #333;
+        }
+        .meta-item { white-space: nowrap; }
+        .meta-item.dur { font-size: 13pt; font-weight: bold; }
+        .meta-item.clock { font-size: 16pt; font-weight: bold; color: #000; }
+
+        /* ── SCRIPT TABLE ── */
+        .script-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+        .dir-cell {
+            vertical-align: top; padding: 11px 14px 11px 0;
+            border-bottom: 1px solid #eee; width: 30%;
+        }
+        .script-cell {
+            vertical-align: top; padding: 11px 0 11px 18px;
+            border-left: 3px solid #000; border-bottom: 1px solid #eee;
+            font-size: 17pt; line-height: 1.8; width: 70%;
+        }
+        .dir-tag {
+            display: inline-block; font-family: 'Courier New', monospace;
+            font-size: 9pt; font-weight: bold; text-transform: uppercase;
+            letter-spacing: 0.5px; background: #f0f0f0; border: 1px solid #ccc;
+            border-radius: 3px; padding: 3px 8px; color: #222;
+        }
+
+        /* ── VT CUE BLOCK ── */
+        .clip-row td { padding: 0; border-bottom: 2px solid #000; border-top: 2px solid #000; }
+        .clip-cue {
+            display: flex; align-items: center; gap: 16px;
+            background: #222; color: #fff;
+            padding: 10px 16px;
+        }
+        .clip-cue-label {
+            font-family: 'Courier New', monospace; font-size: 11pt;
+            font-weight: bold; letter-spacing: 2px; text-transform: uppercase;
+        }
+        .clip-cue-dur {
+            font-family: 'Courier New', monospace; font-size: 16pt;
+            font-weight: bold;
+        }
+        .clip-cue-file {
+            font-family: 'Courier New', monospace; font-size: 9pt;
+            color: #aaa; margin-left: auto;
+        }
+
+        /* ── NO SCRIPT WARNING ── */
+        .no-script {
+            background: #fff3cd; border: 2px solid #ffc107;
+            padding: 12px 16px; font-size: 13pt;
+            font-family: monospace; font-weight: bold;
+            letter-spacing: 1px; color: #856404;
+        }
+
+        /* ── END MARKER ── */
+        .end-marker {
+            text-align: center; padding: 24px;
+            font-family: 'Courier New', monospace;
+            font-size: 14pt; font-weight: bold;
+            letter-spacing: 4px; color: #888;
+            border-top: 2px solid #ccc;
+            border-bottom: none;
+        }
+
+        @media print {
+            body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+            .story-page, .cover-page { page-break-after: always; }
+        }
+    </style>
+</head>
+<body>
+    ${coverSheet}
+    ${storyPages}
+    <script>window.onload = () => window.print();<\/script>
+</body>
+</html>`;
+
+            const win = window.open('', '_blank', 'width=900,height=700');
+            if (!win) { alert('Pop-up blocked. Please allow pop-ups for this page and try again.'); return; }
+            win.document.write(html);
+            win.document.close();
+        }
+        function bindGlobalEvents() {
+    // 1. UNIFIED KEYDOWN LISTENER
+            document.addEventListener('keydown', e => {
+                // A. Newsroom Input Check
+                if (e.target && e.target.id === 'header-room-input' && e.key === 'Enter') {
+                    switchRoom(e.target.value);
+                    return;
+                }
+
+                // B. Presenter Mode Controls (Only if NOT typing in an input/textarea)
+                if (state.mode === 'presenter' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
+                    
+                    // Toggle Horizontal Mirror (M)
+                    if (e.key.toLowerCase() === 'm') {
+                        e.preventDefault();
+                        state.ui.presenter.mirrorX = !state.ui.presenter.mirrorX;
+                        render();
+                    }
+
+                    if (e.key.toLowerCase() === 'f') {
+                            e.preventDefault();
+                            
+                            // 1. Handle the Browser Fullscreen API
+                            if (!document.fullscreenElement) {
+                                document.documentElement.requestFullscreen().catch(err => {
+                                    console.error("Fullscreen failed", err);
+                                });
+                            } else {
+                                if (document.exitFullscreen) {
+                                    document.exitFullscreen();
+                                }
+                            }
+                            
+                            // 2. Toggle the flag and re-render
+                            state.ui.presenter.zenMode = !state.ui.presenter.zenMode;
+                            render();
+                        }
+
+                    // Toggle Vertical Mirror (V) - Included for completeness
+                    if (e.key.toLowerCase() === 'v') {
+                        e.preventDefault();
+                        state.ui.presenter.mirrorY = !state.ui.presenter.mirrorY;
+                        render();
+                    }
+
+                    // Toggle AutoScroll (Spacebar)
+                    if (e.code === 'Space') {
+                        e.preventDefault();
+                        state.ui.presenter.autoScroll = !state.ui.presenter.autoScroll;
+                        render();
+                    }
+
+                    // Speed Controls (Arrows)
+                    if (e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        state.ui.presenter.scrollSpeed = Math.min(state.ui.presenter.scrollSpeed + 5, 200);
+                        render();
+                    }
+                    if (e.key === 'ArrowDown') {
+                        e.preventDefault();
+                        state.ui.presenter.scrollSpeed = Math.max(state.ui.presenter.scrollSpeed - 5, 0);
+                        render();
+                    }
+
+                    // Find active story (Home key)
+                    if (e.key === 'Home') {
+                        e.preventDefault();
+                        const activeEl = document.getElementById(`presenter-story-${state.meta.activeStoryId}`);
+                        if (activeEl) activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }
+            });
+
+            // 2. CONFIG PASTE LISTENER (Input)
+            document.body.addEventListener('input', e => {
+                if (e.target && e.target.id === 'config-paste') {
+                    const val = e.target.value;
+                    const extract = (key) => {
+                        const regex = new RegExp(`${key}["']?\\s*:\\s*["']([^"']+)["']`, 'i');
+                        const match = val.match(regex);
+                        return match ? match[1] : null;
+                    };
+                    if (extract('apiKey')) document.getElementById('config-apikey').value = extract('apiKey');
+                    if (extract('authDomain')) document.getElementById('config-authdomain').value = extract('authDomain');
+                    if (extract('projectId')) document.getElementById('config-projectid').value = extract('projectId');
+                    if (extract('storageBucket')) document.getElementById('config-storagebucket').value = extract('storageBucket');
+                }
+            });
+
+            // 3. GLOBAL CLICK DELEGATION
+            document.body.addEventListener('click', async e => {
+                const btn = e.target.closest('[data-action]');
+                if (!btn) return;
+
+                const action = btn.getAttribute('data-action');
+                const id = btn.getAttribute('data-id');
+                const val = btn.getAttribute('data-val');
+
+                if (action === 'set-mode') {
+                    if (val === 'presenter' && state.mode === 'presenter') {
+                        // Already in presenter — toggle between autocue and reference
+                        state.ui.presenter.presenterMode = state.ui.presenter.presenterMode === 'autocue' ? 'presenter' : 'autocue';
+                    } else {
+                        state.mode = val;
+                        state.ui.lastScrolledStoryId = null;
+                        if (val === 'director') {
+                            const order = state.meta.order || [];
+                            const markerIdx = order.indexOf('marker-line');
+                            const storyIds = markerIdx > -1 ? order.slice(0, markerIdx) : order;
+                            if (storyIds.length > 0 && !state.meta.isTXMode && !state.meta.isRehearsalMode) {
+                                state.meta.activeStoryId = storyIds[0];
+                                state.meta.isCued = true;
+                            }
+                        }
+                    }
+                    render();
+                }
+
+
+
+                if (action === 'join-room') switchRoom(document.getElementById('header-room-input').value);
+                // Rundown structure mutations — blocked when locked (unless you're editor)
+                const isRundownLocked = state.meta.rundownLocked && state.meta.editorStaffId !== state.myStaffId;
+                if (action === 'add-story') { if (!isRundownLocked) addStory(); return; }
+                if (action === 'toggle-float') { if (!isRundownLocked) toggleFloat(id); return; }
+                if (action === 'delete-story') { if (!isRundownLocked) deleteStory(id); return; }
+                if (action === 'toggle-complete') toggleStoryComplete(id);
+                if (action === 'open-settings-modal') { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'connection'; render(); }
+                if (action === 'close-settings-modal') { 
+                    state.ui.isSettingsModalOpen = false; 
+                    state.ui.settingsTab = 'connection'; 
+                    render(); 
+                }
+                if (action === 'set-settings-tab') { state.ui.settingsTab = val; render(); }
+                if (action === 'save-settings') {
+                    const newConfig = {
+                        apiKey: document.getElementById('config-apikey').value.trim(),
+                        authDomain: document.getElementById('config-authdomain').value.trim(),
+                        projectId: document.getElementById('config-projectid').value.trim(),
+                        storageBucket: document.getElementById('config-storagebucket').value.trim()
+                    };
+                    if (newConfig.apiKey) { localStorage.setItem('moira_firebase_config', JSON.stringify(newConfig)); window.location.reload(); }
+                }
+                if (action === 'clear-settings') {
+                    localStorage.removeItem('moira_firebase_config');
+                    window.location.reload();
+                }
+                if (action === 'factory-reset') {
+                    Object.keys(localStorage).forEach(key => { if (key.startsWith('moira_')) localStorage.removeItem(key); });
+                    window.location.reload();
+                }
+                if (action === 'save-editorial-settings') {
+                    const formats = document.getElementById('settings-formats-input').value.split('\n').map(f => f.trim()).filter(f => f.length > 0);
+                    const roles = document.getElementById('settings-roles-input').value.split('\n').map(r => r.trim()).filter(r => r.length > 0);
+                    updateBulletinMeta({ formats, roles });
+                }
+                if (action === 'toggle-playout') { state.ui.showPlayout = !state.ui.showPlayout; render(); return; }
+                if (action === 'header-tx-toggle') updateStudioMode(state.meta.isTXMode ? 'standby' : 'tx');
+                if (action === 'set-studio-state') updateStudioMode(val);
+
+                if (action === 'open-staff-modal') { state.ui.isStaffModalOpen = true; render(); }
+                if (action === 'close-staff-modal') { state.ui.isStaffModalOpen = false; render(); }
+                if (action === 'edit-story') { state.ui.editingStoryId = id; lockStory(id); render(); }
+                if (action === 'save-tx-time') {
+                        const val = document.getElementById('tx-clock-input')?.value.trim();
+                        updateBulletinMeta({ txClockTime: val || '' });
+                    }
+                    if (action === 'save-rx-time') {
+                        const val = document.getElementById('rx-clock-input')?.value.trim();
+                        updateBulletinMeta({ rxClockTime: val || '' });
+                    }
+
+                if (action === 'inline-edit-slug') {
+                    const story = state.storiesMap[id];
+                    if (!canMutate()) return;
+                    if (!story || (story.lockedBySession && story.lockedBySession !== state.sessionId)) return;
+
+                    // Freeze renders while the input is live so Firestore snapshots
+                    // don't rebuild the DOM and destroy the input mid-edit
+                    state.ui.inlineEditingId = id;
+
+                    await lockStory(id);
+
+                    const liveSpan = document.querySelector(`[data-action="inline-edit-slug"][data-id="${id}"]`);
+                    if (!liveSpan) { state.ui.inlineEditingId = null; render(); return; }
+
+                    const originalSlug = state.storiesMap[id]?.slug ?? '';
+
+                    const input = document.createElement('input');
+                    input.type = 'text';
+                    input.value = originalSlug;
+                    input.className = 'w-full border-2 border-blue-500 rounded px-1 text-slate-800 font-semibold outline-none bg-white shadow-sm ring-2 ring-blue-100';
+
+                    let committed = false;
+                    const finish = async (save) => {
+                        if (committed) return;
+                        committed = true;
+                        state.ui.inlineEditingId = null;  // unfreeze renders
+                        const newSlug = input.value.trim();
+                        if (save && newSlug && newSlug !== originalSlug) {
+                            if (state.localMode) {
+                                state.storiesMap[id].slug = newSlug;
+                                await unlockStory(id);
+                                render();
+                            } else {
+                                const storyRef = doc(db, ...paths.stories, id);
+                                try {
+                                    await runTransaction(db, async transaction => {
+                                        const snap = await transaction.get(storyRef);
+                                        if (!snap.exists()) throw new Error('Story missing');
+                                        const serverData = snap.data();
+                                        if (serverData.lockedBySession && serverData.lockedBySession !== state.sessionId) throw new Error('Lock mismatch');
+                                        transaction.update(storyRef, {
+                                            slug: newSlug,
+                                            rev: serverData.rev + 1,
+                                            lockedBySession: null,
+                                            lockedByName: null,
+                                            lockedAt: null
+                                        });
+                                    });
+                                } catch(e) {
+                                    console.error('Inline save failed', e);
+                                    await unlockStory(id);
+                                    render();
+                                }
+                            }
+                        } else {
+                            await unlockStory(id);
+                            render();
+                        }
+                    };
+
+                    input.onblur = () => finish(true);
+                    input.onkeydown = async ev => {
+                        if (ev.key === 'Enter') { ev.preventDefault(); finish(true); }
+                        if (ev.key === 'Escape') { ev.preventDefault(); finish(false); }
+                    };
+
+                    liveSpan.replaceWith(input);
+                    input.focus();
+                    input.select();
+                }
+
+                if (action === 'print-scripts') {printScripts();}
+                if (action === 'browse-media') document.getElementById('media-file-picker').click();
+                if (action === 'take-over-edit') {
+                    const storyId = state.ui.editingStoryId;
+                    if (!storyId) return;
+                    const userName = getMyName();
+                    const now = Date.now();
+                    if (state.localMode) {
+                        state.storiesMap[storyId].lockedBySession = state.sessionId;
+                        state.storiesMap[storyId].lockedByName = userName;
+                        state.storiesMap[storyId].lockedAt = now;
+                        render();
+                    } else {
+                        try {
+                            const storyRef = doc(db, ...paths.stories, storyId);
+                            await runTransaction(db, async (t) => {
+                                const snap = await t.get(storyRef);
+                                if (!snap.exists()) throw "Story missing";
+                                const data = snap.data();
+                                const isStale = data.lockedAt && (now - data.lockedAt > STALE_LOCK_MS);
+                                // Fix 2: Stale check in transaction
+                                if (isStale) {
+                                    t.update(storyRef, { lockedBySession: state.sessionId, lockedByName: userName, lockedAt: now });
+                                } else {
+                                    throw "Lock is still fresh";
+                                }
+                            });
+                        } catch(e) { console.error("Takeover failed:", e); }
+                    }
+                }
+                if (action === 'cancel-edit') { const editingId = state.ui.editingStoryId; state.ui.editingStoryId = null; if (editingId) unlockStory(editingId); render(); }
+                
+                if (action === 'add-staff') {
+                    const nameInput = document.getElementById('new-staff-name');
+                    const roleInput = document.getElementById('new-staff-role');
+                    if (!nameInput || !roleInput) return;
+                    const name = nameInput.value.trim();
+                    const role = roleInput.value;
+                    if (name) {
+                        const newId = crypto.randomUUID();
+                        await updateStaffInCloud(currentStaff => [...currentStaff, { id: newId, name, role, checkedIn: false }]);
+                        // Fix 3: Clearing moved inside conditional
+                        nameInput.value = '';
+                    }
+                }
+                if (action === 'bulk-add-staff') {
+                    const bulkInput = document.getElementById('bulk-staff-input');
+                    if (!bulkInput) return;
+                    const names = bulkInput.value.split('\n').map(n => n.trim()).filter(n => n.length > 0);
+                    if (names.length > 0) {
+                        await updateStaffInCloud(currentStaff => [...currentStaff, ...names.map(name => ({ id: crypto.randomUUID(), name, role: 'Reporter', checkedIn: false }))]);
+                        // Fix 3: Clearing moved inside conditional
+                        bulkInput.value = '';
+                    }
+                }
+                if (action === 'check-in') {
+                    state.myStaffId = id;
+                    localStorage.setItem('moira_my_staff_id', id);
+                    updateStaffInCloud(staff => staff.map(s => s.id === id ? { ...s, checkedIn: true, lastSeen: Date.now() } : s));
+                    render();
+                }
+                if (action === 'check-out') {
+                    state.myStaffId = null;
+                    localStorage.removeItem('moira_my_staff_id');
+                    updateStaffInCloud(staff => staff.map(s => s.id === id ? { ...s, checkedIn: false, lastSeen: null } : s));
+                    render();
+                }
+                if (action === 'set-editor') {
+                    const currentEditor = state.meta.editorStaffId;
+                    const newEditor = currentEditor === id ? null : id;
+                    if (state.localMode) {
+                        state.meta.editorStaffId = newEditor;
+                        render();
+                    } else if (canMutate()) {
+                        const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+                        await updateDoc(bullRef, { editorStaffId: newEditor });
+                    }
+                }
+                if (action === 'toggle-rundown-lock') {
+                    const isEditor = state.meta.editorStaffId === state.myStaffId;
+                    if (!isEditor) return;
+                    const newLocked = !state.meta.rundownLocked;
+                    if (state.localMode) {
+                        state.meta.rundownLocked = newLocked;
+                        render();
+                    } else if (canMutate()) {
+                        const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+                        await updateDoc(bullRef, { rundownLocked: newLocked });
+                    }
+                }
+                if (action === 'remove-staff') {
+                    if (id === state.myStaffId) { state.myStaffId = null; localStorage.removeItem('moira_my_staff_id'); }
+                    // If removed person was editor, clear that too
+                    if (id === state.meta.editorStaffId) {
+                        if (state.localMode) { state.meta.editorStaffId = null; }
+                        else { const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId); updateDoc(bullRef, { editorStaffId: null, rundownLocked: false }); }
+                    }
+                    updateStaffInCloud(staff => staff.filter(s => s.id !== id));
+                }
+                if (action === 'save-edit') {
+                    let durStr = document.getElementById('edit-duration').value;
+                    let parsedDuration = 0;
+                    if (durStr.includes(':')) { const [m, s] = durStr.split(':'); parsedDuration = (parseInt(m, 10) || 0) * 60 + (parseInt(s, 10) || 0); } else { parsedDuration = parseInt(durStr, 10) || 0; }
+                    const scriptText = document.getElementById('edit-script').value;
+                    parsedDuration += parseClipTags(scriptText);
+                    saveStory(state.ui.editingStoryId, { slug: document.getElementById('edit-slug').value, format: document.getElementById('edit-format').value, presenterId: document.getElementById('edit-presenter').value, reporterId: document.getElementById('edit-reporter').value, mediaFile: document.getElementById('edit-media-file').value.trim(), duration: parsedDuration, script: scriptText, rev: parseInt(document.getElementById('edit-rev').value, 10) });
+                }
+                if (action === 'resolve-conflict') {
+                    const { storyId, serverData, localData } = state.ui.pendingConflict;
+                    if (val === 'overwrite') { localData.rev = serverData.rev; state.ui.pendingConflict = null; saveStory(storyId, localData); } else { state.ui.pendingConflict = null; state.ui.editingStoryId = null; unlockStory(storyId); render(); }
+                }
+                if (action === 'take-next') shiftActiveStory(1);
+                if (action === 'undo-take') shiftActiveStory(-1);
+
+                // --- Presenter mode actions ---
+
+                if (action === 'presenter-font-up') {
+                    state.ui.presenter.fontScale = Math.min(state.ui.presenter.fontScale + 0.15, 2.5);
+                    render(); return;
+                }
+                if (action === 'presenter-font-down') {
+                    state.ui.presenter.fontScale = Math.max(state.ui.presenter.fontScale - 0.15, 0.4);
+                    render(); return;
+                }
+                if (action === 'presenter-speed-up') {
+                    state.ui.presenter.scrollSpeed = Math.min(state.ui.presenter.scrollSpeed + 5, 200);
+                    render(); return;
+                }
+                if (action === 'presenter-speed-down') {
+                    state.ui.presenter.scrollSpeed = Math.max(state.ui.presenter.scrollSpeed - 5, 0);
+                    render(); return;
+                }
+                if (action === 'presenter-scroll-toggle') {
+                    state.ui.presenter.autoScroll = !state.ui.presenter.autoScroll;
+                    render(); return;
+                }
+                if (action === 'presenter-find') {
+                    const activeEl = document.getElementById(`presenter-story-${state.meta.activeStoryId}`);
+                    if (activeEl) activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    return;
+                }
+                if (action === 'presenter-story-prev' || action === 'presenter-story-next') {
+                    const rawOrder = state.meta.order || [];
+                    const markerIdx = rawOrder.indexOf('marker-line');
+                    const storyIds = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
+                        .filter(id => !state.storiesMap[id]?.isFloated);
+                    const cur = storyIds.indexOf(state.meta.activeStoryId);
+                    const next = action === 'presenter-story-next' ? cur + 1 : cur - 1;
+                    if (next >= 0 && next < storyIds.length) {
+                        state.meta.activeStoryId = storyIds[next];
+                        state.ui.lastScrolledStoryId = storyIds[next]; // prevent render() scrollIntoView
+                        render();
+                        // After render, jump scrollTop directly to the new active story.
+                        // scrollIntoView can't be used here because the rAF autoscroll loop
+                        // runs every frame and would immediately overwrite any smooth scroll.
+                        // Setting scrollTop directly gives the loop the correct baseline.
+                        const container = document.getElementById('main-container');
+                        const target = document.getElementById(`presenter-story-${storyIds[next]}`);
+                        if (container && target) {
+                            const containerRect = container.getBoundingClientRect();
+                            const targetRect = target.getBoundingClientRect();
+                            container.scrollTop += targetRect.top - containerRect.top;
+                        }
+                    }
+                    return;
+                }
+                if (action === 'ref-toggle-expand') {
+                    const id = e.target.closest('[data-id]')?.getAttribute('data-id');
+                    if (id) {
+                        state.ui.presenter.expandedStoryId =
+                            state.ui.presenter.expandedStoryId === id ? null : id;
+                        render();
+                        // Scroll expanded card into view
+                        setTimeout(() => {
+                            const el = document.getElementById(`ref-story-${id}`);
+                            if (el && state.ui.presenter.expandedStoryId === id)
+                                el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                        }, 50);
+                    }
+                    return;
+                }
+
+                // --- OBS Settings actions (inside main data-action handler) ---
+                if (action === 'obs-disconnect') {
+                    try { await obsWs.disconnect(); } catch(e) {}
+                    state.ui.isSettingsModalOpen = false;
+                    render();
+                    return;
+                }
+                if (action === 'save-obs-settings') {
+                    saveObsConfig();
+                    state.ui.isSettingsModalOpen = false;
+                    render();
+                    obsLog('OBS settings saved. Reconnecting...', 'info');
+                    connectObs();
+                }
+            });
+
+            // --- OBS playout actions (separate handler on data-obs-action) ---
+            document.body.addEventListener('click', e => {
+                const btn = e.target.closest('[data-obs-action]');
+                if (!btn) return;
+                const obsAction = btn.getAttribute('data-obs-action');
+                const deck = btn.getAttribute('data-deck');
+
+                if (obsAction === 'reconnect') { connectObs(); return; }
+                if (obsAction === 'take')      { obsExecuteTake(); return; }
+                if (obsAction === 'l3-update') { obsUpdateL3Text(); return; }
+                if (obsAction === 'l3-show')   { obsToggleL3(true); return; }
+                if (obsAction === 'l3-hide')   { obsToggleL3(false); return; }
+                if (obsAction === 'play')  { obsMediaAction(deck, 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY');  return; }
+                if (obsAction === 'pause') { obsMediaAction(deck, 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE'); return; }
+                if (obsAction === 'stop')  { obsMediaAction(deck, 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP');  return; }
+                if (obsAction === 'cue')   { obsSetCursor(deck, 0); return; }
+            });
+
+            document.body.addEventListener('change', e => {
+                if (e.target && e.target.id === 'media-file-picker') {
+                    const file = e.target.files[0];
+                    if (file) { const input = document.getElementById('edit-media-file'); if (input) input.value = file.name; }
+                }
+            });
+
+            document.body.addEventListener('dragstart', e => {
+                const row = e.target.closest('[data-story-id]');
+                const isRundownLocked = state.meta.rundownLocked && state.meta.editorStaffId !== state.myStaffId;
+                if (row && !isRundownLocked) { state.ui.draggedStoryId = row.getAttribute('data-story-id'); e.dataTransfer.effectAllowed = 'move'; setTimeout(() => row.classList.add('opacity-30'), 0); }
+            });
+            document.body.addEventListener('dragend', e => {
+                const row = e.target.closest('[data-story-id]');
+                if (row) row.classList.remove('opacity-30');
+                state.ui.draggedStoryId = null; render();
+            });
+            document.body.addEventListener('dragover', e => {
+                e.preventDefault(); 
+                document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+                const row = e.target.closest('[data-story-id]');
+                if (row && row.getAttribute('data-story-id') !== state.ui.draggedStoryId) row.classList.add('drag-over');
+            });
+            document.body.addEventListener('dragleave', e => { const row = e.target.closest('[data-story-id]'); if (row) row.classList.remove('drag-over'); });
+            document.body.addEventListener('drop', e => {
+                e.preventDefault();
+                const dropTarget = e.target.closest('[data-story-id]');
+                if (dropTarget) {
+                    dropTarget.classList.remove('drag-over');
+                    const targetId = dropTarget.getAttribute('data-story-id');
+                    if (state.ui.draggedStoryId && state.ui.draggedStoryId !== targetId) reorderStory(state.ui.draggedStoryId, targetId);
+                }
+            });
+        }
+
+        window.addEventListener('beforeunload', () => { 
+            if (txTimerInterval) clearInterval(txTimerInterval); 
+            if (obsTelemetryInterval) clearInterval(obsTelemetryInterval);
+        });
+
+        boot();
+
+    </script>
+</body>
+</html>
