@@ -790,11 +790,6 @@
              const mainContainer = document.getElementById('main-container');
              const savedScroll = mainContainer ? mainContainer.scrollTop : 0;
 
-            // Only re-render header if not in an active timed session
-            // to prevent clock flicker on every render() call
-            const inActiveSession = state.meta.isTXMode || state.meta.isRehearsalMode;
-            document.getElementById('header-container').innerHTML = renderHeader();
-
             const isZen = state.mode === 'presenter' && state.ui.presenter.zenMode;
             document.getElementById('header-container').innerHTML = isZen ? '' : renderHeader();
 
@@ -1142,7 +1137,7 @@
                 // freed (outgoing) is the one that held clipIndex (even=A, odd=B).
                 const queue = state.obs.clipQueue;
                 const takenIndex = state.obs.clipIndex + 1;  // index of clip just taken to air
-                const freeDeck   = takenIndex % 2 === 0 ? 'B' : 'A'; // outgoing deck after this take
+                const freeDeck   = takenIndex % 2 === 0 ? 'A' : 'B'; // outgoing deck after this take
 
                 setTimeout(async () => {
                     try {
@@ -1974,7 +1969,7 @@
                                 <label class="text-sm font-semibold block mb-1">Duration
                                     ${parseClipTags(story.script) > 0 ? `<span id="edit-clip-hint" class="ml-2 text-xs font-normal text-amber-600 font-mono">+${formatDuration(parseClipTags(story.script))} clip</span>` : `<span id="edit-clip-hint" class="ml-2 text-xs font-normal text-slate-400 font-mono"></span>`}
                                 </label>
-                                <input type="text" id="edit-duration" value="${formatDuration(story.duration)}" class="w-full border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>
+                                <input type="text" id="edit-duration" value="${formatDuration(Math.max(0, story.duration - parseClipTags(story.script)))}" class="w-full border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>
                             </div>
                         </div>
                         <div><label class="text-sm font-semibold block mb-1">Media File</label><div class="flex gap-2"><input type="text" id="edit-media-file" value="${escapeHTML(story.mediaFile || '')}" class="flex-1 border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}><button data-action="browse-media" class="px-4 py-2 bg-slate-100 border rounded-lg text-sm font-medium hover:bg-slate-200" ${isLocked ? 'disabled' : ''}>Browse</button><input type="file" id="media-file-picker" class="hidden"></div></div>
