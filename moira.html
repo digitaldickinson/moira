@@ -149,7 +149,9 @@
                     presenterMode: 'autocue',  // 'autocue' | 'presenter'
                     expandedStoryId: null
                 },
-                showPlayout: false
+                showPlayout: false,
+                trash: [],           // [{id, story, orderIndex, deletedAt}]
+                storySnapshots: {}   // {storyId: previousStoryData} — set before each save
             }
         };
 
@@ -393,6 +395,10 @@
         }
 
         async function saveStory(id, newData) {
+            // Snapshot the current version before overwriting (enables revert)
+            if (state.storiesMap[id]) {
+                state.ui.storySnapshots[id] = { ...state.storiesMap[id] };
+            }
             if (state.localMode) {
                 newData.rev = (state.storiesMap[id]?.rev || 0) + 1;
                 state.storiesMap[id] = { ...state.storiesMap[id], ...newData };
@@ -623,9 +629,14 @@
             if (!canMutate()) return;
             if (!confirm("Are you sure you want to delete this story?")) return;
 
+            // Snapshot for rescue
+            const orderIndex = state.meta.order.indexOf(id);
+            const snapshot = { id, story: { ...state.storiesMap[id] }, orderIndex, deletedAt: Date.now() };
+
             if (state.localMode) {
                 delete state.storiesMap[id];
                 state.meta.order = state.meta.order.filter(itemId => itemId !== id);
+                state.ui.trash.unshift(snapshot);
                 render();
                 return;
             }
@@ -641,7 +652,51 @@
                     transaction.delete(storyRef);
                     transaction.update(bullRef, { order });
                 });
+                state.ui.trash.unshift(snapshot);
             } catch(e) { console.error("Delete failed:", e); }
+        }
+
+        async function rescueStory(id) {
+            if (!canMutate()) return;
+            const entry = state.ui.trash.find(t => t.id === id);
+            if (!entry) return;
+            state.ui.trash = state.ui.trash.filter(t => t.id !== id);
+
+            const newId = id; // reuse original id
+            const story = { ...entry.story };
+
+            if (state.localMode) {
+                state.storiesMap[newId] = story;
+                // Re-insert at original position if possible, otherwise append before marker
+                let order = [...state.meta.order];
+                const insertAt = Math.min(entry.orderIndex, order.length);
+                order.splice(insertAt, 0, newId);
+                state.meta.order = order;
+                render();
+                return;
+            }
+
+            const storyRef = doc(db, ...paths.stories, newId);
+            const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const bullDoc = await transaction.get(bullRef);
+                    if (!bullDoc.exists()) throw "Bulletin missing";
+                    let order = [...(bullDoc.data().order || [])];
+                    const insertAt = Math.min(entry.orderIndex, order.length);
+                    order.splice(insertAt, 0, newId);
+                    transaction.set(storyRef, story);
+                    transaction.update(bullRef, { order });
+                });
+            } catch(e) { console.error("Rescue failed:", e); }
+        }
+
+        async function revertStory(id) {
+            const snapshot = state.ui.storySnapshots[id];
+            if (!snapshot) return;
+            if (!confirm(`Revert "${state.storiesMap[id]?.slug || id}" to its previous version?`)) return;
+            delete state.ui.storySnapshots[id];
+            await saveStory(id, { ...snapshot });
         }
 
         async function updateStaffInCloud(mutatorFn) {
@@ -1611,6 +1666,7 @@
                     </td>
                     <td class="px-3 py-1.5 text-right w-20">
                         <button data-action="edit-story" data-id="${id}" class="p-1.5 text-slate-400 hover:text-blue-600"><i class="fa-solid fa-pen text-xs"></i></button>
+                        ${state.ui.storySnapshots[id] ? `<button data-action="revert-story" data-id="${id}" class="p-1.5 text-amber-400 hover:text-amber-600" title="Revert to previous version"><i class="fa-solid fa-clock-rotate-left text-xs"></i></button>` : ''}
                         ${!isRundownLocked ? `<button data-action="delete-story" data-id="${id}" class="p-1.5 text-slate-400 hover:text-red-600"><i class="fa-solid fa-trash text-xs"></i></button>` : ''}
                     </td>
                 </tr>`;
@@ -1672,6 +1728,15 @@
                     </div>
                 </div>
                 ${txRxBar}
+                ${state.ui.trash.length > 0 ? `
+                <div class="flex items-center gap-3 bg-amber-50 border border-amber-200 text-amber-800 px-4 py-2.5 rounded-xl mb-4 text-sm">
+                    <i class="fa-solid fa-trash-arrow-up text-amber-500"></i>
+                    <span class="font-semibold">${state.ui.trash.length} deleted ${state.ui.trash.length === 1 ? 'story' : 'stories'} this session</span>
+                    <div class="flex items-center gap-2 ml-2 flex-wrap">
+                        ${state.ui.trash.map(t => `<button data-action="rescue-story" data-id="${t.id}" class="bg-amber-100 hover:bg-amber-200 border border-amber-300 text-amber-800 px-2.5 py-1 rounded-lg text-xs font-bold transition-colors"><i class="fa-solid fa-rotate-left mr-1"></i>${escapeHTML(t.story.slug)}</button>`).join('')}
+                    </div>
+                    <button data-action="clear-trash" class="ml-auto text-amber-400 hover:text-amber-700 text-xs font-bold px-2 py-1 rounded transition-colors" title="Discard all deleted stories">Clear</button>
+                </div>` : ''}
                 <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                     <table class="w-full text-left border-collapse">
                         <thead>
@@ -2499,6 +2564,9 @@
                 if (action === 'add-story') { if (!isRundownLocked) addStory(); return; }
                 if (action === 'toggle-float') { if (!isRundownLocked) toggleFloat(id); return; }
                 if (action === 'delete-story') { if (!isRundownLocked) deleteStory(id); return; }
+                if (action === 'rescue-story') { rescueStory(id); return; }
+                if (action === 'revert-story') { revertStory(id); return; }
+                if (action === 'clear-trash') { state.ui.trash = []; render(); return; }
                 if (action === 'toggle-complete') toggleStoryComplete(id);
                 if (action === 'open-settings-modal') { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'connection'; render(); }
                 if (action === 'close-settings-modal') { state.ui.isSettingsModalOpen = false; state.ui.settingsTab = 'connection'; render(); }
