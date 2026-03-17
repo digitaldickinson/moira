@@ -14,6 +14,8 @@
         /* OBS Playout tally indicators */
         .obs-tally-program { box-shadow: 0 0 14px 2px rgba(220, 38, 38, 0.5); border-color: #dc2626 !important; }
         .obs-tally-preview { box-shadow: 0 0 14px 2px rgba(37, 99, 235, 0.5); border-color: #2563eb !important; }
+        /* Safari-compatible scrolling for main container */
+        #main-container { -webkit-overflow-scrolling: touch; overflow-y: auto; }
     </style>
 </head>
 <body class="bg-gray-50 h-screen flex flex-col overflow-hidden text-slate-800">
@@ -429,14 +431,20 @@
 
         async function toggleStoryComplete(id) {
             if (!canMutate()) return;
-            const current = !!state.storiesMap[id]?.completed;
+            const current = state.storiesMap[id]?.completed;
+            // Cycle: null/false → 'needs-checking' (yellow) → 'checked-ok' (green) → 'checked-needs-work' (red) → null
+            const nextState = (!current || current === false || current === null)
+                ? 'needs-checking'
+                : current === 'needs-checking' ? 'checked-ok'
+                : current === 'checked-ok' ? 'checked-needs-work'
+                : null;
             if (state.localMode) {
-                state.storiesMap[id].completed = !current;
+                state.storiesMap[id].completed = nextState;
                 render();
                 return;
             }
             try {
-                await updateDoc(doc(db, ...paths.stories, id), { completed: !current });
+                await updateDoc(doc(db, ...paths.stories, id), { completed: nextState });
             } catch(e) { console.error("Toggle failed", e); }
         }
 
@@ -762,6 +770,35 @@
             return `${m}:${s}`;
         }
 
+        // Exposed on window so it can be called from oninput HTML attributes
+        window._moiraUpdateScriptStats = function(ta) {
+            const raw = ta.value;
+
+            // Update clip hint
+            const clipMatches = raw.match(/\[CLIP:(\d+):(\d{2})\]/gi) || [];
+            const clipSecs = clipMatches.reduce((sum, x) => {
+                const p = x.match(/\[CLIP:(\d+):(\d{2})\]/i);
+                return sum + (parseInt(p[1], 10) * 60 + parseInt(p[2], 10));
+            }, 0);
+            const h = document.getElementById('edit-clip-hint');
+            if (h) {
+                h.textContent = clipSecs > 0
+                    ? '+' + String(Math.floor(clipSecs / 60)).padStart(2, '0') + ':' + String(clipSecs % 60).padStart(2, '0') + ' clip'
+                    : '';
+            }
+
+            // Update word count — strip all [tags], split on any whitespace including newlines
+            const stripped = raw.replace(/\[[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim();
+            const words = stripped.length > 0 ? stripped.split(' ').filter(Boolean).length : 0;
+            const secs = Math.round(words / 2.8); // ~168 wpm — typical newsreader pace
+            const st = document.getElementById('edit-script-stats');
+            if (st) {
+                st.textContent = words > 0
+                    ? words + ' words \u00b7 ~' + String(Math.floor(secs / 60)).padStart(2, '0') + ':' + String(secs % 60).padStart(2, '0') + ' read'
+                    : '';
+            }
+        };
+
         // Parse all [CLIP:m:ss] tags from a script string and return total clip seconds.
         function parseClipTags(script) {
             if (!script) return 0;
@@ -780,9 +817,9 @@
             const lined = escaped.replace(/\n/g, '<br>');
             return lined
                 .replace(/\[CLIP:(\d+):(\d{2})\]/gi,
-                    '<br><span class="bg-amber-500 text-white px-4 py-2 rounded-lg font-black uppercase tracking-widest text-4xl inline-block shadow-sm my-3">$&</span><br>')
+                    '<br><span style="font-size:0.75em" class="bg-amber-500 text-white px-4 py-2 rounded-lg font-black uppercase tracking-widest inline-block shadow-sm my-3">$&</span><br>')
                 .replace(/\[(?!CLIP:)(.*?)\]/g,
-                    '<br><span class="bg-slate-200 text-slate-900 px-4 py-2 rounded-lg font-black uppercase tracking-widest text-4xl inline-block shadow-sm my-3">$&</span><br>')
+                    '<br><span style="font-size:0.75em" class="bg-slate-200 text-slate-900 px-4 py-2 rounded-lg font-black uppercase tracking-widest inline-block shadow-sm my-3">$&</span><br>')
                 .replace(/(<br>\s*){3,}/g, '<br><br>');
         }
 
@@ -876,12 +913,44 @@
                 newMainContainer.scrollTop = savedScroll;
             }
              saveLocalState();
+
+            // Kick off takeover countdown if edit modal is open on a locked story
+            if (state.ui.editingStoryId && !state.ui.pendingConflict) {
+                const s = state.storiesMap[state.ui.editingStoryId];
+                if (s?.lockedBySession && s.lockedBySession !== state.sessionId && s.lockedAt) {
+                    startTakeoverCountdown(s.lockedAt);
+                } else {
+                    if (takeoverCountdownInterval) { clearInterval(takeoverCountdownInterval); takeoverCountdownInterval = null; }
+                }
+            } else {
+                if (takeoverCountdownInterval) { clearInterval(takeoverCountdownInterval); takeoverCountdownInterval = null; }
+            }
         }
 
            function startTXTimer() {
                 updateClockDisplays();
                 txTimerInterval = setInterval(updateClockDisplays, 1000);
             }
+
+        let takeoverCountdownInterval = null;
+        function startTakeoverCountdown(lockedAt) {
+            if (takeoverCountdownInterval) return; // already ticking
+            takeoverCountdownInterval = setInterval(() => {
+                const btn = document.getElementById('takeover-btn');
+                if (!btn) { clearInterval(takeoverCountdownInterval); takeoverCountdownInterval = null; return; }
+                const lockAge = Date.now() - lockedAt;
+                const isStale = lockAge >= STALE_LOCK_MS;
+                if (isStale) {
+                    btn.disabled = false;
+                    btn.textContent = 'Take Over';
+                    btn.className = 'text-xs bg-amber-600 hover:bg-amber-700 text-white border border-amber-700 px-3 py-1.5 rounded shadow-sm font-bold transition-colors';
+                    clearInterval(takeoverCountdownInterval);
+                    takeoverCountdownInterval = null;
+                } else {
+                    btn.textContent = `Wait ${Math.ceil((STALE_LOCK_MS - lockAge) / 1000)}s\u2026`;
+                }
+            }, 500);
+        }
 
         // ==========================================
         // OBS PLAYOUT ENGINE
@@ -1432,6 +1501,7 @@
                     <!-- Take bar -->
                     <div class="bg-slate-800 rounded-2xl p-6 flex justify-between items-center gap-4 shadow-xl">
                         <button data-action="undo-take" class="flex-1 py-5 bg-red-600 hover:bg-red-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center"><i class="fa-solid fa-rotate-left mr-2"></i>Previous</button>
+                        <button data-action="reset-runorder" class="flex-1 py-5 bg-slate-600 hover:bg-slate-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center" title="Reset to first story for rehearsal"><i class="fa-solid fa-rotate mr-2"></i>Reset</button>
                         <button data-action="take-next" class="flex-1 py-5 bg-green-600 hover:bg-green-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center">Take Next <i class="fa-solid fa-forward-step ml-2"></i></button>
                         <button id="obs-btn-take" data-obs-action="take" class="flex-1 py-5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-center">&#9654; Take Clip</button>
                     </div>
@@ -1500,7 +1570,7 @@
 
                 const container = document.getElementById('main-container');
                 if (state.mode === 'presenter' && state.ui.presenter.autoScroll && !state.ui.presenter.pausedByUser && container) {
-                    container.scrollTop += state.ui.presenter.scrollSpeed * deltaTime;
+                    container.scrollBy(0, state.ui.presenter.scrollSpeed * deltaTime);
                 }
                 requestAnimationFrame(autoscrollLoop);
             }
@@ -1622,7 +1692,6 @@
                 let rowClasses = 'border-b border-slate-200 transition-colors ';
                 if (isBelowLine) rowClasses += 'bg-slate-100 opacity-80 ';
                 else if (isActive) rowClasses += state.meta.isTXMode ? 'bg-red-50 border-l-4 border-l-red-500 ' : 'bg-amber-50 border-l-4 border-l-amber-500 ';
-                else if (isComplete) rowClasses += 'opacity-60 bg-gray-50 ';
                 else if (story.mediaFile) rowClasses += 'bg-yellow-50 hover:bg-yellow-100 ';
                 else rowClasses += 'bg-white hover:bg-slate-50 ';
                 if (story.isFloated && !isBelowLine) rowClasses += 'opacity-50 ';
@@ -1655,9 +1724,18 @@
                     ${clockCell}
                     <td class="px-3 py-1.5 text-sm italic truncate max-w-xs">${escapeHTML(story.script || 'No script...')}</td>
                     <td class="px-3 py-1.5 text-center w-16">
-                        <button data-action="toggle-complete" data-id="${id}" class="text-lg ${isComplete ? 'text-emerald-500' : 'text-slate-300'} transition-colors">
-                            <i class="fa-solid fa-circle-check"></i>
-                        </button>
+                        ${(()=>{
+                            const cs = story.completed;
+                            const colour = (!cs || cs === false || cs === null) ? 'text-slate-300'
+                                : cs === 'needs-checking' ? 'text-yellow-500'
+                                : cs === 'checked-ok' ? 'text-emerald-500'
+                                : 'text-red-500';
+                            const title = (!cs || cs === false || cs === null) ? 'Not checked — click to flag'
+                                : cs === 'needs-checking' ? 'Needs checking — click to approve'
+                                : cs === 'checked-ok' ? 'Checked OK — click to flag issue'
+                                : 'Needs work — click to clear';
+                            return `<button data-action="toggle-complete" data-id="${id}" class="text-lg ${colour} transition-colors" title="${title}"><i class="fa-solid fa-circle"></i></button>`;
+                        })()}
                     </td>
                     <td class="px-3 py-1.5 text-center w-16">
                         <button data-action="toggle-float" data-id="${id}" class="text-lg ${story.isFloated ? 'text-amber-500' : 'text-slate-300'} transition-colors" title="${story.isFloated ? 'Un-float story' : 'Float story'}">
@@ -1747,7 +1825,7 @@
                                 <th class="px-4 py-3">Dur</th>
                                 <th class="px-4 py-3">Clock</th>
                                 <th class="px-4 py-3">Preview</th>
-                                <th class="px-4 py-3 text-center">Done</th>
+                                <th class="px-4 py-3 text-center">Checked</th>
                                 <th class="px-4 py-3 text-center">Float</th>
                                 <th class="px-4 py-3 text-right">Actions</th>
                             </tr>
@@ -1848,6 +1926,7 @@
 
             return `
                 <div class="bg-black min-h-full overflow-hidden">
+                    ${pm.zenMode ? `<div class="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-black/70 text-white text-xs font-bold uppercase tracking-widest px-5 py-2 rounded-full pointer-events-none select-none">Press F or ESC to exit fullscreen</div>` : ''}
                     <div id="presenter-transform-wrapper" style="${transformStyle}"
                         class="transition-transform duration-300 pb-32">
                         <div style="max-width:65%; margin:0 auto;" class="px-4">
@@ -1956,7 +2035,18 @@
             return `<div class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-[60]">
                 <div class="bg-white rounded-2xl shadow-2xl w-full max-w-3xl flex flex-col max-h-full overflow-hidden">
                     <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50"><h3 class="text-xl font-bold text-slate-800"><i class="fa-solid fa-pen-to-square mr-2 text-blue-500"></i> Edit Story</h3><button data-action="cancel-edit" class="text-slate-400 hover:text-slate-600 text-2xl"><i class="fa-solid fa-xmark"></i></button></div>
-                    ${isLocked ? `<div class="bg-amber-100 border-b border-amber-200 px-6 py-3 flex items-center justify-between"><span class="text-amber-800 text-sm">Editing by ${escapeHTML(story.lockedByName)}.</span><button data-action="take-over-edit" class="text-xs bg-white text-amber-700 border px-3 py-1 rounded shadow-sm">Take Over</button></div>` : ''}
+                    ${isLocked ? (() => {
+                        const lockAge = story.lockedAt ? Date.now() - story.lockedAt : STALE_LOCK_MS;
+                        const isStale = lockAge >= STALE_LOCK_MS;
+                        const waitSecs = isStale ? 0 : Math.ceil((STALE_LOCK_MS - lockAge) / 1000);
+                        return `<div class="bg-amber-100 border-b border-amber-200 px-6 py-3 flex items-center justify-between">
+                            <span class="text-amber-800 text-sm">Currently being edited by <strong>${escapeHTML(story.lockedByName)}</strong>.</span>
+                            <button data-action="take-over-edit" id="takeover-btn" ${!isStale ? 'disabled' : ''}
+                                class="text-xs ${isStale ? 'bg-amber-600 hover:bg-amber-700 text-white border-amber-700' : 'bg-white text-slate-400 border-slate-300 cursor-not-allowed'} border px-3 py-1.5 rounded shadow-sm font-bold transition-colors">
+                                ${isStale ? 'Take Over' : `Wait ${waitSecs}s\u2026`}
+                            </button>
+                        </div>`;
+                    })() : ''}
                     <div class="p-6 overflow-y-auto flex-1 space-y-5">
                         <input type="hidden" id="edit-rev" value="${story.rev}">
                         <div class="grid grid-cols-4 gap-4"><div class="col-span-3"><label class="text-sm font-semibold block mb-1">Slug</label><input type="text" id="edit-slug" value="${escapeHTML(story.slug)}" class="w-full border rounded-lg px-4 py-2.5 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}></div><div class="col-span-1"><label class="text-sm font-semibold block mb-1">Format</label><select id="edit-format" class="w-full border rounded-lg px-4 py-2.5 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${formatOptions}</select></div></div>
@@ -1975,21 +2065,16 @@
                             <div class="flex items-baseline justify-between mb-1">
                                 <label class="text-sm font-semibold">Presenter Script</label>
                                 <span id="edit-script-stats" class="text-xs font-mono text-slate-400">
-                                    ${(()=>{const w=(story.script||'').trim().replace(/\[.*?\]/g,'').trim().split(/\s+/).filter(Boolean).length;const s=Math.round(w/3);return w>0?`${w} words · ~${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')} read`:''})()}
+                                    ${(()=>{
+                                        const stripped = (story.script||'').replace(/\[[^\]]*\]/g,' ').replace(/\s+/g,' ').trim();
+                                        const w = stripped.length > 0 ? stripped.split(' ').filter(Boolean).length : 0;
+                                        const s = Math.round(w / 2.8);
+                                        return w > 0 ? `${w} words \u00b7 ~${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')} read` : '';
+                                    })()}
                                 </span>
                             </div>
                             <textarea id="edit-script" class="w-full flex-1 border rounded-lg p-4 outline-none focus:border-blue-500 resize-none text-lg" ${isLocked ? 'disabled' : ''}
-                                oninput="(function(ta){
-                                    const raw=ta.value;
-                                    const m=raw.match(/\[CLIP:(\d+):(\d{2})\]/gi)||[];
-                                    const t=m.reduce((s,x)=>{const p=x.match(/\[CLIP:(\d+):(\d{2})\]/i);return s+(parseInt(p[1])*60+parseInt(p[2]));},0);
-                                    const h=document.getElementById('edit-clip-hint');
-                                    if(h)h.textContent=t>0?'+'+String(Math.floor(t/60)).padStart(2,'0')+':'+String(t%60).padStart(2,'0')+' clip':'';
-                                    const words=raw.trim().replace(/\[.*?\]/g,'').trim().split(/\s+/).filter(Boolean).length;
-                                    const secs=Math.round(words/3);
-                                    const st=document.getElementById('edit-script-stats');
-                                    if(st)st.textContent=words>0?words+' words · ~'+String(Math.floor(secs/60)).padStart(2,'0')+':'+String(secs%60).padStart(2,'0')+' read':'';
-                                })(this)"
+                                oninput="window._moiraUpdateScriptStats(this)"
                             >${escapeHTML(story.script)}</textarea>
                         </div>
                     </div>
@@ -2473,12 +2558,17 @@
 
                     if (e.key.toLowerCase() === 'f') {
                         e.preventDefault();
-                        if (!document.fullscreenElement) {
-                            document.documentElement.requestFullscreen().catch(err => console.error("Fullscreen failed", err));
+                        const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+                        if (!isFs) {
+                            const el = document.documentElement;
+                            const req = el.requestFullscreen ? el.requestFullscreen() : el.webkitRequestFullscreen ? el.webkitRequestFullscreen() : null;
+                            if (req) req.catch(() => {});
+                            state.ui.presenter.zenMode = true;
                         } else {
                             if (document.exitFullscreen) document.exitFullscreen();
+                            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+                            state.ui.presenter.zenMode = false;
                         }
-                        state.ui.presenter.zenMode = !state.ui.presenter.zenMode;
                         render();
                     }
 
@@ -2512,6 +2602,17 @@
                     }
                 }
             });
+
+            // 1b. FULLSCREEN CHANGE — sync zenMode when browser ESC exits fullscreen (Safari + Chrome)
+            function handleFullscreenChange() {
+                const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+                if (!isFs && state.ui.presenter.zenMode) {
+                    state.ui.presenter.zenMode = false;
+                    render();
+                }
+            }
+            document.addEventListener('fullscreenchange', handleFullscreenChange);
+            document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
 
             // 2. CONFIG PASTE LISTENER
             document.body.addEventListener('input', e => {
@@ -2810,6 +2911,22 @@
                 }
                 if (action === 'take-next') shiftActiveStory(1);
                 if (action === 'undo-take') shiftActiveStory(-1);
+                if (action === 'reset-runorder') {
+                    const rawOrder = state.meta.order || [];
+                    const markerIdx = rawOrder.indexOf('marker-line');
+                    const storyIds = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
+                        .filter(id => !state.storiesMap[id]?.isFloated);
+                    const firstId = storyIds[0] || null;
+                    const now = Date.now();
+                    const updates = {
+                        activeStoryId: firstId,
+                        activeStoryStartedAt: firstId ? now : null,
+                        showStartTime: (state.meta.isTXMode || state.meta.isRehearsalMode) ? now : state.meta.showStartTime,
+                        txStartedAt: (state.meta.isTXMode || state.meta.isRehearsalMode) ? now : state.meta.txStartedAt,
+                    };
+                    updateBulletinMeta(updates);
+                    return;
+                }
 
                 if (action === 'presenter-font-up') { state.ui.presenter.fontScale = Math.min(state.ui.presenter.fontScale + 0.15, 2.5); render(); return; }
                 if (action === 'presenter-font-down') { state.ui.presenter.fontScale = Math.max(state.ui.presenter.fontScale - 0.15, 0.4); render(); return; }
