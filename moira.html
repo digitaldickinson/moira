@@ -16,6 +16,19 @@
         .obs-tally-preview { box-shadow: 0 0 14px 2px rgba(37, 99, 235, 0.5); border-color: #2563eb !important; }
         /* Safari-compatible scrolling for main container */
         #main-container { -webkit-overflow-scrolling: touch; overflow-y: auto; }
+        /* ── PPM METER ── */
+        .ppm-row { display: flex; align-items: center; gap: 4px; height: 8px; }
+        .ppm-ch-label { font-family: monospace; font-size: 9px; font-weight: 700; color: #94a3b8; width: 10px; text-align: center; flex-shrink: 0; }
+        .ppm-bar-wrap { flex: 1; display: flex; flex-direction: row; gap: 1px; height: 100%; }
+        .ppm-seg { flex: 1; border-radius: 1px; }
+        .ppm-dbval { font-family: monospace; font-size: 9px; color: #94a3b8; width: 52px; text-align: right; flex-shrink: 0; }
+        .ppm-dbval.hot  { color: #dc2626; font-weight: 700; }
+        .ppm-dbval.warn { color: #d97706; }
+        .ppm-scale-row { display: flex; gap: 4px; padding-top: 2px; }
+        .ppm-scale-spacer   { width: 14px; flex-shrink: 0; }
+        .ppm-scale-spacer-r { width: 52px;  flex-shrink: 0; }
+        .ppm-scale-inner { flex: 1; position: relative; height: 12px; }
+        .ppm-tick { position: absolute; top: 0; font-size: 8px; font-family: monospace; color: #94a3b8; transform: translateX(-50%); white-space: nowrap; line-height: 1; }
     </style>
 </head>
 <body class="bg-gray-50 h-screen flex flex-col overflow-hidden text-slate-800">
@@ -38,6 +51,20 @@
         const DEFAULT_FORMATS = ["READ", "WRAP", "VOICER", "CLIP", "OOV", "ULAY", "OOV/CLIP", "ULAY/CLIP", "OVO", "FLOAT", "LIVE"];
         const DEFAULT_ROLES = ["Producer", "Reporter", "Presenter"];
         const STALE_LOCK_MS = 1000 * 10; // 10 Seconds
+        // PPM constants — EBU Type II ballistics
+        const PPM_SEGMENTS       = 24;
+        const PPM_DB_MIN         = -36;
+        const PPM_DB_MAX         = 0;
+        const PPM_DB_RANGE       = 36;
+        const PPM_SEG_DB         = PPM_DB_RANGE / PPM_SEGMENTS;  // 1.5 dB per segment
+        const PPM_DECAY_PER_TICK = 0.343;   // ~8.57 dB/s at 40ms tick
+        const PPM_HOLD_MS        = 1800;
+        const PPM_SCALE_TICKS    = [-36, -24, -18, -12, -9, -6, -3, 0];
+        const PPM_SEG_COLOURS    = Array.from({length:PPM_SEGMENTS},(_,i)=>i>=22?'#dc2626':i>=18?'#d97706':'#16a34a');
+        const PPM_HOLD_COLOURS   = Array.from({length:PPM_SEGMENTS},(_,i)=>i>=22?'#fca5a5':i>=18?'#fcd34d':'#86efac');
+        const PPM_SEG_UNLIT      = '#e2e8f0';
+
+        const setSinkIdSupported = typeof HTMLAudioElement.prototype.setSinkId === 'function';
 
         const INITIAL_META = {
             order: [], staff: [], formats: DEFAULT_FORMATS, roles: DEFAULT_ROLES,
@@ -94,6 +121,31 @@
             localStorage.setItem('OBS_BASE_FOLDER', document.getElementById('obs-set-base')?.value || obsConfig.base);
             loadObsConfig();
         }
+        function loadRadioConfig() {
+                state.radio.selectedSinkId = localStorage.getItem('RADIO_SINK_ID') || '';
+            }
+                // Radio audio engine globals
+        let radioAudioCtx = null;
+        let radioRafId = null;
+
+        function getRadioCtx() {
+            if (!radioAudioCtx) radioAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (radioAudioCtx.state === 'suspended') radioAudioCtx.resume();
+            return radioAudioCtx;
+        }
+
+        function makeRadioDeckState(id) {
+            return {
+                id, audio: null, sourceNode: null, splitter: null,
+                analyserL: null, analyserR: null, gainNode: null,
+                state: 'idle', duration: 0, filename: '', slug: '',
+                objectUrl: null, meterInterval: null, loadedStoryId: null,
+                ppm: {
+                    L: { level: PPM_DB_MIN, hold: PPM_DB_MIN, holdAt: 0 },
+                    R: { level: PPM_DB_MIN, hold: PPM_DB_MIN, holdAt: 0 }
+                }
+            };
+        }
 
         const getPaths = (id) => ({
             bulletins: ['artifacts', id, 'public', 'data', 'bulletins'],
@@ -106,6 +158,15 @@
         // ==========================================
         const savedRoomName = localStorage.getItem('moira_room_name') || 'Main';
         const savedBulletinId = localStorage.getItem('moira_bulletin_id') || 'bulletin-primary';
+        // Migration: old boolean showPlayout → new string playoutBackend
+        const _oldShow = localStorage.getItem('moira_show_playout');
+        if (_oldShow !== null) {
+            if (_oldShow === 'true' && !localStorage.getItem('moira_playout_backend')) {
+                localStorage.setItem('moira_playout_backend', 'obs');
+            }
+            localStorage.removeItem('moira_show_playout');
+        }
+        const savedPlayoutBackend = localStorage.getItem('moira_playout_backend') || 'none';
 
         let state = {
             mode: "newsroom", 
@@ -127,6 +188,15 @@
                 clipQueue: [],  // storyIds with mediaFiles, in rundown order
                 clipIndex: -1,  // index into clipQueue of the clip currently on program deck
                 log: []        // [{ time, type, msg }]
+            },
+             radio: {
+                deckA: makeRadioDeckState('A'),
+                deckB: makeRadioDeckState('B'),
+                clipQueue: [], clipIndex: -1,
+                selectedSinkId: '',
+                devices: [],
+                directoryHandle: null,
+                log: []
             },
             ui: {
                 draggedStoryId: null,
@@ -151,7 +221,7 @@
                     presenterMode: 'autocue',  // 'autocue' | 'presenter'
                     expandedStoryId: null
                 },
-                showPlayout: false,
+                playoutBackend: savedPlayoutBackend,  // 'none' | 'radio' | 'obs'
                 trash: [],           // [{id, story, orderIndex, deletedAt}]
                 storySnapshots: {}   // {storyId: previousStoryData} — set before each save
             }
@@ -163,7 +233,7 @@
         // ==========================================
         // 3. STARTUP & FIREBASE INIT
         // ==========================================
-        async function boot() {
+       async function boot() {
             state.myStaffId = localStorage.getItem('moira_my_staff_id');
             if (firebaseConfig) state.connectionState = 'connecting';
             // Start heartbeat — updates lastSeen every 30s while checked in
@@ -176,9 +246,12 @@
             }, 30000);
             
             // Load OBS config and attempt connection only if playout is enabled
-            if (state.ui.showPlayout) {
+            if (state.ui.playoutBackend === 'obs') {
                 loadObsConfig();
                 connectObs();
+            } else if (state.ui.playoutBackend === 'radio') {
+                loadRadioConfig();
+                populateRadioDevices();
             }
             
             if (firebaseConfig) {
@@ -490,24 +563,21 @@
             const markerIdx = order.indexOf('marker-line');
             const storyIds = markerIdx > -1 ? order.slice(0, markerIdx) : order;
             const firstStoryId = storyIds[0] || null;
-
-            // Build the active order (no floated stories) for OBS loading
             const activeOrder = storyIds.filter(id => !state.storiesMap[id]?.isFloated);
 
             let updates = {
                 isTXMode: false,
                 isRehearsalMode: false,
-                isCued: true,                    // always cued
+                isCued: true,
                 showStartTime: null,
                 txStartedAt: null,
                 txTargetDuration: null,
                 activeStoryStartedAt: null,
-                activeStoryId: firstStoryId      // always default to first story
+                activeStoryId: firstStoryId
             };
 
-            if (targetMode === 'tx' || targetMode === 'rehearsal') {
-                updates.isTXMode = targetMode === 'tx';
-                updates.isRehearsalMode = targetMode === 'rehearsal';
+            if (targetMode === 'tx') {
+                updates.isTXMode = true;
                 updates.showStartTime = Date.now();
                 updates.txStartedAt = Date.now();
                 updates.activeStoryStartedAt = Date.now();
@@ -525,12 +595,12 @@
                 } catch(e) { console.error('Mode update failed', e); }
             }
 
-            // On TX/Rehearsal start, load first two media clips into the decks
-            if (targetMode === 'tx' || targetMode === 'rehearsal') {
-                obsInitialLoad(activeOrder);
+            // Prime playout on TX start and on standby (entering Studio view)
+            if (targetMode === 'tx' || targetMode === 'standby') {
+                if (state.ui.playoutBackend === 'obs')        obsInitialLoad(activeOrder);
+                else if (state.ui.playoutBackend === 'radio') radioInitialLoad(activeOrder);
             }
         }
-
 
       async function shiftActiveStory(direction) {
             if (!canMutate()) return;
@@ -567,6 +637,9 @@
                     await updateDoc(doc(db, ...paths.bulletins, state.currentBulletinId), updates);
                 } catch(e) { console.error('Shift failed', e); }
             }
+
+            // Sync playout decks to the new active story position
+            await syncPlayoutToActive(nextId);
         }
 
 
@@ -891,13 +964,13 @@
             }
 
             // TX Timer housekeeping
-            if ((state.meta.isTXMode || state.meta.isRehearsalMode) && state.meta.txStartedAt) {
+            if (state.meta.isTXMode && state.meta.txStartedAt) {
                 if (!txTimerInterval) startTXTimer();
             } else if (txTimerInterval) {
                 clearInterval(txTimerInterval);
                 txTimerInterval = null;
             }
-            if (state.meta.isTXMode || state.meta.isRehearsalMode) updateClockDisplays();
+            if (state.meta.isTXMode) updateClockDisplays();
 
 
             const newMainContainer = document.getElementById('main-container');
@@ -951,7 +1024,561 @@
                 }
             }, 500);
         }
+        // ==========================================
+        // RADIO PLAYOUT ENGINE
+        // ==========================================
 
+        function radioLog(msg, type = 'info') {
+            const time = new Date().toISOString().split('T')[1].substring(0, 12);
+            state.radio.log.unshift({ time, type, msg });
+            if (state.radio.log.length > 80) state.radio.log.pop();
+            const el = document.getElementById('radio-log-container');
+            if (el) el.innerHTML = renderRadioLog();
+        }
+
+        function renderRadioLog() {
+            if (state.radio.log.length === 0) return '<span class="text-slate-400 italic">No radio events yet.</span>';
+            return state.radio.log.map(e => {
+                const col = e.type === 'error' ? 'text-red-500' : e.type === 'success' ? 'text-emerald-600' : e.type === 'warn' ? 'text-amber-600' : 'text-slate-500';
+                const prefix = e.type === 'error' ? '[ERR]' : e.type === 'success' ? '[OK]' : e.type === 'warn' ? '[WARN]' : '[INFO]';
+                return `<div class="${col}"><span class="text-slate-300 mr-1">${e.time}</span><span class="font-bold mr-1">${prefix}</span>${escapeHTML(e.msg)}</div>`;
+            }).join('');
+        }
+
+     async function populateRadioDevices() {
+            if (!setSinkIdSupported || !navigator.mediaDevices) {
+                state.radio.devices = [];
+                render();
+                return;
+            }
+            // On file:// origins mediaDevices.enumerateDevices may throw or return
+            // empty unlabelled results — catch silently and fall back to system default
+            try {
+                const devs = await navigator.mediaDevices.enumerateDevices();
+                // Filter out entries with no label — file:// returns phantom entries
+                const outputs = devs.filter(d => d.kind === 'audiooutput' && d.deviceId);
+                state.radio.devices = outputs;
+            } catch(e) {
+                state.radio.devices = [];
+            }
+            render();
+        }
+
+        // PPM ballistics — peak detection on time-domain data
+        function peakDbFromTimeDomain(data) {
+            let peak = 0;
+            for (let i = 0; i < data.length; i++) {
+                const s = Math.abs(data[i] - 128) / 128;
+                if (s > peak) peak = s;
+            }
+            return peak === 0 ? -Infinity : 20 * Math.log10(peak);
+        }
+
+        function tickRadioChannel(deck, ch, newDb) {
+            const s = deck.ppm[ch];
+            const now = Date.now();
+
+            // Instantaneous attack, EBU Type II decay
+            if (newDb >= s.level) { s.level = newDb; }
+            else { s.level = Math.max(PPM_DB_MIN, s.level - PPM_DECAY_PER_TICK); }
+
+            // Peak hold
+            if (newDb >= s.hold) { s.hold = newDb; s.holdAt = now; }
+            else if (now - s.holdAt > PPM_HOLD_MS) {
+                s.hold = Math.max(PPM_DB_MIN, s.hold - PPM_DECAY_PER_TICK);
+            }
+
+            const clampedDb = Math.max(PPM_DB_MIN, Math.min(PPM_DB_MAX, s.level));
+            const litCount  = Math.max(0, Math.floor((clampedDb - PPM_DB_MIN) / PPM_SEG_DB));
+            const holdDb    = Math.max(PPM_DB_MIN, Math.min(PPM_DB_MAX, s.hold));
+            const holdIdx   = Math.max(0, Math.min(PPM_SEGMENTS - 1,
+                Math.floor((holdDb - PPM_DB_MIN) / PPM_SEG_DB)));
+
+            for (let i = 0; i < PPM_SEGMENTS; i++) {
+                const seg = document.getElementById(`ppm-seg-${deck.id}-${ch}-${i}`);
+                if (!seg) return;
+                seg.style.background = i < litCount
+                    ? PPM_SEG_COLOURS[i]
+                    : (i === holdIdx && holdDb > PPM_DB_MIN + PPM_SEG_DB)
+                    ? PPM_HOLD_COLOURS[i]
+                    : PPM_SEG_UNLIT;
+            }
+
+            const valEl = document.getElementById(`ppm-val-${deck.id}-${ch}`);
+            if (valEl) {
+                if (s.level <= PPM_DB_MIN + 1) {
+                    valEl.textContent = '—';
+                    valEl.className = 'ppm-dbval';
+                } else {
+                    const r = Math.round(s.level);
+                    valEl.textContent = (r > 0 ? '+' : '') + r + ' dBFS';
+                    valEl.className = 'ppm-dbval' + (s.level >= -3 ? ' hot' : s.level >= -9 ? ' warn' : '');
+                }
+            }
+        }
+
+        function startRadioMeter(deck) {
+            if (deck.meterInterval) clearInterval(deck.meterInterval);
+            if (!deck.analyserL || !deck.analyserR) return;
+            const dataL = new Uint8Array(deck.analyserL.fftSize);
+            const dataR = new Uint8Array(deck.analyserR.fftSize);
+            deck.meterInterval = setInterval(() => {
+                deck.analyserL.getByteTimeDomainData(dataL);
+                deck.analyserR.getByteTimeDomainData(dataR);
+                tickRadioChannel(deck, 'L', peakDbFromTimeDomain(dataL));
+                tickRadioChannel(deck, 'R', peakDbFromTimeDomain(dataR));
+            }, 40);
+        }
+
+        function stopRadioMeter(deck) {
+            if (deck.meterInterval) { clearInterval(deck.meterInterval); deck.meterInterval = null; }
+            for (const ch of ['L', 'R']) {
+                deck.ppm[ch].level = PPM_DB_MIN;
+                deck.ppm[ch].hold  = PPM_DB_MIN;
+                deck.ppm[ch].holdAt = 0;
+                tickRadioChannel(deck, ch, -Infinity);
+            }
+        }
+
+        function fmtRadioTC(s) {
+            if (!isFinite(s) || s < 0) s = 0;
+            return String(Math.floor(s / 60)).padStart(2, '0') + ':' +
+                String(Math.floor(s % 60)).padStart(2, '0') + '.' +
+                Math.floor((s % 1) * 10);
+        }
+
+        function startRadioDisplayLoop() {
+            if (radioRafId) return;
+            (function loop() {
+                for (const dk of ['deckA', 'deckB']) {
+                    const d = state.radio[dk];
+                    if (!d.audio) continue;
+                    const cur = d.audio.currentTime;
+                    const tcEl = document.getElementById(`radio-tc-${d.id}`);
+                    const pbEl = document.getElementById(`radio-prog-${d.id}`);
+                    if (tcEl) tcEl.textContent = fmtRadioTC(cur);
+                    if (pbEl) pbEl.style.width = d.duration > 0
+                        ? (cur / d.duration * 100).toFixed(1) + '%' : '0%';
+                }
+                radioRafId = requestAnimationFrame(loop);
+            })();
+        }
+
+        async function radioLoadFile(deckKey, file, storyId = null) {
+            const deck = state.radio[deckKey];
+            radioLog(`Loading "${file.name}" → Deck ${deck.id}…`, 'info');
+
+            // Teardown existing
+            if (deck.audio) {
+                deck.audio.pause();
+                for (const n of [deck.sourceNode, deck.splitter, deck.analyserL, deck.analyserR, deck.gainNode]) {
+                    if (n) try { n.disconnect(); } catch(e) {}
+                }
+            }
+            if (deck.objectUrl) { URL.revokeObjectURL(deck.objectUrl); deck.objectUrl = null; }
+            stopRadioMeter(deck);
+            deck.audio = null; deck.sourceNode = null; deck.splitter = null;
+            deck.analyserL = null; deck.analyserR = null; deck.gainNode = null;
+
+            deck.state = 'loading';
+            deck.filename = file.name;
+            deck.slug = file.name.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ').toUpperCase();
+            deck.loadedStoryId = storyId;
+            render();
+
+            deck.objectUrl = URL.createObjectURL(file);
+            const audio = new Audio();
+            audio.src = deck.objectUrl;
+            audio.preload = 'auto';
+            deck.audio = audio;
+
+            if (state.radio.selectedSinkId && audio.setSinkId) {
+                try { await audio.setSinkId(state.radio.selectedSinkId); } catch(e) {}
+            }
+
+            // Audio graph: source → gain → destination (audible output)
+            //              source → splitter → analyserL/R (metering tap only, no output)
+            const ctx      = getRadioCtx();
+            const src      = ctx.createMediaElementSource(audio);
+            const splitter = ctx.createChannelSplitter(2);
+            const aL       = ctx.createAnalyser();
+            const aR       = ctx.createAnalyser();
+            const gain     = ctx.createGain();
+            aL.fftSize = 2048; aR.fftSize = 2048;
+            src.connect(gain);
+            gain.connect(ctx.destination);
+            src.connect(splitter);
+            splitter.connect(aL, 0);
+            splitter.connect(aR, 1);
+
+            deck.sourceNode = src; deck.splitter = splitter;
+            deck.analyserL = aL;   deck.analyserR = aR;
+            deck.gainNode = gain;
+
+            await new Promise((resolve, reject) => {
+                audio.addEventListener('loadedmetadata', resolve, { once: true });
+                audio.addEventListener('error', () => reject(new Error(audio.error?.message || 'Load error')), { once: true });
+                setTimeout(() => reject(new Error('Timeout')), 10000);
+            }).catch(e => radioLog(`Deck ${deck.id} load error: ${e.message}`, 'error'));
+
+            deck.duration = audio.duration || 0;
+            audio.currentTime = 0;
+            deck.state = 'cued';
+
+            audio.addEventListener('ended', () => {
+                audio.currentTime = 0;
+                stopRadioMeter(deck);
+                deck.state = 'cued';
+                radioLog(`Deck ${deck.id} ended — re-cued.`, 'info');
+                render();
+            });
+
+            radioLog(`Deck ${deck.id} cued: "${deck.slug}" (${formatDuration(deck.duration)})`, 'success');
+            startRadioDisplayLoop();
+            render();
+        }
+
+        function radioPlay(deckKey) {
+            const deck = state.radio[deckKey];
+            if (!deck.audio || (deck.state !== 'cued' && deck.state !== 'paused')) return;
+            getRadioCtx();
+            deck.audio.play()
+                .then(() => {
+                    deck.state = 'playing';
+                    startRadioMeter(deck);
+                    radioLog(`Deck ${deck.id} — PLAYING`, 'success');
+                    render();
+                })
+                .catch(e => radioLog(`Deck ${deck.id} play error: ${e.message}`, 'error'));
+        }
+
+        function radioPause(deckKey) {
+            const deck = state.radio[deckKey];
+            if (!deck.audio || deck.state !== 'playing') return;
+            deck.audio.pause();
+            stopRadioMeter(deck);
+            deck.state = 'paused';
+            radioLog(`Deck ${deck.id} — PAUSED`, 'warn');
+            render();
+        }
+
+        function radioStop(deckKey) {
+            const deck = state.radio[deckKey];
+            if (!deck.audio) return;
+            deck.audio.pause();
+            deck.audio.currentTime = 0;
+            stopRadioMeter(deck);
+            deck.state = 'cued';
+            radioLog(`Deck ${deck.id} — STOPPED & re-cued`, 'warn');
+            render();
+        }
+
+        function radioCue(deckKey) {
+            const deck = state.radio[deckKey];
+            if (!deck.audio) return;
+            deck.audio.pause();
+            deck.audio.currentTime = 0;
+            stopRadioMeter(deck);
+            deck.state = 'cued';
+            radioLog(`Deck ${deck.id} — cued to 0`, 'info');
+            render();
+        }
+
+        function radioScrub(deckId, e) {
+            const deckKey = deckId === 'A' ? 'deckA' : 'deckB';
+            const deck = state.radio[deckKey];
+            if (!deck.audio || deck.duration === 0) return;
+            const bg = document.getElementById(`radio-prog-bg-${deckId}`);
+            if (!bg) return;
+            const rect = bg.getBoundingClientRect();
+            deck.audio.currentTime = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * deck.duration;
+        }
+
+        async function radioExecuteTake() {
+            const deckA = state.radio.deckA;
+            const deckB = state.radio.deckB;
+            const cuedDeck = (deckA.state === 'cued' || deckA.state === 'paused') ? deckA
+                        : (deckB.state === 'cued' || deckB.state === 'paused') ? deckB
+                        : null;
+            const playingDeck = deckA.state === 'playing' ? deckA
+                            : deckB.state === 'playing' ? deckB
+                            : null;
+
+            if (!cuedDeck || !cuedDeck.audio) {
+                radioLog('No cued deck available for take.', 'warn');
+                return;
+            }
+
+            getRadioCtx();
+            try {
+                await cuedDeck.audio.play();
+                cuedDeck.state = 'playing';
+                startRadioMeter(cuedDeck);
+                radioLog(`Deck ${cuedDeck.id} — ON AIR`, 'success');
+            } catch(e) {
+                radioLog(`Take failed: ${e.message}`, 'error');
+                return;
+            }
+
+            // Stop outgoing deck and update queue index after short buffer
+            if (playingDeck) {
+                setTimeout(() => {
+                    if (playingDeck.audio) {
+                        playingDeck.audio.pause();
+                        playingDeck.audio.currentTime = 0;
+                    }
+                    stopRadioMeter(playingDeck);
+                    playingDeck.state = 'cued';
+                    state.radio.clipIndex = Math.max(state.radio.clipIndex, 0) + 1;
+                    const nextIdx = state.radio.clipIndex + 1;
+                    const queue = state.radio.clipQueue;
+                    if (nextIdx < queue.length) {
+                        const nextStory = state.storiesMap[queue[nextIdx]];
+                        if (nextStory) {
+                            playingDeck.slug = nextStory.slug;
+                            playingDeck.filename = nextStory.mediaFile;
+                            playingDeck.loadedStoryId = queue[nextIdx];
+                            radioLog(`Deck ${playingDeck.id} freed — load "${nextStory.mediaFile}" for next clip.`, 'info');
+                        }
+                    }
+                    render();
+                }, 300);
+            } else {
+                state.radio.clipIndex++;
+            }
+            render();
+        }
+
+        // Attempt to get a File object from the granted directory handle by filename.
+        // Returns the File if found, null if no handle granted or file not found.
+        async function radioGetFileFromHandle(filename) {
+            if (!state.radio.directoryHandle) return null;
+            try {
+                const fileHandle = await state.radio.directoryHandle.getFileHandle(filename);
+                return await fileHandle.getFile();
+            } catch(e) {
+                radioLog(`Could not find "${filename}" in media folder.`, 'warn');
+                return null;
+            }
+        }
+
+        async function radioInitialLoad(activeOrder) {
+            const queue = activeOrder.filter(id => !!state.storiesMap[id]?.mediaFile);
+            state.radio.clipQueue = queue;
+            state.radio.clipIndex = -1;
+
+            if (queue.length === 0) { radioLog('No media clips in running order.', 'info'); return; }
+
+            radioLog(`Clip queue: ${queue.length} clip(s). ${state.radio.directoryHandle ? 'Auto-loading from media folder...' : 'Load files onto decks manually.'}`, 'info');
+
+            // Try auto-load from directory handle for first two clips
+            const deckPairs = [
+                { storyId: queue[0], deckKey: 'deckA' },
+                { storyId: queue[1], deckKey: 'deckB' }
+            ];
+
+            for (const { storyId, deckKey } of deckPairs) {
+                if (!storyId) continue;
+                const story = state.storiesMap[storyId];
+                if (!story) continue;
+
+                if (state.radio.directoryHandle) {
+                    const file = await radioGetFileFromHandle(story.mediaFile);
+                    if (file) {
+                        await radioLoadFile(deckKey, file, storyId);
+                        continue;
+                    }
+                }
+                // Fallback: label the deck so operator knows what to load
+                const deck = state.radio[deckKey];
+                if (!deck.audio) {
+                    deck.slug = story.slug;
+                    deck.filename = story.mediaFile;
+                    deck.loadedStoryId = storyId;
+                }
+            }
+            render();
+        }
+
+        // Syncs playout decks to match a new active story position.
+        // Called after Previous / Next / Reset so decks stay in step with the rundown.
+        async function syncPlayoutToActive(newActiveStoryId) {
+            if (state.ui.playoutBackend === 'none') return;
+
+            const rawOrder = state.meta.order || [];
+            const markerIdx = rawOrder.indexOf('marker-line');
+            const activeOrder = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
+                .filter(id => !state.storiesMap[id]?.isFloated);
+
+            const queue = activeOrder.filter(id => !!state.storiesMap[id]?.mediaFile);
+            if (queue.length === 0) return;
+
+            // The active story goes on Deck A (preview/cued), next clip goes on Deck B (standby).
+            const activeClipIdx = newActiveStoryId ? queue.indexOf(newActiveStoryId) : 0;
+            const deckAStoryId  = queue[activeClipIdx > -1 ? activeClipIdx     : 0] || null;
+            const deckBStoryId  = queue[activeClipIdx > -1 ? activeClipIdx + 1 : 1] || null;
+
+            if (state.ui.playoutBackend === 'radio') {
+                state.radio.clipQueue  = queue;
+                state.radio.clipIndex  = Math.max(activeClipIdx - 1, -1);
+
+                // Stop both decks cleanly before reloading
+                for (const dk of ['deckA', 'deckB']) {
+                    const deck = state.radio[dk];
+                    if (deck.audio) { deck.audio.pause(); deck.audio.currentTime = 0; }
+                    stopRadioMeter(deck);
+                    deck.state = 'idle';
+                }
+
+                const loadOrLabel = async (deckKey, storyId) => {
+                    if (!storyId) return;
+                    const story = state.storiesMap[storyId];
+                    if (!story) return;
+                    if (state.radio.directoryHandle) {
+                        const file = await radioGetFileFromHandle(story.mediaFile);
+                        if (file) { await radioLoadFile(deckKey, file, storyId); return; }
+                    }
+                    // No directory handle or file not found — label only
+                    const deck = state.radio[deckKey];
+                    deck.slug = story.slug;
+                    deck.filename = story.mediaFile;
+                    deck.loadedStoryId = storyId;
+                };
+
+                await loadOrLabel('deckA', deckAStoryId);
+                await loadOrLabel('deckB', deckBStoryId);
+                radioLog(`Deck sync → A: "${state.storiesMap[deckAStoryId]?.mediaFile || 'empty'}"  B: "${state.storiesMap[deckBStoryId]?.mediaFile || 'empty'}"`, 'info');
+                render();
+
+            } else if (state.ui.playoutBackend === 'obs') {
+                if (!state.obs.connected) return;
+                state.obs.clipQueue = queue;
+                state.obs.clipIndex = Math.max(activeClipIdx - 1, -1);
+                if (deckAStoryId) { await obsLoadDeck('A', deckAStoryId); obsLog(`Sync → Deck A: "${state.storiesMap[deckAStoryId]?.mediaFile}"`, 'info'); }
+                if (deckBStoryId) { await obsLoadDeck('B', deckBStoryId); obsLog(`Sync → Deck B: "${state.storiesMap[deckBStoryId]?.mediaFile}"`, 'info'); }
+            }
+        }
+
+        function renderPPMStrip(deckId) {
+                const rows = ['L', 'R'].map(ch => {
+                    const segs = Array.from({length: PPM_SEGMENTS}, (_, i) =>
+                        `<div class="ppm-seg" id="ppm-seg-${deckId}-${ch}-${i}" style="background:${PPM_SEG_UNLIT}"></div>`
+                    ).join('');
+                    return `<div class="ppm-row">
+                        <span class="ppm-ch-label">${ch}</span>
+                        <div class="ppm-bar-wrap">${segs}</div>
+                        <span class="ppm-dbval" id="ppm-val-${deckId}-${ch}">—</span>
+                    </div>`;
+                }).join('');
+                const ticks = PPM_SCALE_TICKS.map(db => {
+                    const pct = (db - PPM_DB_MIN) / PPM_DB_RANGE * 100;
+                    return `<span class="ppm-tick" style="left:${pct}%">${db === 0 ? '0' : String(db)}</span>`;
+                }).join('');
+                return `<div class="bg-slate-50 border border-slate-100 rounded px-3 py-2 space-y-1">
+                    ${rows}
+                    <div class="ppm-scale-row">
+                        <div class="ppm-scale-spacer"></div>
+                        <div class="ppm-scale-inner">${ticks}</div>
+                        <div class="ppm-scale-spacer-r"></div>
+                    </div>
+                </div>`;
+            }
+
+            function renderRadioDeck(deckKey) {
+                const d = state.radio[deckKey];
+                if (!d) return '<div class="bg-white border-2 rounded-xl p-4 text-slate-400 text-sm italic">Deck unavailable</div>';
+                const isPlaying = d.state === 'playing';
+                const isCued    = d.state === 'cued' || d.state === 'paused';
+                const borderClass = isPlaying ? 'obs-tally-program border-red-400'
+                                : isCued    ? 'obs-tally-preview border-blue-400'
+                                : 'border-slate-200';
+                const tallyLabel = isPlaying
+                    ? '<span class="text-red-600 font-black tracking-widest text-xs">ON AIR</span>'
+                    : isCued
+                    ? '<span class="text-blue-600 font-bold tracking-widest text-xs">CUED</span>'
+                    : '<span class="text-slate-400 text-xs">STANDBY</span>';
+                const timeClass = 'font-mono text-lg font-bold px-3 py-1 rounded transition-all '
+                    + (isPlaying ? 'bg-red-50 text-red-600' : isCued ? 'bg-amber-50 text-amber-700' : 'bg-slate-100 text-slate-700');
+                const canPlay  = d.state === 'cued' || d.state === 'paused';
+                const canPause = d.state === 'playing';
+                const canStop  = d.state === 'playing' || d.state === 'paused';
+                const canCue   = d.state === 'cued' || d.state === 'playing' || d.state === 'paused';
+                const btnOn  = (col) => `p-2 rounded border transition-colors ${col} text-white`;
+                const btnOff = 'p-2 rounded border transition-colors bg-slate-100 border-slate-200 text-slate-300 cursor-not-allowed';
+
+                return `
+                    <div id="radio-deck-${d.id}" class="bg-white border-2 rounded-xl p-4 flex flex-col gap-3 transition-all duration-300 ${borderClass}">
+                        <div class="flex justify-between items-center">
+                            <span class="font-bold text-slate-700 bg-slate-100 px-3 py-1 rounded text-sm font-mono tracking-widest">CLIP ${d.id}</span>
+                            <div>${tallyLabel}</div>
+                            <span id="radio-tc-${d.id}" class="${timeClass}">${fmtRadioTC(d.audio ? d.audio.currentTime : 0)}</span>
+                        </div>
+                        <div class="bg-slate-200 rounded-full h-1 cursor-pointer" id="radio-prog-bg-${d.id}" data-action="radio-scrub" data-deck="${d.id}">
+                            <div id="radio-prog-${d.id}" class="h-1 rounded-full ${isPlaying ? 'bg-red-400' : 'bg-blue-300'} transition-colors" style="width:${d.duration > 0 && d.audio ? (d.audio.currentTime / d.duration * 100).toFixed(1) : 0}%"></div>
+                        </div>
+                        <div class="flex flex-col gap-0.5 bg-slate-50 border border-slate-100 rounded px-3 py-2 min-h-[40px]">
+                            ${d.slug
+                                ? `<span class="font-bold text-slate-800 text-sm truncate">${escapeHTML(d.slug)}</span>
+                                <span class="text-xs text-slate-400 font-mono truncate">${escapeHTML(d.filename)}</span>`
+                                : `<span class="text-slate-400 text-xs italic">No clip loaded</span>`}
+                        </div>
+                        ${renderPPMStrip(d.id)}
+                        <div class="flex justify-center gap-2">
+                            <button data-action="radio-play"  data-deck="${d.id}" ${canPlay  ? '' : 'disabled'} class="${canPlay  ? btnOn('bg-green-500 border-green-600 hover:bg-green-400') : btnOff}" title="Play">
+                                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd"/></svg>
+                            </button>
+                            <button data-action="radio-pause" data-deck="${d.id}" ${canPause ? '' : 'disabled'} class="${canPause ? btnOn('bg-amber-400 border-amber-500 hover:bg-amber-300') : btnOff}" title="Pause">
+                                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"/></svg>
+                            </button>
+                            <button data-action="radio-stop"  data-deck="${d.id}" ${canStop  ? '' : 'disabled'} class="${canStop  ? btnOn('bg-red-500 border-red-600 hover:bg-red-400') : btnOff}" title="Stop">
+                                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clip-rule="evenodd"/></svg>
+                            </button>
+                            <button data-action="radio-cue"   data-deck="${d.id}" ${canCue   ? '' : 'disabled'} class="${canCue   ? btnOn('bg-blue-500 border-blue-600 hover:bg-blue-400') : btnOff}" title="Cue to 0">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 19l-7-7 7-7m8 14l-7-7 7-7"/></svg>
+                            </button>
+                            <label class="p-2 rounded border border-slate-300 bg-slate-100 hover:bg-slate-200 text-slate-600 cursor-pointer transition-colors" title="Load audio file">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+                                <input type="file" id="radio-file-${d.id}" accept="audio/*" class="hidden">
+                            </label>
+                        </div>
+                        <div class="bg-slate-50 border border-slate-100 rounded px-3 py-1.5 text-xs font-mono text-slate-500 flex justify-between">
+                            <span>State: <span class="text-slate-800 font-bold">${d.state.toUpperCase()}</span></span>
+                            <span>Dur: <span class="text-slate-800">${formatDuration(d.duration)}</span></span>
+                        </div>
+                    </div>`;
+            }
+
+            function renderRadioPlayout() {
+                const sinkInfo = setSinkIdSupported
+                    ? (state.radio.selectedSinkId
+                        ? `<span class="text-xs text-emerald-600 font-medium">→ Custom output active</span>`
+                        : `<span class="text-xs text-slate-400">→ System default output</span>`)
+                    : `<span class="text-xs text-slate-400 italic">→ System default (use Loopback / BlackHole to route)</span>`;
+
+                return `
+                    <div class="bg-slate-50 border border-slate-200 rounded-2xl p-5">
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="font-bold text-slate-700 tracking-widest text-sm uppercase">
+                                <i class="fa-solid fa-radio mr-2 text-slate-400"></i>Radio Playout
+                            </h3>
+                            <div class="flex items-center gap-3">
+                                ${sinkInfo}
+                                <button data-action="radio-refresh-devices" class="text-xs text-slate-400 hover:text-blue-600 transition-colors font-mono">↺ Refresh Devices</button>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-4 mb-4">
+                            ${renderRadioDeck('deckA')}
+                            ${renderRadioDeck('deckB')}
+                        </div>
+                        <details class="mt-3">
+                            <summary class="text-xs font-bold text-slate-400 uppercase tracking-widest cursor-pointer select-none hover:text-slate-600 transition-colors">Radio System Log</summary>
+                            <div id="radio-log-container" class="mt-2 bg-white border border-slate-200 rounded-lg p-3 font-mono text-xs space-y-0.5 max-h-32 overflow-y-auto">
+                                ${renderRadioLog()}
+                            </div>
+                        </details>
+                    </div>`;
+            }      
+       
         // ==========================================
         // OBS PLAYOUT ENGINE
         // ==========================================
@@ -1413,7 +2040,7 @@
         // END OBS PLAYOUT ENGINE
         // ==========================================
 
-        function renderDirector() {
+       function renderDirector() {
             const rawOrder = state.meta.order || [];
             const markerIdx = rawOrder.indexOf('marker-line');
             const order = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
@@ -1427,85 +2054,156 @@
             const nxt = nxtId ? state.storiesMap[nxtId] : null;
 
             const isLive = state.meta.isTXMode;
-            const isRehearsal = state.meta.isRehearsalMode;
-            const statusBg = isLive ? 'bg-red-600' : isRehearsal ? 'bg-amber-500' : 'bg-slate-700';
+
+            // Map storyId → deck info for clip badges
+            const deckMap = {};
+            if (state.ui.playoutBackend === 'obs') {
+                if (state.obs.deckA.loadedStoryId) deckMap[state.obs.deckA.loadedStoryId] = { deck: 'A', deckState: state.obs.deckA.state };
+                if (state.obs.deckB.loadedStoryId) deckMap[state.obs.deckB.loadedStoryId] = { deck: 'B', deckState: state.obs.deckB.state };
+            } else if (state.ui.playoutBackend === 'radio') {
+                if (state.radio.deckA.loadedStoryId) deckMap[state.radio.deckA.loadedStoryId] = { deck: 'A', deckState: state.radio.deckA.state };
+                if (state.radio.deckB.loadedStoryId) deckMap[state.radio.deckB.loadedStoryId] = { deck: 'B', deckState: state.radio.deckB.state };
+            }
+
+            const clipTitleBadge = (story, storyId) => {
+                if (!story?.mediaFile || state.ui.playoutBackend === 'none') return '';
+                const info = deckMap[storyId];
+                if (!info) {
+                    return `<span class="flex items-center gap-1 ml-2">
+                        <span class="text-[10px] font-bold bg-white/20 text-white/70 px-1.5 py-0.5 rounded uppercase tracking-wide">No Clip</span>
+                    </span>`;
+                }
+                const ds = (info.deckState || '').toLowerCase().replace('obs_media_state_', '');
+                const isPlaying = ds === 'playing';
+                const isCued    = ds === 'cued' || ds === 'paused';
+                const stateLbl  = isPlaying ? 'Playing' : isCued ? 'Cued' : ds;
+                const stateBg   = isPlaying ? 'bg-white text-red-600' : isCued ? 'bg-white/30 text-white' : 'bg-white/20 text-white/70';
+                const dot       = isPlaying ? '<span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse inline-block mr-1"></span>' : '';
+                return `<span class="flex items-center gap-1 ml-2">
+                    <span class="text-[10px] font-bold ${stateBg} px-1.5 py-0.5 rounded uppercase tracking-wide">${dot}${stateLbl}</span>
+                    <span class="text-[10px] font-black bg-white/20 text-white px-1.5 py-0.5 rounded uppercase tracking-wide">${info.deck}</span>
+                </span>`;
+            };
+
+            const onAirBorder = isLive ? 'border-red-300' : 'border-slate-200';
+            const onAirHdrBg  = isLive ? 'bg-red-600'    : 'bg-slate-700';
 
             return `
-                <div class="max-w-6xl mx-auto p-6 pb-12 flex flex-col gap-6">
+                <div class="flex flex-col" style="min-height:100%">
 
-                    <!-- Header -->
-                    <div class="flex justify-between items-center">
-                        <h2 class="text-3xl font-bold text-slate-800"><i class="fa-solid fa-sliders mr-3 text-slate-400"></i>Control Room</h2>
-                        <div class="flex items-center gap-3">
-                            <span id="obs-conn-badge" class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold ${state.obs.connected ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' : 'bg-red-100 text-red-700 border border-red-200'}">
-                                <span class="w-1.5 h-1.5 rounded-full ${state.obs.connected ? 'bg-emerald-500' : 'bg-red-500 animate-pulse'}"></span>
-                                ${state.obs.connected ? 'OBS Connected' : 'OBS Offline'}
-                            </span>
-                            <div class="px-5 py-2 rounded-xl text-white font-black tracking-widest text-sm shadow-lg ${statusBg}">
-                                ${isLive ? 'ON AIR' : isRehearsal ? 'REHEARSAL' : 'STUDIO'}
+                    <!-- TX STATUS BAR — lives inside Studio view, not the global header -->
+                    <div class="${isLive ? 'bg-red-900' : 'bg-slate-800'} transition-colors duration-300 shrink-0">
+                        <div class="max-w-6xl mx-auto px-6 py-3 flex items-center justify-between gap-6">
+                            <div class="flex items-center gap-4">
+                                ${isLive ? `
+                                <div class="flex items-center gap-3">
+                                    <span class="w-3 h-3 rounded-full bg-red-400 animate-pulse"></span>
+                                    <span class="text-white font-black tracking-widest text-sm uppercase">TX Live</span>
+                                    <span id="tx-timer-display" class="font-mono text-red-300 font-bold text-lg ml-1">00:00</span>
+                                    <div class="w-px h-5 bg-white/20 mx-2"></div>
+                                    <span class="text-white/50 text-xs uppercase tracking-wide">Backtime</span>
+                                    <span id="backtime-display" class="font-mono font-bold text-lg text-slate-300 ml-1">--:--</span>
+                                </div>` : `
+                                <div class="flex items-center gap-3">
+                                    <span class="text-slate-400 text-sm font-medium tracking-wide">OFF AIR</span>
+                                    ${state.ui.playoutBackend === 'obs' ? `
+                                    <span id="obs-conn-badge" class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold ${state.obs.connected ? 'bg-emerald-900/40 text-emerald-300 border border-emerald-700' : 'bg-red-900/40 text-red-300 border border-red-700'}">
+                                        <span class="w-1.5 h-1.5 rounded-full ${state.obs.connected ? 'bg-emerald-400' : 'bg-red-400 animate-pulse'}"></span>
+                                        ${state.obs.connected ? 'OBS Connected' : 'OBS Offline'}
+                                    </span>` : ''}
+                                    ${state.ui.playoutBackend === 'radio' ? `
+                                    <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold ${state.radio.directoryHandle ? 'bg-emerald-900/40 text-emerald-300 border border-emerald-700' : 'bg-amber-900/40 text-amber-300 border border-amber-700'}">
+                                        <span class="w-1.5 h-1.5 rounded-full ${state.radio.directoryHandle ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                                        ${state.radio.directoryHandle ? `Media: ${escapeHTML(state.radio.directoryHandle.name)}` : 'No Media Folder'}
+                                    </span>` : ''}
+                                </div>`}
                             </div>
+                            <button data-action="studio-tx-toggle"
+                                class="px-6 py-2 rounded-lg font-black text-sm tracking-widest transition-all shadow-lg ${isLive ? 'bg-slate-700 hover:bg-slate-600 text-white border-2 border-slate-500' : 'bg-red-600 hover:bg-red-500 text-white border-2 border-red-400'}">
+                                ${isLive ? 'End TX' : 'Start TX'}
+                            </button>
                         </div>
                     </div>
 
-                    <!-- Story cards: ON AIR + PREVIEW NEXT -->
-                    <div class="grid grid-cols-2 gap-6">
-                        <div class="bg-white border-2 rounded-2xl flex flex-col overflow-hidden shadow-sm ${isLive ? 'border-red-300' : 'border-slate-200'}">
-                            <div class="${statusBg} text-white font-bold text-lg px-6 py-3 tracking-widest flex justify-between items-center">
-                                <span>ON AIR</span>
-                                ${cur ? `<span class="font-mono bg-black/20 px-2 py-0.5 rounded text-sm">${formatDuration(cur.duration)}</span>` : ''}
+                    <!-- Studio body -->
+                    <div class="max-w-6xl mx-auto p-6 pb-12 flex flex-col gap-6 w-full">
+
+                        <!-- Story cards: ON AIR + PREVIEW NEXT -->
+                        <div class="grid grid-cols-2 gap-6">
+                            <div class="bg-white border-2 rounded-2xl flex flex-col overflow-hidden shadow-sm ${onAirBorder}">
+                                <div class="${onAirHdrBg} text-white font-bold text-lg px-6 py-3 tracking-widest flex justify-between items-center">
+                                    <span class="flex items-center">ON AIR${clipTitleBadge(cur, curId)}</span>
+                                    ${cur ? `<span class="font-mono bg-black/20 px-2 py-0.5 rounded text-sm">${formatDuration(cur.duration)}</span>` : ''}
+                                </div>
+                                <div class="p-6 flex-1 text-center flex flex-col justify-center min-h-[100px]">
+                                    ${cur ? `<h3 class="text-3xl font-black text-slate-800 uppercase">${escapeHTML(cur.slug)}</h3><p class="text-slate-400 italic mt-2 text-sm truncate">${escapeHTML(cur.script?.split('\n')[0] || '')}</p>` : '<span class="text-slate-400">No Active Story</span>'}
+                                </div>
                             </div>
-                            <div class="p-6 flex-1 text-center flex flex-col justify-center min-h-[100px]">
-                                ${cur ? `<h3 class="text-3xl font-black text-slate-800 uppercase">${escapeHTML(cur.slug)}</h3><p class="text-slate-400 italic mt-2 text-sm truncate">${escapeHTML(cur.script?.split('\n')[0] || '')}</p>` : '<span class="text-slate-400">No Active Story</span>'}
+                            <div class="bg-white border-2 rounded-2xl flex flex-col overflow-hidden shadow-sm ${!nxt ? 'border-red-800' : 'border-blue-200'}">
+                                <div class="${!nxt ? 'bg-red-900' : 'bg-blue-100'} ${!nxt ? 'text-white' : 'text-blue-800'} font-bold text-lg px-6 py-3 tracking-widest flex justify-between items-center">
+                                    <span class="flex items-center">${!nxt ? 'END OF PROGRAMME' : 'PREVIEW NEXT'}${nxt ? clipTitleBadge(nxt, nxtId) : ''}</span>
+                                    ${nxt ? `<span class="font-mono bg-blue-200 px-2 py-0.5 rounded text-sm">${formatDuration(nxt.duration)}</span>` : ''}
+                                </div>
+                                <div class="p-6 flex-1 text-center flex flex-col justify-center min-h-[100px]">
+                                    ${nxt ? `<h3 class="text-3xl font-black text-slate-800 uppercase">${escapeHTML(nxt.slug)}</h3>` : '<span class="text-2xl font-black text-red-800 tracking-widest uppercase">Programme End</span>'}
+                                </div>
                             </div>
                         </div>
-                        <div class="bg-white border-2 rounded-2xl flex flex-col overflow-hidden shadow-sm ${!nxt ? 'border-red-800' : 'border-blue-200'}">
-                            <div class="${!nxt ? 'bg-red-900' : 'bg-blue-100'} ${!nxt ? 'text-white' : 'text-blue-800'} font-bold text-lg px-6 py-3 tracking-widest flex justify-between items-center">
-                                <span>${!nxt ? 'END OF PROGRAMME' : 'PREVIEW NEXT'}</span>
-                                ${nxt ? `<span class="font-mono bg-blue-200 px-2 py-0.5 rounded text-sm">${formatDuration(nxt.duration)}</span>` : ''}
-                            </div>
-                            <div class="p-6 flex-1 text-center flex flex-col justify-center min-h-[100px]">
-                                ${nxt ? `<h3 class="text-3xl font-black text-slate-800 uppercase">${escapeHTML(nxt.slug)}</h3>` : '<span class="text-2xl font-black text-red-800 tracking-widest uppercase">Programme End</span>'}
-                            </div>
+
+                        ${renderPlayoutSection()}
+
+                        <div class="bg-slate-800 rounded-2xl p-6 flex justify-between items-center gap-4 shadow-xl">
+                            <button data-action="undo-take" class="flex-1 py-5 bg-red-600 hover:bg-red-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center"><i class="fa-solid fa-rotate-left mr-2"></i>Previous</button>
+                            <button data-action="reset-runorder" class="flex-1 py-5 bg-slate-600 hover:bg-slate-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center" title="Reset to first story"><i class="fa-solid fa-rotate mr-2"></i>Reset</button>
+                            <button data-action="take-next" class="flex-1 py-5 bg-green-600 hover:bg-green-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center">Take Next <i class="fa-solid fa-forward-step ml-2"></i></button>
+                            ${state.ui.playoutBackend === 'obs' ? `
+                            <button id="obs-btn-take" data-obs-action="take" class="flex-1 py-5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-center">&#9654; Take Clip</button>` : ''}
+                            ${state.ui.playoutBackend === 'radio' ? `
+                            <button data-action="radio-take" class="flex-1 py-5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-all active:scale-95 text-center">&#9654; Take Clip</button>` : ''}
                         </div>
+
                     </div>
+                </div>`;
+        }
 
-                    <!-- Clip Playout section -->
-                    <div class="bg-slate-50 border border-slate-200 rounded-2xl p-5">
-                        <div class="flex items-center justify-between mb-4">
-                            <h3 class="font-bold text-slate-700 tracking-widest text-sm uppercase"><i class="fa-solid fa-film mr-2 text-slate-400"></i>Clip Playout</h3>
-                            <button data-obs-action="reconnect" class="text-xs text-slate-400 hover:text-blue-600 transition-colors font-mono">↺ Reconnect OBS</button>
-                        </div>
+        function renderPlayoutSection() {
+            if (state.ui.playoutBackend === 'obs')   return renderObsPlayout();
+            if (state.ui.playoutBackend === 'radio') return renderRadioPlayout();
+            return '';
+        }
 
-                        ${state.ui.showPlayout && state.obs.connected ? `
-                        <div class="grid grid-cols-2 gap-4 mb-4">
-                            ${renderObsDeck('A')}
-                            ${renderObsDeck('B')}
-                        </div>
-                        <div class="flex items-center gap-3 bg-white border border-slate-200 rounded-xl px-4 py-3">
-                            <span class="text-xs font-black uppercase tracking-widest text-slate-500 shrink-0">Lower Third</span>
-                            <input type="text" id="obs-l3-text" placeholder="Enter lower third text..." class="flex-1 border border-slate-200 rounded px-3 py-1.5 text-sm focus:border-blue-400 focus:outline-none">
-                            <button data-obs-action="l3-update" class="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded text-xs font-bold transition-colors">Update</button>
-                            <div class="w-px h-6 bg-slate-200"></div>
-                            <button data-obs-action="l3-show" class="bg-blue-50 text-blue-600 border border-blue-300 hover:bg-blue-600 hover:text-white px-3 py-1.5 rounded text-xs font-bold transition-colors">SHOW</button>
-                            <button data-obs-action="l3-hide" class="bg-red-50 text-red-500 border border-red-300 hover:bg-red-500 hover:text-white px-3 py-1.5 rounded text-xs font-bold transition-colors">HIDE</button>
-                        </div>
-                        <details class="mt-3">
-                            <summary class="text-xs font-bold text-slate-400 uppercase tracking-widest cursor-pointer select-none hover:text-slate-600 transition-colors">OBS System Log</summary>
-                            <div id="obs-log-container" class="mt-2 bg-white border border-slate-200 rounded-lg p-3 font-mono text-xs space-y-0.5 max-h-32 overflow-y-auto">
-                                ${renderObsLog()}
-                            </div>
-                        </details>
-                        ` : ''}
+        function renderObsPlayout() {
+            return `
+                <div class="bg-slate-50 border border-slate-200 rounded-2xl p-5">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="font-bold text-slate-700 tracking-widest text-sm uppercase"><i class="fa-solid fa-film mr-2 text-slate-400"></i>Clip Playout</h3>
+                        <button data-obs-action="reconnect" class="text-xs text-slate-400 hover:text-blue-600 transition-colors font-mono">↺ Reconnect OBS</button>
                     </div>
-
-                    <!-- Take bar -->
-                    <div class="bg-slate-800 rounded-2xl p-6 flex justify-between items-center gap-4 shadow-xl">
-                        <button data-action="undo-take" class="flex-1 py-5 bg-red-600 hover:bg-red-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center"><i class="fa-solid fa-rotate-left mr-2"></i>Previous</button>
-                        <button data-action="reset-runorder" class="flex-1 py-5 bg-slate-600 hover:bg-slate-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center" title="Reset to first story for rehearsal"><i class="fa-solid fa-rotate mr-2"></i>Reset</button>
-                        <button data-action="take-next" class="flex-1 py-5 bg-green-600 hover:bg-green-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center">Take Next <i class="fa-solid fa-forward-step ml-2"></i></button>
-                        <button id="obs-btn-take" data-obs-action="take" class="flex-1 py-5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-center">&#9654; Take Clip</button>
+                    ${state.obs.connected ? `
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        ${renderObsDeck('A')}
+                        ${renderObsDeck('B')}
                     </div>
-
+                    <div class="flex items-center gap-3 bg-white border border-slate-200 rounded-xl px-4 py-3">
+                        <span class="text-xs font-black uppercase tracking-widest text-slate-500 shrink-0">Lower Third</span>
+                        <input type="text" id="obs-l3-text" placeholder="Enter lower third text..." class="flex-1 border border-slate-200 rounded px-3 py-1.5 text-sm focus:border-blue-400 focus:outline-none">
+                        <button data-obs-action="l3-update" class="bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded text-xs font-bold transition-colors">Update</button>
+                        <div class="w-px h-6 bg-slate-200"></div>
+                        <button data-obs-action="l3-show" class="bg-blue-50 text-blue-600 border border-blue-300 hover:bg-blue-600 hover:text-white px-3 py-1.5 rounded text-xs font-bold transition-colors">SHOW</button>
+                        <button data-obs-action="l3-hide" class="bg-red-50 text-red-500 border border-red-300 hover:bg-red-500 hover:text-white px-3 py-1.5 rounded text-xs font-bold transition-colors">HIDE</button>
+                    </div>
+                    <details class="mt-3">
+                        <summary class="text-xs font-bold text-slate-400 uppercase tracking-widest cursor-pointer select-none hover:text-slate-600 transition-colors">OBS System Log</summary>
+                        <div id="obs-log-container" class="mt-2 bg-white border border-slate-200 rounded-lg p-3 font-mono text-xs space-y-0.5 max-h-32 overflow-y-auto">
+                            ${renderObsLog()}
+                        </div>
+                    </details>
+                    ` : `
+                    <div class="text-center py-8 text-slate-400">
+                        <i class="fa-solid fa-plug text-3xl mb-3 block"></i>
+                        <p class="text-sm font-medium">OBS is not connected</p>
+                        <p class="text-xs mt-1">Check your connection settings in <strong>Settings → Playout</strong></p>
+                    </div>`}
                 </div>`;
         }
 
@@ -1579,29 +2277,6 @@
 
         function renderHeader() {
             const staffCount = (state.meta.staff || []).length;
-            let statusBanner = `<span class="text-slate-400 font-medium text-sm mr-4">OFF AIR</span>`;
-
-            if (state.meta.isTXMode) {
-                statusBanner = `
-                    <div class="flex items-center gap-3 bg-red-900/10 px-4 py-1.5 rounded-lg border border-red-200 mr-2">
-                        <span class="w-2.5 h-2.5 bg-red-600 rounded-full animate-pulse"></span>
-                        <span class="font-bold text-red-600 tracking-widest text-sm uppercase">TX LIVE</span>
-                        <span id="tx-timer-display" class="font-mono text-red-700 font-bold ml-2">00:00</span>
-                        <span class="text-slate-300 mx-1">|</span>
-                        <span class="text-xs text-slate-500 uppercase tracking-wide">BT</span>
-                        <span id="backtime-display" class="font-mono text-lg font-bold text-slate-400">--:--</span>
-                    </div>`;
-            } else if (state.meta.isRehearsalMode) {
-                statusBanner = `
-                    <div class="flex items-center gap-3 bg-amber-900/10 px-4 py-1.5 rounded-lg border border-amber-200 mr-2 shadow-inner">
-                        <span class="w-2.5 h-2.5 bg-amber-500 rounded-full shadow-[0_0_8px_#f59e0b]"></span>
-                        <span class="font-bold text-amber-600 tracking-widest text-sm uppercase">REHEARSAL</span>
-                        <span id="tx-timer-display" class="font-mono text-amber-700 font-bold ml-2">00:00</span>
-                        <span class="text-slate-300 mx-1">|</span>
-                        <span class="text-xs text-slate-500 uppercase tracking-wide">BT</span>
-                        <span id="backtime-display" class="font-mono text-lg font-bold text-slate-400">--:--</span>
-                    </div>`;
-            }
 
             let connectionBadge = '';
             if (state.connectionState === 'connecting') connectionBadge = renderStatusBadge('Connecting', 'fa-circle-notch fa-spin', 'bg-blue-100 text-blue-800 border border-blue-200');
@@ -1624,28 +2299,20 @@
                         ${(()=>{
                             const me = (state.meta.staff||[]).find(s=>s.id===state.myStaffId);
                             const isEditor = state.meta.editorStaffId === state.myStaffId;
-                            const locked = state.meta.rundownLocked;
                             if (!me) return `<span class="text-xs text-slate-400 italic px-2">Not checked in</span>`;
                             return `<span class="flex items-center gap-1.5 bg-blue-50 border border-blue-200 text-blue-800 px-3 py-1 rounded-full text-xs font-bold">
                                 <span class="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_4px_#10b981]"></span>
                                 ${escapeHTML(me.name)}
                                 <span class="opacity-60 font-normal">${escapeHTML(me.role)}</span>
                                 ${isEditor ? `<span class="ml-1 bg-amber-400 text-amber-900 px-1.5 py-0.5 rounded text-[10px] font-black uppercase tracking-wide">Editor</span>` : ''}
-                            </span>
-`;
+                            </span>`;
                         })()}
                     </div>
                     <div class="flex items-center gap-3">
-                        <div class="flex items-center bg-slate-100 p-1 rounded-lg border border-slate-200 mr-2">
+                        <div class="flex items-center bg-slate-100 p-1 rounded-lg border border-slate-200">
                             <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-2">Newsroom</span>
                             <input type="text" id="header-room-input" value="${escapeHTML(state.roomDisplayName)}" class="bg-white border border-slate-300 rounded px-2 py-1 text-sm font-bold text-slate-800 w-24 outline-none focus:border-blue-500">
                             <button data-action="join-room" class="ml-1 bg-slate-800 hover:bg-slate-700 text-white px-2 py-1 rounded text-sm font-medium transition-colors shadow-sm">Join</button>
-                        </div>
-                        <div class="flex items-center border-r border-slate-200 pr-4 mr-1">
-                            ${statusBanner}
-                            <button data-action="header-tx-toggle" class="px-4 py-1.5 rounded-md text-sm font-bold shadow-sm transition-colors ${state.meta.isTXMode ? 'bg-slate-800 text-white hover:bg-slate-700' : state.meta.isRehearsalMode ? 'bg-amber-500 text-white hover:bg-amber-600' : 'bg-red-50 text-red-600 border border-red-200 hover:bg-red-100'}">
-                                ${state.meta.isTXMode ? 'End TX' : state.meta.isRehearsalMode ? 'End Rehearsal' : 'Start TX'}
-                            </button>
                         </div>
                         <button data-action="open-settings-modal" class="text-slate-400 hover:text-slate-600 transition-colors ml-1" title="System Settings"><i class="fa-solid fa-gear text-lg"></i></button>
                         ${connectionBadge}
@@ -1685,7 +2352,7 @@
                 const story = state.storiesMap[id];
                 if (!story) return '';
                 if (!isBelowLine && !story.isFloated) totalDuration += story.duration || 0;
-                const isActive = state.meta.activeStoryId === id && (state.meta.isTXMode || state.meta.isRehearsalMode);
+                const isActive = state.meta.activeStoryId === id && state.meta.isTXMode;
                 const isComplete = story.completed;
                 const isLocked = story.lockedBySession && story.lockedBySession !== state.sessionId;
 
@@ -1797,6 +2464,15 @@
                         <h2 class="text-3xl font-bold text-slate-800"><i class="fa-solid fa-bars-staggered mr-3 text-slate-400"></i>Rundown</h2>
                     </div>
                     <div class="flex items-center gap-4">
+                        ${state.meta.isTXMode ? `
+                        <div class="flex items-center gap-3 bg-red-50 border border-red-200 px-4 py-2 rounded-xl">
+                            <span class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+                            <span class="text-xs font-black uppercase tracking-widest text-red-600">TX</span>
+                            <span id="tx-timer-display" class="font-mono font-bold text-red-700">00:00</span>
+                            <div class="w-px h-4 bg-red-200"></div>
+                            <span class="text-xs font-bold uppercase tracking-wide text-slate-400">BT</span>
+                            <span id="backtime-display" class="font-mono font-bold text-slate-600">--:--</span>
+                        </div>` : ''}
                         ${txSecs === null || rxSecs === null ? `<div class="text-sm font-medium text-slate-500">Total TRT: <span class="text-slate-800 font-mono text-lg bg-slate-200 px-2 py-1 rounded ml-1">${formatDuration(totalDuration)}</span></div>` : ''}
                         <button data-action="add-story" ${isRundownLocked ? 'disabled title="Rundown is locked"' : ''} class="${isRundownLocked ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white'} px-5 py-2.5 rounded-lg font-medium transition-colors shadow-sm"><i class="fa-solid fa-plus mr-2"></i>Add Story</button>
                         <button data-action="print-scripts" class="bg-slate-600 hover:bg-slate-700 text-white px-5 py-2.5 rounded-lg font-medium transition-colors shadow-sm">
@@ -2136,10 +2812,75 @@
                                         <textarea id="settings-roles-input" rows="5" class="w-full border rounded-lg p-4 text-sm font-mono outline-none">${escapeHTML(currentRoles)}</textarea>
                                     </div>
                                 </div>`
-                            : state.ui.settingsTab === 'playout' ? `
+                           : state.ui.settingsTab === 'playout' ? `
                                 <div class="space-y-4">
+
+                                    <!-- Backend selector -->
+                                    <div class="bg-slate-50 border border-slate-200 rounded-xl p-5">
+                                        <h4 class="font-bold text-slate-800 text-sm mb-3">Playout Backend</h4>
+                                        <div class="flex bg-slate-200 p-1 rounded-lg gap-1">
+                                            <button data-action="set-playout-backend" data-val="none"
+                                                class="flex-1 py-2 rounded-md text-sm font-bold transition-colors ${state.ui.playoutBackend === 'none' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}">
+                                                <i class="fa-solid fa-newspaper mr-1.5"></i>No Playout
+                                            </button>
+                                            <button data-action="set-playout-backend" data-val="radio"
+                                                class="flex-1 py-2 rounded-md text-sm font-bold transition-colors ${state.ui.playoutBackend === 'radio' ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}">
+                                                <i class="fa-solid fa-radio mr-1.5"></i>Radio
+                                            </button>
+                                            <button data-action="set-playout-backend" data-val="obs"
+                                                class="flex-1 py-2 rounded-md text-sm font-bold transition-colors ${state.ui.playoutBackend === 'obs' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}">
+                                                <i class="fa-solid fa-film mr-1.5"></i>OBS
+                                            </button>
+                                        </div>
+                                        ${state.ui.playoutBackend === 'none' ? `
+                                        <p class="text-xs text-slate-400 mt-3 leading-relaxed">Moira will operate as a pure NRCS. No playout controls will appear in the Studio view. Story media file fields are still available for reference.</p>
+                                        ` : ''}
+                                    </div>
+
+                                    <!-- Radio config — only shown when radio is selected -->
+                                    ${state.ui.playoutBackend === 'radio' ? `
                                     <div class="bg-slate-50 border border-slate-200 rounded-xl p-5 space-y-4">
-                                        <h4 class="font-bold text-slate-800 flex items-center gap-2"><i class="fa-solid fa-film text-slate-400"></i> OBS WebSocket Connection</h4>
+                                        <h4 class="font-bold text-slate-800 flex items-center gap-2"><i class="fa-solid fa-radio text-slate-400"></i>Audio Output Device</h4>
+                                        ${setSinkIdSupported ? `
+                                        <div>
+                                            <label class="text-xs font-bold text-slate-500 uppercase tracking-wide block mb-1">Output Device</label>
+                                            <select id="radio-sink-select" class="w-full border rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500 bg-white">
+                                                <option value="">System Default</option>
+                                                ${(state.radio.devices || []).map(d =>
+                                                    `<option value="${escapeHTML(d.deviceId)}" ${state.radio.selectedSinkId === d.deviceId ? 'selected' : ''}>${escapeHTML(d.label || d.deviceId.slice(0, 20))}</option>`
+                                                ).join('')}
+                                            </select>
+                                            <p class="text-xs text-slate-400 mt-1">Selects which audio output device the browser routes audio to.</p>
+                                        </div>
+                                        ` : `
+                                        <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-800">
+                                            <strong>Output device selection is not available in this browser.</strong><br>
+                                            Audio will route to the system default output. Use a virtual audio router such as Loopback or BlackHole to direct it to your broadcast device.
+                                        </div>
+                                        `}
+                                    </div>
+                                    <div class="bg-slate-50 border border-slate-200 rounded-xl p-5 space-y-3">
+                                        <h4 class="font-bold text-slate-800 flex items-center gap-2"><i class="fa-solid fa-folder-open text-slate-400"></i>Media Folder</h4>
+                                        <p class="text-xs text-slate-500 leading-relaxed">Grant Moira access to your clips folder once per session. Clips will be loaded automatically from the running order on TX start.</p>
+                                        ${state.radio.directoryHandle ? `
+                                        <div class="flex items-center gap-3 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                                            <i class="fa-solid fa-circle-check text-emerald-500 text-sm"></i>
+                                            <span class="text-sm font-medium text-emerald-800 truncate">${escapeHTML(state.radio.directoryHandle.name)}</span>
+                                            <button data-action="revoke-media-folder" class="ml-auto text-xs text-slate-400 hover:text-red-500 transition-colors font-mono shrink-0">✕ Revoke</button>
+                                        </div>
+                                        ` : `
+                                        <button data-action="grant-media-folder" class="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors">
+                                            <i class="fa-solid fa-folder-open"></i> Grant Media Folder Access
+                                        </button>
+                                        <p class="text-xs text-slate-400">No folder granted — clips must be loaded manually onto each deck.</p>
+                                        `}
+                                    </div>
+                                    ` : ''}
+
+                                    <!-- OBS config — only shown when OBS is selected -->
+                                    ${state.ui.playoutBackend === 'obs' ? `
+                                    <div class="bg-slate-50 border border-slate-200 rounded-xl p-5 space-y-4">
+                                        <h4 class="font-bold text-slate-800 flex items-center gap-2"><i class="fa-solid fa-film text-slate-400"></i>OBS WebSocket Connection</h4>
                                         <div class="grid grid-cols-2 gap-4">
                                             <div>
                                                 <label class="text-xs font-bold text-slate-500 uppercase tracking-wide block mb-1">IP Address</label>
@@ -2161,17 +2902,10 @@
                                         </div>
                                     </div>
                                     <div class="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800">
-                                        <strong>Expected OBS scene structure:</strong> Scenes named <code class="bg-blue-100 px-1 rounded">VT A</code>, <code class="bg-blue-100 px-1 rounded">VT B</code>, and <code class="bg-blue-100 px-1 rounded">Lower Third</code> with corresponding media sources. Moira will auto-create these on connect if they don't exist.
+                                        <strong>Expected OBS scene structure:</strong> Scenes named <code class="bg-blue-100 px-1 rounded">VT A</code>, <code class="bg-blue-100 px-1 rounded">VT B</code>, and <code class="bg-blue-100 px-1 rounded">Lower Third</code>. Moira will auto-create these on connect if they don't exist.
                                     </div>
-                                    <div class="bg-slate-50 border border-slate-200 rounded-xl p-5 flex items-center justify-between">
-                                        <div>
-                                            <p class="font-bold text-slate-700 text-sm">Show Clip Players</p>
-                                            <p class="text-xs text-slate-400 mt-0.5">Display the Clip A / Clip B deck panels in the director view.</p>
-                                        </div>
-                                        <button data-action="toggle-playout" class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${state.ui.showPlayout ? 'bg-blue-600' : 'bg-slate-300'}">
-                                            <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${state.ui.showPlayout ? 'translate-x-6' : 'translate-x-1'}"></span>
-                                        </button>
-                                    </div>
+                                    ` : ''}
+
                                 </div>`
                             : state.ui.settingsTab === 'reset' ? `
                                 <div class="space-y-6">
@@ -2202,12 +2936,13 @@
                         <div class="px-6 py-4 border-t border-slate-200 bg-slate-50 rounded-b-2xl flex justify-between items-center">
                             <div>
                                 ${state.ui.settingsTab === 'connection' ? `<button data-action="clear-settings" class="px-4 py-2 rounded-lg text-red-600 font-medium hover:bg-red-50" title="Remove Firebase config and work offline">Disconnect Firebase</button>` : ''}
-                                ${state.ui.settingsTab === 'playout' ? `<button data-action="obs-disconnect" class="px-4 py-2 rounded-lg text-red-600 font-medium hover:bg-red-50" title="Disconnect OBS WebSocket">Disconnect OBS</button>` : ''}
-                            </div>
+                                ${state.ui.settingsTab === 'playout' && state.ui.playoutBackend === 'obs' ? `<button data-action="obs-disconnect" class="px-4 py-2 rounded-lg text-red-600 font-medium hover:bg-red-50">Disconnect OBS</button>` : ''}
+                                </div>
                             <button data-action="close-settings-modal" class="px-5 py-2.5 rounded-lg text-slate-600 hover:bg-slate-200">Close</button>
                             <div>
                                 ${state.ui.settingsTab === 'connection' ? `<button data-action="save-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Save & Restart</button>` : ''}
-                                ${state.ui.settingsTab === 'playout' ? `<button data-action="save-obs-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Save & Reconnect OBS</button>` : ''}
+                                ${state.ui.settingsTab === 'playout' && state.ui.playoutBackend === 'obs' ? `<button data-action="save-obs-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Save & Reconnect OBS</button>` : ''}
+                                ${state.ui.settingsTab === 'playout' && state.ui.playoutBackend === 'radio' ? `<button data-action="save-radio-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Save Audio Settings</button>` : ''}
                                 ${state.ui.settingsTab === 'editorial' ? `<button data-action="save-editorial-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Apply to Newsroom</button>` : ''}
                             </div>
                         </div>
@@ -2649,10 +3384,13 @@
                             const order = state.meta.order || [];
                             const markerIdx = order.indexOf('marker-line');
                             const storyIds = markerIdx > -1 ? order.slice(0, markerIdx) : order;
-                            if (storyIds.length > 0 && !state.meta.isTXMode && !state.meta.isRehearsalMode) {
+                            if (storyIds.length > 0) {
                                 state.meta.activeStoryId = storyIds[0];
                                 state.meta.isCued = true;
                             }
+                            const activeOrder = storyIds.filter(id => !state.storiesMap[id]?.isFloated);
+                            if (state.ui.playoutBackend === 'obs')        obsInitialLoad(activeOrder);
+                            else if (state.ui.playoutBackend === 'radio') radioInitialLoad(activeOrder);
                         }
                     }
                     render();
@@ -2690,19 +3428,47 @@
                     const roles = document.getElementById('settings-roles-input').value.split('\n').map(r => r.trim()).filter(r => r.length > 0);
                     updateBulletinMeta({ formats, roles });
                 }
-                if (action === 'toggle-playout') {
-                    state.ui.showPlayout = !state.ui.showPlayout;
-                    if (state.ui.showPlayout) {
-                        loadObsConfig();
-                        connectObs();
-                    } else {
+                if (action === 'set-playout-backend') {
+                    const newBackend = val; // 'none' | 'radio' | 'obs'
+                    const oldBackend = state.ui.playoutBackend;
+                    if (newBackend === oldBackend) return;
+
+                    // Tear down the outgoing backend
+                    if (oldBackend === 'obs') {
                         if (obsTelemetryInterval) { clearInterval(obsTelemetryInterval); obsTelemetryInterval = null; }
                         try { await obsWs.disconnect(); } catch(e) {}
                         state.obs.connected = false;
+                    } else if (oldBackend === 'radio') {
+                        for (const dk of ['deckA', 'deckB']) {
+                            const deck = state.radio[dk];
+                            if (deck.audio) { deck.audio.pause(); }
+                            stopRadioMeter(deck);
+                            for (const n of [deck.sourceNode, deck.splitter, deck.analyserL, deck.analyserR, deck.gainNode]) {
+                                if (n) try { n.disconnect(); } catch(e) {}
+                            }
+                            if (deck.objectUrl) { URL.revokeObjectURL(deck.objectUrl); }
+                            state.radio[dk] = makeRadioDeckState(dk === 'deckA' ? 'A' : 'B');
+                        }
+                        if (radioAudioCtx) { try { await radioAudioCtx.close(); } catch(e) {} radioAudioCtx = null; }
+                        if (radioRafId) { cancelAnimationFrame(radioRafId); radioRafId = null; }
+                        state.radio.log = [];
                     }
+
+                    // Start up the incoming backend
+                    state.ui.playoutBackend = newBackend;
+                    localStorage.setItem('moira_playout_backend', newBackend);
+
+                    if (newBackend === 'obs') {
+                        loadObsConfig();
+                        connectObs();
+                    } else if (newBackend === 'radio') {
+                        loadRadioConfig();
+                        populateRadioDevices();
+                    }
+
                     render(); return;
                 }
-                if (action === 'header-tx-toggle') updateStudioMode(state.meta.isTXMode ? 'standby' : 'tx');
+                if (action === 'studio-tx-toggle') updateStudioMode(state.meta.isTXMode ? 'standby' : 'tx');
                 if (action === 'set-studio-state') updateStudioMode(val);
 
                 if (action === 'open-staff-modal') { state.ui.isStaffModalOpen = true; render(); }
@@ -2921,10 +3687,11 @@
                     const updates = {
                         activeStoryId: firstId,
                         activeStoryStartedAt: firstId ? now : null,
-                        showStartTime: (state.meta.isTXMode || state.meta.isRehearsalMode) ? now : state.meta.showStartTime,
-                        txStartedAt: (state.meta.isTXMode || state.meta.isRehearsalMode) ? now : state.meta.txStartedAt,
+                        showStartTime: state.meta.isTXMode ? now : state.meta.showStartTime,
+                        txStartedAt: state.meta.isTXMode ? now : state.meta.txStartedAt,
                     };
                     updateBulletinMeta(updates);
+                    await syncPlayoutToActive(firstId);
                     return;
                 }
 
@@ -2987,6 +3754,50 @@
                     obsLog('OBS settings saved. Reconnecting...', 'info');
                     connectObs();
                 }
+                if (action === 'save-radio-settings') {
+                    const sel = document.getElementById('radio-sink-select');
+                    if (sel) {
+                        state.radio.selectedSinkId = sel.value;
+                        localStorage.setItem('RADIO_SINK_ID', sel.value);
+                        for (const dk of ['deckA', 'deckB']) {
+                            const deck = state.radio[dk];
+                            if (deck.audio?.setSinkId) {
+                                deck.audio.setSinkId(sel.value).catch(() => {});
+                            }
+                        }
+                    }
+                    state.ui.isSettingsModalOpen = false;
+                    render();
+                    return;
+                }
+
+                if (action === 'grant-media-folder') {
+                    if (!window.showDirectoryPicker) {
+                        alert('File System Access API is not supported in this browser. Use Chrome or Edge for auto-preload.');
+                        return;
+                    }
+                    try {
+                        const handle = await window.showDirectoryPicker({ mode: 'read' });
+                        state.radio.directoryHandle = handle;
+                        radioLog(`Media folder granted: "${handle.name}"`, 'success');
+                        render();
+                    } catch(e) {
+                        if (e.name !== 'AbortError') radioLog(`Folder access error: ${e.message}`, 'error');
+                    }
+                    return;
+                }
+
+                if (action === 'revoke-media-folder') {
+                    state.radio.directoryHandle = null;
+                    radioLog('Media folder access revoked.', 'info');
+                    render();
+                    return;
+                }
+
+                if (action === 'radio-refresh-devices') {
+                    populateRadioDevices();
+                    return;
+                }
             });
 
             // --- OBS playout actions ---
@@ -3005,6 +3816,35 @@
                 if (obsAction === 'pause') { obsMediaAction(deck, 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE'); return; }
                 if (obsAction === 'stop')  { obsMediaAction(deck, 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP');  return; }
                 if (obsAction === 'cue')   { obsSetCursor(deck, 0); return; }
+            });
+
+            // Radio playout actions
+            document.body.addEventListener('click', e => {
+                const btn = e.target.closest('[data-action]');
+                if (!btn) return;
+                const action = btn.getAttribute('data-action');
+                const deck   = btn.getAttribute('data-deck');
+                const deckKey = deck === 'A' ? 'deckA' : 'deckB';
+
+                if (action === 'radio-play')  { radioPlay(deckKey);  return; }
+                if (action === 'radio-pause') { radioPause(deckKey); return; }
+                if (action === 'radio-stop')  { radioStop(deckKey);  return; }
+                if (action === 'radio-cue')   { radioCue(deckKey);   return; }
+                if (action === 'radio-take')  { radioExecuteTake();   return; }
+                if (action === 'radio-scrub') {
+                    radioScrub(deck, e);
+                    return;
+                }
+            });
+
+            // Radio file load
+            document.body.addEventListener('change', e => {
+                if (!e.target.id.startsWith('radio-file-')) return;
+                const deckId  = e.target.id.replace('radio-file-', '');
+                const deckKey = deckId === 'A' ? 'deckA' : 'deckB';
+                const file    = e.target.files[0];
+                if (file) radioLoadFile(deckKey, file);
+                e.target.value = '';
             });
 
             document.body.addEventListener('change', e => {
