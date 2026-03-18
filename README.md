@@ -10,3 +10,5 @@ It is built on a few core principles
 - Industry adjacent - all the terminology, workflow, and (where possible) functionality should be as similar to professional practice as possible. You should recognise iNews functions in Moira and Moira functions in iNews
 
 But those principles mean it's not perfect. They mean comprises and challenges. Perhaps the biggest is the use of the FIRESTORE database. This is both a vulnerability and a barrier - these things are never easy to set up for non-geeks. However, I hope the setup process is as easy as possible, given the functionality on offer. 
+
+<img width="663" height="379" alt="image" src="https://github.com/user-attachments/assets/1c9eb518-8cdb-423a-a579-e035f8ab5d44" />
