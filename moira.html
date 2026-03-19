@@ -29,6 +29,29 @@
         .ppm-scale-spacer-r { width: 52px;  flex-shrink: 0; }
         .ppm-scale-inner { flex: 1; position: relative; height: 12px; }
         .ppm-tick { position: absolute; top: 0; font-size: 8px; font-family: monospace; color: #94a3b8; transform: translateX(-50%); white-space: nowrap; line-height: 1; }
+
+        /* ── REUSABLE UI PATTERNS ── */
+        /* Settings form labels */
+        .form-label    { font-size: 0.75rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; display: block; margin-bottom: 0.25rem; }
+        .form-label-sm { font-size: 0.625rem; font-weight: 700; color: #64748b; text-transform: uppercase; }
+        /* Settings form inputs */
+        .form-input    { width: 100%; border: 1px solid #e2e8f0; border-radius: 0.5rem; padding: 0.5rem 0.75rem; font-size: 0.875rem; font-family: monospace; outline: none; }
+        .form-input:focus { border-color: #3b82f6; }
+        .form-input-sm { width: 100%; border: 1px solid #e2e8f0; border-radius: 0.375rem; padding: 0.5rem 0.75rem; font-size: 0.875rem; font-family: monospace; outline: none; }
+        /* Take control bar buttons */
+        .take-btn      { flex: 1; padding: 1.25rem; border-radius: 0.75rem; font-weight: 900; font-size: 1.25rem; letter-spacing: 0.025em; box-shadow: 0 10px 15px -3px rgb(0 0 0/0.1); transition: background-color 150ms; text-align: center; }
+        /* Primary action button (modal footer, settings) */
+        .btn-primary   { padding: 0.625rem 1.5rem; border-radius: 0.5rem; background: #2563eb; color: #fff; font-weight: 500; font-size: 0.875rem; box-shadow: 0 1px 2px rgb(0 0 0/0.05); transition: background-color 150ms; }
+        .btn-primary:hover { background: #1d4ed8; }
+        /* Card header row used in Studio story cards */
+        .card-header   { font-weight: 700; font-size: 1.125rem; padding: 0.75rem 1.5rem; letter-spacing: 0.05em; display: flex; justify-content: space-between; align-items: center; }
+
+        /* ── SEGMENT BREAK ROWS ── */
+        .segment-row td { padding: 0; }
+        .segment-divider { display: flex; align-items: center; gap: 0; background: #eef2ff; color: #3730a3; border-top: 1px solid #c7d2fe; border-bottom: 1px solid #c7d2fe; }
+        .segment-label  { font-size: 0.7rem; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase; padding: 0.4rem 1rem; white-space: nowrap; }
+        .segment-dur    { font-size: 0.7rem; font-family: monospace; opacity: 0.6; padding-right: 1rem; }
+        .segment-line   { flex: 1; height: 1px; background: #c7d2fe; }
     </style>
 </head>
 <body class="bg-gray-50 h-screen flex flex-col overflow-hidden text-slate-800">
@@ -127,6 +150,7 @@
                 // Radio audio engine globals
         let radioAudioCtx = null;
         let radioRafId = null;
+        let syncPlayoutTimeout = null; // debounce handle for syncPlayoutToActive
 
         function getRadioCtx() {
             if (!radioAudioCtx) radioAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -233,6 +257,13 @@
         // ==========================================
         // 3. STARTUP & FIREBASE INIT
         // ==========================================
+       /**
+         * Application entry point. Restores persisted staff identity, starts the
+         * 30s heartbeat that keeps lastSeen current, initialises the configured
+         * playout backend (OBS or radio), then either connects to Firebase (cloud
+         * mode) or falls back to local seed data. Always ends by binding the
+         * global DOM event listeners.
+         */
        async function boot() {
             state.myStaffId = localStorage.getItem('moira_my_staff_id');
             if (firebaseConfig) state.connectionState = 'connecting';
@@ -282,6 +313,13 @@
             bindGlobalEvents();
         }
 
+       /**
+         * Switches the active bulletin to a different named room. Tears down the
+         * existing Firebase listeners, resets stories and meta state, stores the
+         * new room name in localStorage, then re-seeds or re-connects for the
+         * new room. Triggers a full re-render on completion.
+         * @param {string} newRoomName - Display name of the target room.
+         */
        async function switchRoom(newRoomName) {
             const name = newRoomName.trim() || 'Main';
             const sanitizedId = name.toLowerCase() === 'main' ? 'bulletin-primary' : 'bulletin-' + name.toLowerCase().replace(/[^a-z0-9]/g, '-');
@@ -384,6 +422,12 @@
         let unsubBulletin = null;
         let unsubStories = null;
 
+        /**
+         * Attaches Firestore real-time listeners for the current bulletin document
+         * and its stories collection. Both listeners call render() on every update.
+         * Old listeners are unsubscribed before new ones are attached, making this
+         * safe to call again after a room switch.
+         */
         function setupListeners() {
             if (!canMutate() || state.localMode) return;
 
@@ -423,6 +467,12 @@
         // ==========================================
         // 5. CORE ACTIONS (Mutators)
         // ==========================================
+        /**
+         * Acquires an optimistic edit lock on a story for the current session.
+         * In cloud mode uses a Firestore transaction so only the first writer wins.
+         * Stale locks (older than STALE_LOCK_MS) are silently overwritten.
+         * @param {string} id - Story document ID.
+         */
         async function lockStory(id) {
             if (!canMutate()) return;
             const userName = getMyName();
@@ -450,6 +500,11 @@
             } catch(e) { console.error("Lock failed", e); }
         }
 
+        /**
+         * Releases the edit lock on a story, but only if held by this session.
+         * No-ops if the story is locked by a different session.
+         * @param {string} id - Story document ID.
+         */
         async function unlockStory(id) {
             if (!canMutate()) return;
             const story = state.storiesMap[id];
@@ -469,6 +524,15 @@
             } catch(e) { console.error("Unlock failed", e); }
         }
 
+        /**
+         * Persists story field changes and releases the edit lock. Snapshots the
+         * pre-save version into storySnapshots to enable one-step revert.
+         * In cloud mode uses an optimistic-concurrency Firestore transaction:
+         * if the server rev has advanced since the editor opened the story,
+         * sets pendingConflict so the user can resolve manually.
+         * @param {string} id      - Story document ID.
+         * @param {object} newData - Fields to merge, must include current rev.
+         */
         async function saveStory(id, newData) {
             // Snapshot the current version before overwriting (enables revert)
             if (state.storiesMap[id]) {
@@ -544,6 +608,12 @@
             } catch(e) { console.error("Reorder failed", e); }
         }
 
+        /**
+         * Writes a partial update to the bulletin metadata document (or local
+         * state in offline mode). Used for clock times, lock state, formats,
+         * roles, and any other top-level meta fields.
+         * @param {object} updates - Key/value pairs to merge into bulletin meta.
+         */
         async function updateBulletinMeta(updates) {
             if (state.localMode) {
                 state.meta = { ...state.meta, ...updates };
@@ -556,14 +626,22 @@
             } catch(e) { console.error("Bulletin update failed", e); }
         }
 
+      /**
+         * Transitions the show between off-air (standby) and live TX.
+         * On TX start: records show/TX timestamps, sets active story to first in
+         * the rundown, computes target duration for backtime. On standby: clears
+         * all timing fields. Also primes the playout backend so decks are loaded
+         * before the operator hits Start TX.
+         * @param {'tx'|'standby'} targetMode
+         */
       async function updateStudioMode(targetMode) {
             if (!canMutate()) return;
 
             const order = state.meta.order || [];
             const markerIdx = order.indexOf('marker-line');
             const storyIds = markerIdx > -1 ? order.slice(0, markerIdx) : order;
-            const firstStoryId = storyIds[0] || null;
-            const activeOrder = storyIds.filter(id => !state.storiesMap[id]?.isFloated);
+            const firstStoryId = storyIds.find(id => !state.storiesMap[id]?.isFloated && state.storiesMap[id]?.type !== 'segment') || null;
+            const activeOrder = storyIds.filter(id => !state.storiesMap[id]?.isFloated && state.storiesMap[id]?.type !== 'segment');
 
             let updates = {
                 isTXMode: false,
@@ -602,11 +680,21 @@
             }
         }
 
+      /**
+         * Moves the active story pointer one step forward (+1) or back (-1)
+         * through the non-floated rundown. Writes the new activeStoryId to
+         * Firebase (or local state), signals the presenter view to jump to the
+         * new story, and calls syncPlayoutToActive so the playout decks stay
+         * in step.
+         * @param {1|-1} direction
+         */
       async function shiftActiveStory(direction) {
             if (!canMutate()) return;
             const rawOrder = state.meta.order;
             const markerIdx = rawOrder.indexOf('marker-line');
-            const activeOrder = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder).filter(id => !state.storiesMap[id]?.isFloated);
+            // Exclude floated stories and segment breaks from navigation
+            const activeOrder = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
+                .filter(id => !state.storiesMap[id]?.isFloated && state.storiesMap[id]?.type !== 'segment');
 
             if (activeOrder.length === 0) return;
 
@@ -689,6 +777,49 @@
                     transaction.update(bullRef, { order: newOrder });
                 });
             } catch(e) { console.error("Add story failed:", e); }
+        }
+
+
+        /**
+         * Creates a new segment/break divider in the rundown. Segments have a
+         * label and optional duration but no script, presenter, reporter, format,
+         * or media. They are skipped by Previous/Next navigation and by the
+         * playout system but their duration counts toward TRT.
+         */
+        async function addSegment() {
+            if (!canMutate()) return;
+            const newId = crypto.randomUUID();
+            const newStory = {
+                id: newId, bulletinId: state.currentBulletinId,
+                type: 'segment',
+                slug: 'BREAK', duration: 0,
+                rev: 1,
+                completed: false, isFloated: false,
+                lockedBySession: null, lockedByName: null, lockedAt: null,
+                // Unused fields kept for schema consistency
+                format: '', script: '', presenterId: '', reporterId: '', mediaFile: ''
+            };
+            if (state.localMode) {
+                state.storiesMap[newId] = newStory;
+                insertStoryIntoOrder(newId);
+                render();
+                return;
+            }
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+                    const storyRef = doc(db, ...paths.stories, newId);
+                    const bullSnap = await transaction.get(bullRef);
+                    if (!bullSnap.exists()) throw 'Bulletin missing';
+                    const currentOrder = bullSnap.data().order || [];
+                    const newOrder = [...currentOrder];
+                    const markerIdx = newOrder.indexOf('marker-line');
+                    if (markerIdx > -1) newOrder.splice(markerIdx, 0, newId);
+                    else newOrder.push(newId, 'marker-line');
+                    transaction.set(storyRef, newStory);
+                    transaction.update(bullRef, { order: newOrder });
+                });
+            } catch(e) { console.error('Add segment failed', e); }
         }
 
         async function toggleFloat(id) {
@@ -902,6 +1033,11 @@
             </span>`;
         }
 
+       /**
+         * Persists the current storiesMap and meta to localStorage under a
+         * per-room key. Only runs in local mode — cloud mode uses Firebase.
+         * Clears all lock fields before writing to avoid ghost locks on reload.
+         */
        function saveLocalState() {
             if (!state.localMode) return;
             try {
@@ -941,6 +1077,15 @@
         // ==========================================
         // 7. RENDERING ENGINE
         // ==========================================
+        /**
+         * Main render loop. Re-renders header, main content, and modals from
+         * current state. Skips re-rendering the main area while the user is
+         * dragging, inline-editing, or typing. Skips re-rendering the modal
+         * while the edit modal is open (prevents content being wiped by
+         * background Firebase snapshots). Manages the TX timer interval and
+         * the takeover countdown. Restores scroll position after each render.
+         * Called after every state mutation.
+         */
         function render() {
              const mainContainer = document.getElementById('main-container');
              const savedScroll = mainContainer ? mainContainer.scrollTop : 0;
@@ -1164,6 +1309,22 @@
             })();
         }
 
+        /**
+         * Loads an audio File onto a radio deck and wires it into the Web Audio
+         * graph for metering. Tears down any previous audio on the deck first
+         * (pausing, disconnecting nodes, revoking the object URL).
+         *
+         * Audio graph:
+         *   MediaElementSource → GainNode → destination  (audible output)
+         *   MediaElementSource → ChannelSplitter → AnalyserL/R  (metering tap, silent)
+         *
+         * After metadata loads the deck is cued to position 0 (state = 'cued').
+         * On natural end the deck transitions to 'ended' so stale audio cannot
+         * be mistakenly re-taken.
+         * @param {'deckA'|'deckB'} deckKey
+         * @param {File}            file     - Audio file to load.
+         * @param {string|null}     storyId  - Running-order story this file belongs to.
+         */
         async function radioLoadFile(deckKey, file, storyId = null) {
             const deck = state.radio[deckKey];
             radioLog(`Loading "${file.name}" → Deck ${deck.id}…`, 'info');
@@ -1226,10 +1387,9 @@
             deck.state = 'cued';
 
             audio.addEventListener('ended', () => {
-                audio.currentTime = 0;
                 stopRadioMeter(deck);
-                deck.state = 'cued';
-                radioLog(`Deck ${deck.id} ended — re-cued.`, 'info');
+                deck.state = 'ended';
+                radioLog(`Deck ${deck.id} ended.`, 'info');
                 render();
             });
 
@@ -1294,17 +1454,39 @@
             deck.audio.currentTime = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * deck.duration;
         }
 
+        /**
+         * Fires a radio take: plays the deck whose loadedStoryId matches the
+         * current activeStoryId (the deck shown on the On Air card). Falls back
+         * to any takeable deck for manual loads not linked to a story.
+         * After firing: advances clipIndex, then in a 300ms timeout stops the
+         * outgoing deck and auto-loads the upcoming clip onto it (if a media
+         * folder handle is available) or labels it for manual load.
+         */
         async function radioExecuteTake() {
             const deckA = state.radio.deckA;
             const deckB = state.radio.deckB;
-            const cuedDeck = (deckA.state === 'cued' || deckA.state === 'paused') ? deckA
-                        : (deckB.state === 'cued' || deckB.state === 'paused') ? deckB
-                        : null;
-            const playingDeck = deckA.state === 'playing' ? deckA
-                            : deckB.state === 'playing' ? deckB
-                            : null;
 
-            if (!cuedDeck || !cuedDeck.audio) {
+            // Select the deck whose loadedStoryId matches the active story.
+            // Avoids always picking A when B has the right clip loaded.
+            const activeStoryId = state.meta.activeStoryId;
+            const isTakeable = d => (d.state === 'cued' || d.state === 'paused') && d.audio;
+
+            let cuedDeck = null;
+            if (activeStoryId) {
+                if      (deckA.loadedStoryId === activeStoryId && isTakeable(deckA)) cuedDeck = deckA;
+                else if (deckB.loadedStoryId === activeStoryId && isTakeable(deckB)) cuedDeck = deckB;
+            }
+            // Fallback: any takeable deck (manual loads with no story link)
+            if (!cuedDeck) {
+                if      (isTakeable(deckA)) cuedDeck = deckA;
+                else if (isTakeable(deckB)) cuedDeck = deckB;
+            }
+
+            const playingDeck = deckA.state === 'playing' ? deckA
+                              : deckB.state === 'playing' ? deckB
+                              : null;
+
+            if (!cuedDeck) {
                 radioLog('No cued deck available for take.', 'warn');
                 return;
             }
@@ -1320,33 +1502,51 @@
                 return;
             }
 
-            // Stop outgoing deck and update queue index after short buffer
+            // Advance queue index to match what just played
+            const playedQueueIdx = state.radio.clipQueue.indexOf(cuedDeck.loadedStoryId);
+            if (playedQueueIdx > -1) state.radio.clipIndex = playedQueueIdx;
+            render();
+
+            // Release outgoing deck and load the upcoming clip onto it
             if (playingDeck) {
-                setTimeout(() => {
+                setTimeout(async () => {
                     if (playingDeck.audio) {
                         playingDeck.audio.pause();
                         playingDeck.audio.currentTime = 0;
                     }
                     stopRadioMeter(playingDeck);
-                    playingDeck.state = 'cued';
-                    state.radio.clipIndex = Math.max(state.radio.clipIndex, 0) + 1;
-                    const nextIdx = state.radio.clipIndex + 1;
-                    const queue = state.radio.clipQueue;
-                    if (nextIdx < queue.length) {
-                        const nextStory = state.storiesMap[queue[nextIdx]];
-                        if (nextStory) {
-                            playingDeck.slug = nextStory.slug;
-                            playingDeck.filename = nextStory.mediaFile;
-                            playingDeck.loadedStoryId = queue[nextIdx];
-                            radioLog(`Deck ${playingDeck.id} freed — load "${nextStory.mediaFile}" for next clip.`, 'info');
+
+                    const upcomingIdx = state.radio.clipIndex + 1;
+                    const queue       = state.radio.clipQueue;
+
+                    if (upcomingIdx < queue.length) {
+                        const upcomingStory = state.storiesMap[queue[upcomingIdx]];
+                        if (upcomingStory) {
+                            if (state.radio.directoryHandle) {
+                                const deckKey = playingDeck.id === 'A' ? 'deckA' : 'deckB';
+                                const file = await radioGetFileFromHandle(upcomingStory.mediaFile);
+                                if (file) {
+                                    await radioLoadFile(deckKey, file, queue[upcomingIdx]);
+                                    radioLog(`Deck ${playingDeck.id} auto-loaded: "${upcomingStory.mediaFile}"`, 'success');
+                                    return;
+                                }
+                            }
+                            playingDeck.state         = 'idle';
+                            playingDeck.slug          = upcomingStory.slug;
+                            playingDeck.filename      = upcomingStory.mediaFile;
+                            playingDeck.loadedStoryId = queue[upcomingIdx];
+                            radioLog(`Deck ${playingDeck.id} ready for manual load: "${upcomingStory.mediaFile}"`, 'info');
                         }
+                    } else {
+                        playingDeck.state         = 'idle';
+                        playingDeck.slug          = '';
+                        playingDeck.filename      = '';
+                        playingDeck.loadedStoryId = null;
+                        radioLog(`Deck ${playingDeck.id} cleared — end of clip queue.`, 'info');
                     }
                     render();
                 }, 300);
-            } else {
-                state.radio.clipIndex++;
             }
-            render();
         }
 
         // Attempt to get a File object from the granted directory handle by filename.
@@ -1362,6 +1562,13 @@
             }
         }
 
+        /**
+         * Builds the clip queue from the active running order and loads the
+         * first two clips onto Deck A and Deck B. Auto-loads from the granted
+         * File System Access API directory handle if available; otherwise labels
+         * the decks so the operator knows which files to load manually.
+         * @param {string[]} activeOrder - Ordered story IDs (floated excluded).
+         */
         async function radioInitialLoad(activeOrder) {
             const queue = activeOrder.filter(id => !!state.storiesMap[id]?.mediaFile);
             state.radio.clipQueue = queue;
@@ -1402,7 +1609,32 @@
 
         // Syncs playout decks to match a new active story position.
         // Called after Previous / Next / Reset so decks stay in step with the rundown.
-        async function syncPlayoutToActive(newActiveStoryId) {
+        // Debounced entry point for syncPlayoutToActive.
+        // All callers use this so rapid button presses or Firebase snapshot
+        // bursts collapse into a single load operation.
+        /**
+         * Debounced entry point for deck sync. Collapses rapid calls (e.g. fast
+         * Take Next presses or Firebase snapshot bursts) into a single 150ms-
+         * delayed execution so decks are not reloaded multiple times in quick
+         * succession. All call sites use this wrapper, not _syncPlayoutToActive.
+         * @param {string|null} newActiveStoryId
+         */
+        function syncPlayoutToActive(newActiveStoryId) {
+            clearTimeout(syncPlayoutTimeout);
+            syncPlayoutTimeout = setTimeout(() => _syncPlayoutToActive(newActiveStoryId), 150);
+        }
+
+        /**
+         * Reloads playout decks to match a new active story position.
+         * Checks whether each deck already has the correct clip loaded and cued —
+         * if so, skips reloading it (preserves existing assignments). Never
+         * interrupts a deck that is currently playing.
+         * For radio: Deck assignment is flexible — B can hold the active clip if
+         * it was already there, avoiding unnecessary reloads after a take.
+         * For OBS: always assigns A=active, B=next.
+         * @param {string|null} newActiveStoryId - Story now at front, or null for top of show.
+         */
+        async function _syncPlayoutToActive(newActiveStoryId) {
             if (state.ui.playoutBackend === 'none') return;
 
             const rawOrder = state.meta.order || [];
@@ -1413,44 +1645,79 @@
             const queue = activeOrder.filter(id => !!state.storiesMap[id]?.mediaFile);
             if (queue.length === 0) return;
 
-            // The active story goes on Deck A (preview/cued), next clip goes on Deck B (standby).
-            const activeClipIdx = newActiveStoryId ? queue.indexOf(newActiveStoryId) : 0;
-            const deckAStoryId  = queue[activeClipIdx > -1 ? activeClipIdx     : 0] || null;
-            const deckBStoryId  = queue[activeClipIdx > -1 ? activeClipIdx + 1 : 1] || null;
-
             if (state.ui.playoutBackend === 'radio') {
-                state.radio.clipQueue  = queue;
-                state.radio.clipIndex  = Math.max(activeClipIdx - 1, -1);
+                state.radio.clipQueue = queue;
 
-                // Stop both decks cleanly before reloading
-                for (const dk of ['deckA', 'deckB']) {
-                    const deck = state.radio[dk];
-                    if (deck.audio) { deck.audio.pause(); deck.audio.currentTime = 0; }
-                    stopRadioMeter(deck);
-                    deck.state = 'idle';
+                const activeClipIdx = newActiveStoryId ? queue.indexOf(newActiveStoryId) : 0;
+                const nextClipIdx   = activeClipIdx > -1 ? activeClipIdx + 1 : 1;
+                const activeStoryId = queue[activeClipIdx > -1 ? activeClipIdx : 0] || null;
+                const nextStoryId   = queue[nextClipIdx] || null;
+
+                state.radio.clipIndex = Math.max(activeClipIdx - 1, -1);
+
+                const deckA = state.radio.deckA;
+                const deckB = state.radio.deckB;
+
+                // A deck is correctly loaded if it already has the right story cued/paused.
+                // Don't reload it — preserve what the operator has ready.
+                const alreadyReady = (deck, storyId) =>
+                    storyId &&
+                    deck.loadedStoryId === storyId &&
+                    (deck.state === 'cued' || deck.state === 'paused') &&
+                    deck.audio;
+
+                const aHasActive = alreadyReady(deckA, activeStoryId);
+                const bHasActive = alreadyReady(deckB, activeStoryId);
+                const aHasNext   = alreadyReady(deckA, nextStoryId);
+                const bHasNext   = alreadyReady(deckB, nextStoryId);
+
+                if ((aHasActive || bHasActive) && (aHasNext || bHasNext || !nextStoryId)) {
+                    // Both needed clips are already on decks — nothing to do
+                    radioLog(`Deck sync — clips already loaded, skipping reload.`, 'info');
+                    render();
+                    return;
                 }
 
                 const loadOrLabel = async (deckKey, storyId) => {
                     if (!storyId) return;
+                    const deck = state.radio[deckKey];
+                    if (alreadyReady(deck, storyId)) return; // already correct, skip
+                    if (deck.state === 'playing') return;   // never interrupt playback
+                    // Stop and clear before reloading
+                    if (deck.audio) { deck.audio.pause(); deck.audio.currentTime = 0; }
+                    stopRadioMeter(deck);
+                    deck.state = 'idle';
+                    deck.loadedStoryId = null;
                     const story = state.storiesMap[storyId];
                     if (!story) return;
                     if (state.radio.directoryHandle) {
                         const file = await radioGetFileFromHandle(story.mediaFile);
                         if (file) { await radioLoadFile(deckKey, file, storyId); return; }
                     }
-                    // No directory handle or file not found — label only
-                    const deck = state.radio[deckKey];
                     deck.slug = story.slug;
                     deck.filename = story.mediaFile;
                     deck.loadedStoryId = storyId;
                 };
 
-                await loadOrLabel('deckA', deckAStoryId);
-                await loadOrLabel('deckB', deckBStoryId);
-                radioLog(`Deck sync → A: "${state.storiesMap[deckAStoryId]?.mediaFile || 'empty'}"  B: "${state.storiesMap[deckBStoryId]?.mediaFile || 'empty'}"`, 'info');
+                // Keep existing deck assignments if they're already correct.
+                // If B has the active clip, use B for active and A for next.
+                // Otherwise default: A=active, B=next.
+                if (bHasActive) {
+                    await loadOrLabel('deckA', nextStoryId);
+                } else if (aHasNext) {
+                    await loadOrLabel('deckB', activeStoryId);
+                } else {
+                    await loadOrLabel('deckA', activeStoryId);
+                    await loadOrLabel('deckB', nextStoryId);
+                }
+
+                radioLog(`Deck sync → A: "${state.storiesMap[deckA.loadedStoryId]?.mediaFile || 'empty'}"  B: "${state.storiesMap[deckB.loadedStoryId]?.mediaFile || 'empty'}"`, 'info');
                 render();
 
             } else if (state.ui.playoutBackend === 'obs') {
+                const activeClipIdx = newActiveStoryId ? queue.indexOf(newActiveStoryId) : 0;
+                const deckAStoryId  = queue[activeClipIdx > -1 ? activeClipIdx     : 0] || null;
+                const deckBStoryId  = queue[activeClipIdx > -1 ? activeClipIdx + 1 : 1] || null;
                 if (!state.obs.connected) return;
                 state.obs.clipQueue = queue;
                 state.obs.clipIndex = Math.max(activeClipIdx - 1, -1);
@@ -1458,7 +1725,6 @@
                 if (deckBStoryId) { await obsLoadDeck('B', deckBStoryId); obsLog(`Sync → Deck B: "${state.storiesMap[deckBStoryId]?.mediaFile}"`, 'info'); }
             }
         }
-
         function renderPPMStrip(deckId) {
                 const rows = ['L', 'R'].map(ch => {
                     const segs = Array.from({length: PPM_SEGMENTS}, (_, i) =>
@@ -1502,7 +1768,7 @@
                 const canPlay  = d.state === 'cued' || d.state === 'paused';
                 const canPause = d.state === 'playing';
                 const canStop  = d.state === 'playing' || d.state === 'paused';
-                const canCue   = d.state === 'cued' || d.state === 'playing' || d.state === 'paused';
+                const canCue   = d.state === 'cued' || d.state === 'playing' || d.state === 'paused' || d.state === 'ended';
                 const btnOn  = (col) => `p-2 rounded border transition-colors ${col} text-white`;
                 const btnOff = 'p-2 rounded border transition-colors bg-slate-100 border-slate-200 text-slate-300 cursor-not-allowed';
 
@@ -2040,6 +2306,15 @@
         // END OBS PLAYOUT ENGINE
         // ==========================================
 
+       /**
+         * Renders the Studio / Director view. Structure:
+         * - Dark TX status bar (Off Air / TX Live) with timer, backtime, and
+         *   Start TX / End TX button. Playout connection badge in off-air state.
+         * - On Air and Preview Next story cards with clip state/deck badges.
+         * - Playout deck panels (radio PPM decks or OBS decks, per backend).
+         * - Take control bar: Previous, Reset, Take Next, Take Clip.
+         * @returns {string} HTML string.
+         */
        function renderDirector() {
             const rawOrder = state.meta.order || [];
             const markerIdx = rawOrder.indexOf('marker-line');
@@ -2055,14 +2330,21 @@
 
             const isLive = state.meta.isTXMode;
 
-            // Map storyId → deck info for clip badges
+            // Map storyId → deck info for clip badges.
+            // If two decks share a storyId (same filename), prefer the one in a better state.
+            const deckStatePriority = s => s === 'playing' ? 3 : s === 'cued' || s === 'paused' ? 2 : s === 'ended' ? 1 : 0;
             const deckMap = {};
-            if (state.ui.playoutBackend === 'obs') {
+            if (state.ui.playoutBackend === 'radio') {
+                for (const [key, deck] of [['deckA', state.radio.deckA], ['deckB', state.radio.deckB]]) {
+                    if (!deck.loadedStoryId) continue;
+                    const existing = deckMap[deck.loadedStoryId];
+                    if (!existing || deckStatePriority(deck.state) > deckStatePriority(existing.deckState)) {
+                        deckMap[deck.loadedStoryId] = { deck: key === 'deckA' ? 'A' : 'B', deckState: deck.state };
+                    }
+                }
+            } else if (state.ui.playoutBackend === 'obs') {
                 if (state.obs.deckA.loadedStoryId) deckMap[state.obs.deckA.loadedStoryId] = { deck: 'A', deckState: state.obs.deckA.state };
                 if (state.obs.deckB.loadedStoryId) deckMap[state.obs.deckB.loadedStoryId] = { deck: 'B', deckState: state.obs.deckB.state };
-            } else if (state.ui.playoutBackend === 'radio') {
-                if (state.radio.deckA.loadedStoryId) deckMap[state.radio.deckA.loadedStoryId] = { deck: 'A', deckState: state.radio.deckA.state };
-                if (state.radio.deckB.loadedStoryId) deckMap[state.radio.deckB.loadedStoryId] = { deck: 'B', deckState: state.radio.deckB.state };
             }
 
             const clipTitleBadge = (story, storyId) => {
@@ -2153,13 +2435,13 @@
                         ${renderPlayoutSection()}
 
                         <div class="bg-slate-800 rounded-2xl p-6 flex justify-between items-center gap-4 shadow-xl">
-                            <button data-action="undo-take" class="flex-1 py-5 bg-red-600 hover:bg-red-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center"><i class="fa-solid fa-rotate-left mr-2"></i>Previous</button>
-                            <button data-action="reset-runorder" class="flex-1 py-5 bg-slate-600 hover:bg-slate-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center" title="Reset to first story"><i class="fa-solid fa-rotate mr-2"></i>Reset</button>
-                            <button data-action="take-next" class="flex-1 py-5 bg-green-600 hover:bg-green-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-colors text-center">Take Next <i class="fa-solid fa-forward-step ml-2"></i></button>
+                            <button data-action="undo-take" class="take-btn bg-red-600 hover:bg-red-500 text-white"><i class="fa-solid fa-rotate-left mr-2"></i>Previous</button>
+                            <button data-action="reset-runorder" class="take-btn bg-slate-600 hover:bg-slate-500 text-white" title="Reset to first story"><i class="fa-solid fa-rotate mr-2"></i>Reset</button>
+                            <button data-action="take-next" class="take-btn bg-green-600 hover:bg-green-500 text-white">Take Next <i class="fa-solid fa-forward-step ml-2"></i></button>
                             ${state.ui.playoutBackend === 'obs' ? `
-                            <button id="obs-btn-take" data-obs-action="take" class="flex-1 py-5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed text-center">&#9654; Take Clip</button>` : ''}
+                            <button id="obs-btn-take" data-obs-action="take" class="take-btn bg-blue-600 hover:bg-blue-500 text-white active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed">&#9654; Take Clip</button>` : ''}
                             ${state.ui.playoutBackend === 'radio' ? `
-                            <button data-action="radio-take" class="flex-1 py-5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl font-black text-xl tracking-wide shadow-lg transition-all active:scale-95 text-center">&#9654; Take Clip</button>` : ''}
+                            <button data-action="radio-take" class="take-btn bg-blue-600 hover:bg-blue-500 text-white active:scale-95">&#9654; Take Clip</button>` : ''}
                         </div>
 
                     </div>
@@ -2275,6 +2557,13 @@
             requestAnimationFrame(autoscrollLoop);
 
 
+        /**
+         * Renders the global application header bar: logo, mode tabs
+         * (Newsroom / Presenter / Studio), staff button, checked-in user badge,
+         * room switcher, settings gear, and sync/connection badge.
+         * TX controls are intentionally absent — they live in the Studio view.
+         * @returns {string} HTML string.
+         */
         function renderHeader() {
             const staffCount = (state.meta.staff || []).length;
 
@@ -2321,6 +2610,13 @@
         }
 
 
+        /**
+         * Renders the Newsroom / Rundown view. Builds the TX/RX timing bar, the
+         * sortable story table with per-row clock times and clip/staff badges,
+         * the TX timer badges when TX is live, and the trash rescue bar.
+         * Clock times are computed by accumulating story durations from TX start.
+         * @returns {string} HTML string.
+         */
         function renderNewsroom() {
             let totalDuration = 0;
             let isBelowLine = false;
@@ -2351,6 +2647,26 @@
                 }
                 const story = state.storiesMap[id];
                 if (!story) return '';
+
+                // Segment/break divider row
+                if (story.type === 'segment') {
+                    if (!isBelowLine) totalDuration += story.duration || 0;
+                    const durLabel = story.duration > 0 ? formatDuration(story.duration) : '';
+                    return `<tr class="segment-row" data-story-id="${id}" draggable="true">
+                        <td colspan="10">
+                            <div class="segment-divider">
+                                <div class="segment-label"><i class="fa-solid fa-scissors mr-2 opacity-40"></i>${escapeHTML(story.slug)}</div>
+                                ${durLabel ? `<span class="segment-dur">${durLabel}</span>` : ''}
+                                <div class="segment-line"></div>
+                                <div class="flex items-center gap-1 px-2">
+                                    <button data-action="edit-story" data-id="${id}" class="p-1.5 text-indigo-300 hover:text-indigo-700 transition-colors"><i class="fa-solid fa-pen text-xs"></i></button>
+                                    ${!isRundownLocked ? `<button data-action="delete-story" data-id="${id}" class="p-1.5 text-indigo-300 hover:text-red-500 transition-colors"><i class="fa-solid fa-trash text-xs"></i></button>` : ''}
+                                </div>
+                            </div>
+                        </td>
+                    </tr>`;
+                }
+
                 if (!isBelowLine && !story.isFloated) totalDuration += story.duration || 0;
                 const isActive = state.meta.activeStoryId === id && state.meta.isTXMode;
                 const isComplete = story.completed;
@@ -2386,7 +2702,7 @@
                         ${story.isFloated ? `<span class="ml-2 text-[10px] font-bold bg-amber-100 text-amber-700 border border-amber-200 px-1.5 py-0.5 rounded uppercase tracking-wide">Floated</span>` : ''}
                     </td>
                     <td class="px-3 py-1.5 text-sm w-24"><span class="bg-slate-100 border px-2 py-0.5 rounded text-xs font-mono font-bold">${escapeHTML(story.format)}</span></td>
-                    <td class="px-3 py-1.5 w-32"><div class="text-xs font-bold text-blue-700">${escapeHTML(pres)}</div><div class="text-xs text-slate-600">${escapeHTML(rep)}</div></td>
+                    <td class="px-3 py-1.5 w-32"><div class="text-xs font-bold text-blue-700">${escapeHTML(rep)}</div><div class="text-xs text-slate-600">${escapeHTML(pres)}</div></td>
                     <td class="px-3 py-1.5 text-sm w-24 font-mono">${story.isFloated ? `<span class="line-through text-slate-400">${formatDuration(story.duration)}</span>` : formatDuration(story.duration)}</td>
                     ${clockCell}
                     <td class="px-3 py-1.5 text-sm italic truncate max-w-xs">${escapeHTML(story.script || 'No script...')}</td>
@@ -2475,6 +2791,7 @@
                         </div>` : ''}
                         ${txSecs === null || rxSecs === null ? `<div class="text-sm font-medium text-slate-500">Total TRT: <span class="text-slate-800 font-mono text-lg bg-slate-200 px-2 py-1 rounded ml-1">${formatDuration(totalDuration)}</span></div>` : ''}
                         <button data-action="add-story" ${isRundownLocked ? 'disabled title="Rundown is locked"' : ''} class="${isRundownLocked ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white'} px-5 py-2.5 rounded-lg font-medium transition-colors shadow-sm"><i class="fa-solid fa-plus mr-2"></i>Add Story</button>
+                        <button data-action="add-segment" ${isRundownLocked ? 'disabled title="Rundown is locked"' : ''} class="${isRundownLocked ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-slate-700 hover:bg-slate-600 text-white'} px-5 py-2.5 rounded-lg font-medium transition-colors shadow-sm" title="Add a segment break or theme divider"><i class="fa-solid fa-scissors mr-2"></i>Add Segment</button>
                         <button data-action="print-scripts" class="bg-slate-600 hover:bg-slate-700 text-white px-5 py-2.5 rounded-lg font-medium transition-colors shadow-sm">
                             <i class="fa-solid fa-print mr-2"></i>Print Scripts
                         </button>
@@ -2516,6 +2833,14 @@
         }
 
 
+       /**
+         * Renders the Presenter view. Switches between two sub-modes:
+         * - 'autocue': full-screen scrolling script view (renderAutocue)
+         * - 'presenter': side-by-side reference cards (renderPresenterCards)
+         * The Presenter tab button toggles between the two sub-modes when already
+         * active, rather than switching away from presenter view.
+         * @returns {string} HTML string.
+         */
        function renderPresenter() {
             const rawOrder = state.meta.order || [];
             const markerIdx = rawOrder.indexOf('marker-line');
@@ -2537,6 +2862,15 @@
             }
         }
 
+        /**
+         * Renders the full-screen autocue view. Stories scroll continuously —
+         * the view never jumps unless Take Next is explicitly pressed (controlled
+         * via pendingScrollToActive flag). Active story is fully opaque; others
+         * are dimmed. Mirror and font scale applied via CSS transform. A fixed
+         * controls bar at the bottom handles scroll speed and navigation.
+         * @param {string[]} storyIds - Ordered non-floated story IDs.
+         * @returns {string} HTML string.
+         */
         function renderAutocue(storyIds) {
             const pm = state.ui.presenter;
             const fontSize = Math.round(48 * pm.fontScale);
@@ -2551,6 +2885,20 @@
                 const story = state.storiesMap[id];
                 if (!story) return '';
                 const isActive = state.meta.activeStoryId === id;
+
+                // Segment break — show as a horizontal holding card
+                if (story.type === 'segment') {
+                    const durLabel = story.duration > 0 ? ` · ${formatDuration(story.duration)}` : '';
+                    return `
+                        <div id="presenter-story-${id}" class="mb-16">
+                            <div style="border: 2px dashed #6366f1; border-radius: 0.75rem; padding: 1.25rem 1.5rem; display: flex; align-items: center; gap: 1rem; opacity: 0.6;">
+                                <i class="fa-solid fa-scissors" style="color:#6366f1; font-size:1.25rem;"></i>
+                                <span style="color:#6366f1; font-weight:900; font-size:1.1rem; letter-spacing:0.12em; text-transform:uppercase;">${escapeHTML(story.slug)}${durLabel}</span>
+                                <div style="flex:1; height:1px; background:#6366f1; opacity:0.3;"></div>
+                            </div>
+                        </div>`;
+                }
+
                 const clipSecs = parseClipTags(story.script);
 
                 return `
@@ -2615,6 +2963,13 @@
                 </div>`;
         }
 
+        /**
+         * Renders the presenter reference card view: a grid of story cards
+         * showing slug, format, script excerpt, and staff names. The active
+         * story is highlighted. Cards can be expanded to show full script.
+         * @param {string[]} storyIds - Ordered non-floated story IDs.
+         * @returns {string} HTML string.
+         */
         function renderPresenterCards(storyIds) {
             const isLive = state.meta.isTXMode;
             const isRehearsal = state.meta.isRehearsalMode;
@@ -2700,9 +3055,45 @@
             return '';
         }
 
+        /**
+         * Renders the story edit modal. The modal container is NOT re-rendered
+         * while it is open (guarded in render()) so background Firebase snapshots
+         * cannot wipe unsaved content mid-edit. Shows a conflict resolution UI
+         * instead if pendingConflict is set.
+         * @returns {string} HTML string.
+         */
         function renderEditModal() {
             const story = state.storiesMap[state.ui.editingStoryId];
             if (!story) return '';
+
+            // Segment edit modal — minimal form, label + duration only
+            if (story.type === 'segment') {
+                const isLocked = story.lockedBySession && story.lockedBySession !== state.sessionId;
+                return `<div class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 z-[60]">
+                    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-sm flex flex-col overflow-hidden">
+                        <div class="px-6 py-4 border-b border-indigo-100 flex justify-between items-center bg-indigo-50 rounded-t-2xl">
+                            <h3 class="text-lg font-bold text-indigo-900"><i class="fa-solid fa-scissors mr-2 text-indigo-400"></i>Edit Segment</h3>
+                            <button data-action="cancel-edit" class="text-indigo-300 hover:text-indigo-600 text-2xl"><i class="fa-solid fa-xmark"></i></button>
+                        </div>
+                        <div class="p-6 space-y-4">
+                            <input type="hidden" id="edit-rev" value="${story.rev}">
+                            <div>
+                                <label class="text-sm font-semibold block mb-1">Label</label>
+                                <input type="text" id="edit-slug" value="${escapeHTML(story.slug)}" class="w-full border rounded-lg px-4 py-2.5 outline-none focus:border-blue-500 font-bold uppercase tracking-widest" ${isLocked ? 'disabled' : ''} placeholder="e.g. SPORT, AD BREAK, WEATHER">
+                            </div>
+                            <div>
+                                <label class="text-sm font-semibold block mb-1">Duration <span class="font-normal text-slate-400">(optional, counts toward TRT)</span></label>
+                                <input type="text" id="edit-duration" value="${story.duration > 0 ? formatDuration(story.duration) : ''}" class="w-full border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''} placeholder="e.g. 3:00">
+                            </div>
+                        </div>
+                        <div class="px-6 py-4 border-t border-slate-200 bg-slate-50 flex justify-end gap-3">
+                            <button data-action="cancel-edit" class="px-5 py-2.5 rounded-lg text-slate-600 hover:bg-slate-200 transition-colors">Cancel</button>
+                            ${!isLocked ? `<button data-action="save-edit" class="btn-primary">Save</button>` : ''}
+                        </div>
+                    </div>
+                </div>`;
+            }
+
             const formats = state.meta.formats || DEFAULT_FORMATS;
             const formatOptions = formats.map(f => `<option value="${f}" ${story.format === f ? 'selected' : ''}>${f}</option>`).join('');
             const isLocked = story.lockedBySession && story.lockedBySession !== state.sessionId;
@@ -2754,11 +3145,18 @@
                             >${escapeHTML(story.script)}</textarea>
                         </div>
                     </div>
-                    <div class="px-6 py-4 border-t border-slate-200 bg-slate-50 flex justify-between items-center gap-3"><div>${state.ui.storySnapshots[state.ui.editingStoryId] ? `<button data-action="revert-story" data-id="${state.ui.editingStoryId}" class="flex items-center gap-2 px-4 py-2.5 rounded-lg text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 font-medium transition-colors text-sm"><i class="fa-solid fa-clock-rotate-left"></i>Revert to previous version</button>` : ''}</div><div class="flex gap-3"><button data-action="cancel-edit" class="px-5 py-2.5 rounded-lg text-slate-600 hover:bg-slate-200 transition-colors">${isLocked ? 'Close' : 'Cancel'}</button>${!isLocked ? `<button data-action="save-edit" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Save Changes</button>` : ''}</div></div>
+                    <div class="px-6 py-4 border-t border-slate-200 bg-slate-50 flex justify-between items-center gap-3"><div>${state.ui.storySnapshots[state.ui.editingStoryId] ? `<button data-action="revert-story" data-id="${state.ui.editingStoryId}" class="flex items-center gap-2 px-4 py-2.5 rounded-lg text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 font-medium transition-colors text-sm"><i class="fa-solid fa-clock-rotate-left"></i>Revert to previous version</button>` : ''}</div><div class="flex gap-3"><button data-action="cancel-edit" class="px-5 py-2.5 rounded-lg text-slate-600 hover:bg-slate-200 transition-colors">${isLocked ? 'Close' : 'Cancel'}</button>${!isLocked ? `<button data-action="save-edit" class="btn-primary">Save Changes</button>` : ''}</div></div>
                 </div>
             </div>`;
         }
 
+        /**
+         * Renders the settings modal with three tabs: Connection (Firebase config),
+         * Playout (backend selector, OBS config, radio output device and media
+         * folder), and Editorial (TX/RX clock times, story formats, staff roles,
+         * rundown lock). Settings are persisted to localStorage on save.
+         * @returns {string} HTML string.
+         */
         function renderSettingsModal() {
             let savedConfig = {};
             try {
@@ -2796,10 +3194,10 @@
                                         <div class="flex justify-between items-start mb-2"><h4 class="font-bold text-blue-800">Cloud Sync</h4>${state.connectionState === 'connected' ? `<span class="text-[10px] font-bold uppercase tracking-wider bg-emerald-500 text-white px-2 py-1 rounded-md shadow-sm">Connected</span>` : ''}</div>
                                         <textarea id="config-paste" rows="4" class="w-full border rounded-lg p-3 text-xs font-mono bg-white outline-none mb-4" placeholder="const firebaseConfig = { ... }"></textarea>
                                         <div class="grid grid-cols-2 gap-4">
-                                            <div><label class="text-[10px] uppercase font-bold text-slate-500">apiKey</label><input type="text" id="config-apikey" value="${escapeHTML(savedConfig.apiKey || '')}" class="w-full border rounded-md px-3 py-2 text-sm font-mono outline-none"></div>
-                                            <div><label class="text-[10px] uppercase font-bold text-slate-500">authDomain</label><input type="text" id="config-authdomain" value="${escapeHTML(savedConfig.authDomain || '')}" class="w-full border rounded-md px-3 py-2 text-sm font-mono outline-none"></div>
-                                            <div><label class="text-[10px] uppercase font-bold text-slate-500">projectId</label><input type="text" id="config-projectid" value="${escapeHTML(savedConfig.projectId || '')}" class="w-full border rounded-md px-3 py-2 text-sm font-mono outline-none"></div>
-                                            <div><label class="text-[10px] uppercase font-bold text-slate-500">storageBucket</label><input type="text" id="config-storagebucket" value="${escapeHTML(savedConfig.storageBucket || '')}" class="w-full border rounded-md px-3 py-2 text-sm font-mono outline-none"></div>
+                                            <div><label class="form-label-sm">apiKey</label><input type="text" id="config-apikey" value="${escapeHTML(savedConfig.apiKey || '')}" class="form-input-sm"></div>
+                                            <div><label class="form-label-sm">authDomain</label><input type="text" id="config-authdomain" value="${escapeHTML(savedConfig.authDomain || '')}" class="form-input-sm"></div>
+                                            <div><label class="form-label-sm">projectId</label><input type="text" id="config-projectid" value="${escapeHTML(savedConfig.projectId || '')}" class="form-input-sm"></div>
+                                            <div><label class="form-label-sm">storageBucket</label><input type="text" id="config-storagebucket" value="${escapeHTML(savedConfig.storageBucket || '')}" class="form-input-sm"></div>
                                         </div>
                                     </div>
                                 </div>` 
@@ -2843,7 +3241,7 @@
                                         <h4 class="font-bold text-slate-800 flex items-center gap-2"><i class="fa-solid fa-radio text-slate-400"></i>Audio Output Device</h4>
                                         ${setSinkIdSupported ? `
                                         <div>
-                                            <label class="text-xs font-bold text-slate-500 uppercase tracking-wide block mb-1">Output Device</label>
+                                            <label class="form-label">Output Device</label>
                                             <select id="radio-sink-select" class="w-full border rounded-lg px-3 py-2 text-sm outline-none focus:border-blue-500 bg-white">
                                                 <option value="">System Default</option>
                                                 ${(state.radio.devices || []).map(d =>
@@ -2883,20 +3281,20 @@
                                         <h4 class="font-bold text-slate-800 flex items-center gap-2"><i class="fa-solid fa-film text-slate-400"></i>OBS WebSocket Connection</h4>
                                         <div class="grid grid-cols-2 gap-4">
                                             <div>
-                                                <label class="text-xs font-bold text-slate-500 uppercase tracking-wide block mb-1">IP Address</label>
-                                                <input type="text" id="obs-set-ip" value="${escapeHTML(obsConfig.ip)}" placeholder="127.0.0.1" class="w-full border rounded-lg px-3 py-2 text-sm font-mono outline-none focus:border-blue-500">
+                                                <label class="form-label">IP Address</label>
+                                                <input type="text" id="obs-set-ip" value="${escapeHTML(obsConfig.ip)}" placeholder="127.0.0.1" class="form-input">
                                             </div>
                                             <div>
-                                                <label class="text-xs font-bold text-slate-500 uppercase tracking-wide block mb-1">Port</label>
-                                                <input type="number" id="obs-set-port" value="${escapeHTML(obsConfig.port)}" placeholder="4455" class="w-full border rounded-lg px-3 py-2 text-sm font-mono outline-none focus:border-blue-500">
+                                                <label class="form-label">Port</label>
+                                                <input type="number" id="obs-set-port" value="${escapeHTML(obsConfig.port)}" placeholder="4455" class="form-input">
                                             </div>
                                             <div>
-                                                <label class="text-xs font-bold text-slate-500 uppercase tracking-wide block mb-1">WebSocket Password</label>
-                                                <input type="password" id="obs-set-pass" value="${escapeHTML(obsConfig.pass)}" class="w-full border rounded-lg px-3 py-2 text-sm font-mono outline-none focus:border-blue-500">
+                                                <label class="form-label">WebSocket Password</label>
+                                                <input type="password" id="obs-set-pass" value="${escapeHTML(obsConfig.pass)}" class="form-input">
                                             </div>
                                             <div>
-                                                <label class="text-xs font-bold text-slate-500 uppercase tracking-wide block mb-1">Base Media Folder</label>
-                                                <input type="text" id="obs-set-base" value="${escapeHTML(obsConfig.base)}" placeholder="D:/Broadcast/Clips/" class="w-full border rounded-lg px-3 py-2 text-sm font-mono outline-none focus:border-blue-500">
+                                                <label class="form-label">Base Media Folder</label>
+                                                <input type="text" id="obs-set-base" value="${escapeHTML(obsConfig.base)}" placeholder="D:/Broadcast/Clips/" class="form-input">
                                                 <p class="text-xs text-slate-400 mt-1">Include trailing slash. Prepended to all media filenames.</p>
                                             </div>
                                         </div>
@@ -2940,10 +3338,10 @@
                                 </div>
                             <button data-action="close-settings-modal" class="px-5 py-2.5 rounded-lg text-slate-600 hover:bg-slate-200">Close</button>
                             <div>
-                                ${state.ui.settingsTab === 'connection' ? `<button data-action="save-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Save & Restart</button>` : ''}
-                                ${state.ui.settingsTab === 'playout' && state.ui.playoutBackend === 'obs' ? `<button data-action="save-obs-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Save & Reconnect OBS</button>` : ''}
-                                ${state.ui.settingsTab === 'playout' && state.ui.playoutBackend === 'radio' ? `<button data-action="save-radio-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Save Audio Settings</button>` : ''}
-                                ${state.ui.settingsTab === 'editorial' ? `<button data-action="save-editorial-settings" class="px-6 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-sm transition-colors">Apply to Newsroom</button>` : ''}
+                                ${state.ui.settingsTab === 'connection' ? `<button data-action="save-settings" class="btn-primary">Save & Restart</button>` : ''}
+                                ${state.ui.settingsTab === 'playout' && state.ui.playoutBackend === 'obs' ? `<button data-action="save-obs-settings" class="btn-primary">Save & Reconnect OBS</button>` : ''}
+                                ${state.ui.settingsTab === 'playout' && state.ui.playoutBackend === 'radio' ? `<button data-action="save-radio-settings" class="btn-primary">Save Audio Settings</button>` : ''}
+                                ${state.ui.settingsTab === 'editorial' ? `<button data-action="save-editorial-settings" class="btn-primary">Apply to Newsroom</button>` : ''}
                             </div>
                         </div>
                     </div>
@@ -3039,6 +3437,13 @@
             </div>`;
         }
 
+        /**
+         * Parses a story script string into an array of typed line objects for
+         * the print layout. Recognises [BRACKET] instruction blocks, [CLIP:] tags,
+         * and blank-line paragraph separators.
+         * @param {string} script
+         * @returns {{type: string, text: string}[]}
+         */
         function parseScriptLines(script) {
             const lines = (script || '').split('\n').filter(l => l.trim());
             const rows = [];
@@ -3060,6 +3465,12 @@
             return rows;
         }
 
+        /**
+         * Opens a new browser window containing a print-formatted version of all
+         * above-the-line scripts. Each story gets a header block (slug, format,
+         * duration, staff) followed by the formatted script body. Triggers
+         * window.print() automatically after a short delay.
+         */
         function printScripts() {
             const order = state.meta.order || [];
             const markerIdx = order.indexOf('marker-line');
@@ -3276,6 +3687,12 @@
             setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
         }
 
+        /**
+         * Attaches all global DOM event listeners (click, change, input, drag,
+         * keydown, etc.) via event delegation on document.body. Called once from
+         * boot(). All UI interactions flow through here to the appropriate action
+         * handlers or mutator functions.
+         */
         function bindGlobalEvents() {
             // 1. UNIFIED KEYDOWN LISTENER
             document.addEventListener('keydown', e => {
@@ -3384,8 +3801,9 @@
                             const order = state.meta.order || [];
                             const markerIdx = order.indexOf('marker-line');
                             const storyIds = markerIdx > -1 ? order.slice(0, markerIdx) : order;
-                            if (storyIds.length > 0) {
-                                state.meta.activeStoryId = storyIds[0];
+                            const firstPlayable = storyIds.find(id => state.storiesMap[id]?.type !== 'segment');
+                            if (firstPlayable) {
+                                state.meta.activeStoryId = firstPlayable;
                                 state.meta.isCued = true;
                             }
                             const activeOrder = storyIds.filter(id => !state.storiesMap[id]?.isFloated);
@@ -3400,6 +3818,7 @@
 
                 const isRundownLocked = state.meta.rundownLocked && state.meta.editorStaffId !== state.myStaffId;
                 if (action === 'add-story') { if (!isRundownLocked) addStory(); return; }
+                if (action === 'add-segment') { if (!isRundownLocked) addSegment(); return; }
                 if (action === 'toggle-float') { if (!isRundownLocked) toggleFloat(id); return; }
                 if (action === 'delete-story') { if (!isRundownLocked) deleteStory(id); return; }
                 if (action === 'rescue-story') { rescueStory(id); return; }
@@ -3667,9 +4086,15 @@
                     let durStr = document.getElementById('edit-duration').value;
                     let parsedDuration = 0;
                     if (durStr.includes(':')) { const [m, s] = durStr.split(':'); parsedDuration = (parseInt(m, 10) || 0) * 60 + (parseInt(s, 10) || 0); } else { parsedDuration = parseInt(durStr, 10) || 0; }
-                    const scriptText = document.getElementById('edit-script').value;
-                    parsedDuration += parseClipTags(scriptText);
-                    saveStory(state.ui.editingStoryId, { slug: document.getElementById('edit-slug').value, format: document.getElementById('edit-format').value, presenterId: document.getElementById('edit-presenter').value, reporterId: document.getElementById('edit-reporter').value, mediaFile: document.getElementById('edit-media-file').value.trim(), duration: parsedDuration, script: scriptText, rev: parseInt(document.getElementById('edit-rev').value, 10) });
+                    const editingStory = state.storiesMap[state.ui.editingStoryId];
+                    if (editingStory?.type === 'segment') {
+                        // Segment save — label and duration only
+                        saveStory(state.ui.editingStoryId, { slug: document.getElementById('edit-slug').value.toUpperCase(), duration: parsedDuration, rev: parseInt(document.getElementById('edit-rev').value, 10) });
+                    } else {
+                        const scriptText = document.getElementById('edit-script').value;
+                        parsedDuration += parseClipTags(scriptText);
+                        saveStory(state.ui.editingStoryId, { slug: document.getElementById('edit-slug').value, format: document.getElementById('edit-format').value, presenterId: document.getElementById('edit-presenter').value, reporterId: document.getElementById('edit-reporter').value, mediaFile: document.getElementById('edit-media-file').value.trim(), duration: parsedDuration, script: scriptText, rev: parseInt(document.getElementById('edit-rev').value, 10) });
+                    }
                 }
                 if (action === 'resolve-conflict') {
                     const { storyId, serverData, localData } = state.ui.pendingConflict;
@@ -3681,7 +4106,7 @@
                     const rawOrder = state.meta.order || [];
                     const markerIdx = rawOrder.indexOf('marker-line');
                     const storyIds = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
-                        .filter(id => !state.storiesMap[id]?.isFloated);
+                        .filter(id => !state.storiesMap[id]?.isFloated && state.storiesMap[id]?.type !== 'segment');
                     const firstId = storyIds[0] || null;
                     const now = Date.now();
                     const updates = {
