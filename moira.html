@@ -243,7 +243,9 @@
                     focusMode: 'rundown',
                     pausedByUser: false,
                     presenterMode: 'autocue',  // 'autocue' | 'presenter'
-                    expandedStoryId: null
+                    expandedStoryId: null,
+                    selfFireEnabled: localStorage.getItem('moira_presenter_self_fire') === 'true',
+                    clipAudio: null   // transient Audio element for presenter self-fire
                 },
                 playoutBackend: savedPlayoutBackend,  // 'none' | 'radio' | 'obs'
                 trash: [],           // [{id, story, orderIndex, deletedAt}]
@@ -1027,6 +1029,66 @@
                 .replace(/(<br>\s*){3,}/g, '<br><br>');
         }
 
+
+        /**
+         * Fires a clip from the presenter view using a transient Audio element.
+         * Uses the same output device as the radio decks. If a clip is already
+         * playing, stops it first. Entirely independent of the deck system.
+         * @param {string} storyId - The story whose mediaFile should play.
+         */
+        async function presenterFireClip(storyId) {
+            const story = state.storiesMap[storyId];
+            if (!story?.mediaFile) return;
+
+            // Stop any currently playing presenter clip
+            if (state.ui.presenter.clipAudio) {
+                state.ui.presenter.clipAudio.pause();
+                if (state.ui.presenter.clipAudio.objectUrl)
+                    URL.revokeObjectURL(state.ui.presenter.clipAudio.objectUrl);
+                state.ui.presenter.clipAudio = null;
+                render();
+            }
+
+            // If same story tapped while playing it was a stop — we're done
+            if (state.ui.presenter.playingClipStoryId === storyId) {
+                state.ui.presenter.playingClipStoryId = null;
+                render();
+                return;
+            }
+
+            // Load file from directory handle
+            if (!state.radio.directoryHandle) {
+                radioLog('Presenter self-fire: no media folder granted.', 'warn');
+                return;
+            }
+            const file = await radioGetFileFromHandle(story.mediaFile);
+            if (!file) return;
+
+            const objectUrl = URL.createObjectURL(file);
+            const audio = new Audio();
+            audio.src = objectUrl;
+            audio.objectUrl = objectUrl;
+
+            if (state.radio.selectedSinkId && audio.setSinkId) {
+                try { await audio.setSinkId(state.radio.selectedSinkId); } catch(e) {}
+            }
+
+            audio.addEventListener('ended', () => {
+                URL.revokeObjectURL(objectUrl);
+                state.ui.presenter.clipAudio = null;
+                state.ui.presenter.playingClipStoryId = null;
+                render();
+            });
+
+            state.ui.presenter.clipAudio = audio;
+            state.ui.presenter.playingClipStoryId = storyId;
+            render();
+            await audio.play().catch(e => {
+                radioLog(`Presenter clip error: ${e.message}`, 'error');
+                state.ui.presenter.clipAudio = null;
+                state.ui.presenter.playingClipStoryId = null;
+            });
+        }
         function renderStatusBadge(label, icon, colorClass) {
             return `<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium ${colorClass} ml-1">
                 <i class="fa-solid ${icon}"></i> ${label}
@@ -2970,9 +3032,69 @@
          * @param {string[]} storyIds - Ordered non-floated story IDs.
          * @returns {string} HTML string.
          */
+
+        /**
+         * Renders a presenter script with [CLIP] tags replaced by large tap-to-fire
+         * buttons. Only used in presenter cards view when self-fire is enabled.
+         * Non-CLIP instruction blocks render as normal visual cues.
+         * @param {string} script
+         * @param {string} storyId
+         * @returns {string} HTML string
+         */
+        function renderPresenterScriptWithFire(script, storyId) {
+            if (!script) return '<p class="text-base text-slate-500 italic">No script.</p>';
+            const playingId = state.ui.presenter.playingClipStoryId;
+            const isPlaying = playingId === storyId;
+
+            // Split on CLIP tags to interleave text and buttons
+            const parts = script.split(/(\[CLIP:\d+:\d{2}\])/gi);
+            return parts.map(part => {
+                const clipMatch = part.match(/^\[CLIP:(\d+):(\d{2})\]$/i);
+                if (clipMatch) {
+                    const mins = parseInt(clipMatch[1], 10);
+                    const secs = parseInt(clipMatch[2], 10);
+                    const dur  = formatDuration(mins * 60 + secs);
+                    if (isPlaying) {
+                        return `<button data-action="presenter-fire-clip" data-id="${storyId}"
+                            style="display:block; width:100%; margin:1rem 0; padding:1.1rem 1.5rem; border-radius:0.75rem;
+                                   background:#dc2626; color:#fff; border:none; cursor:pointer;
+                                   font-size:1.1rem; font-weight:900; letter-spacing:0.08em; text-transform:uppercase;
+                                   box-shadow:0 4px 24px rgba(220,38,38,0.4);">
+                            <span style="display:flex;align-items:center;justify-content:center;gap:1rem;">
+                                <span style="font-size:1.4rem;">⏹</span>
+                                <span>STOP CLIP</span>
+                                <span style="opacity:0.7;font-size:1.1rem;font-weight:700;">${dur}</span>
+                            </span>
+                        </button>`;
+                    } else {
+                        return `<button data-action="presenter-fire-clip" data-id="${storyId}"
+                            style="display:block; width:100%; margin:1rem 0; padding:1.1rem 1.5rem; border-radius:0.75rem;
+                                   background:#16a34a; color:#fff; border:none; cursor:pointer;
+                                   font-size:1.1rem; font-weight:900; letter-spacing:0.08em; text-transform:uppercase;
+                                   box-shadow:0 4px 16px rgba(22,163,74,0.3);">
+                            <span style="display:flex;align-items:center;justify-content:center;gap:1rem;">
+                                <span style="font-size:1.4rem;">▶</span>
+                                <span>PLAY CLIP</span>
+                                <span style="opacity:0.7;font-size:1.1rem;font-weight:700;">${dur}</span>
+                            </span>
+                        </button>`;
+                    }
+                } else if (part.trim()) {
+                    // Regular script text — preserve line breaks
+                    const escaped = escapeHTML(part).replace(/\n/g, '<br>');
+                    // Render [INSTRUCTION] blocks
+                    const formatted = escaped.replace(/\[([^\]]+)\]/g,
+                        '<span style="display:inline-block;background:#e2e8f0;color:#1e293b;padding:0.15rem 0.6rem;border-radius:0.375rem;font-size:0.75em;font-weight:900;text-transform:uppercase;letter-spacing:0.05em;margin:0 0.2rem;">[$1]</span>');
+                    return `<span style="font-size:1.05rem;line-height:1.8;color:#1e293b;">${formatted}</span>`;
+                }
+                return '';
+            }).join('');
+        }
         function renderPresenterCards(storyIds) {
             const isLive = state.meta.isTXMode;
             const isRehearsal = state.meta.isRehearsalMode;
+            const selfFire = state.ui.presenter.selfFireEnabled && state.ui.playoutBackend === 'radio' && !!state.radio.directoryHandle;
+            const playingId = state.ui.presenter.playingClipStoryId || null;
 
             const activeIdx = storyIds.indexOf(state.meta.activeStoryId);
             const remaining = storyIds.slice(activeIdx > -1 ? activeIdx : 0)
@@ -3004,9 +3126,9 @@
                 if (isExpanded) cardStyle += ' ring-2 ring-offset-1 ring-slate-400';
 
                 return `
-                    <div id="ref-story-${id}" class="rounded-xl overflow-hidden ${cardStyle} cursor-pointer select-none"
-                        data-action="ref-toggle-expand" data-id="${id}">
-                        <div class="px-4 py-2 flex items-center justify-between ${headerStyle}">
+                    <div id="ref-story-${id}" class="rounded-xl overflow-hidden ${cardStyle} select-none">
+                        <div class="px-4 py-2 flex items-center justify-between ${headerStyle} cursor-pointer"
+                            data-action="ref-toggle-expand" data-id="${id}">
                             <div class="flex items-center gap-3">
                                 <span class="font-black text-xs tracking-widest uppercase">${escapeHTML(story.format)}</span>
                                 <span class="font-black text-base uppercase tracking-wide">${escapeHTML(story.slug)}</span>
@@ -3021,7 +3143,10 @@
                         </div>
                         ${isExpanded ? `
                         <div class="px-5 py-4 bg-white">
-                            <p class="text-base text-slate-800 leading-relaxed whitespace-pre-wrap">${escapeHTML(story.script || 'No script.')}</p>
+                            ${selfFire && story.mediaFile
+                                ? renderPresenterScriptWithFire(story.script, id)
+                                : `<p class="text-base text-slate-800 leading-relaxed whitespace-pre-wrap">${escapeHTML(story.script || 'No script.')}</p>`
+                            }
                         </div>` : (isActive || isNext) ? `
                         <div class="px-4 py-2">
                             <p class="text-sm text-slate-500 leading-relaxed line-clamp-2 italic">${escapeHTML(story.script?.split('\n').find(l => l.trim()) || '')}</p>
@@ -3272,6 +3397,23 @@
                                         </button>
                                         <p class="text-xs text-slate-400">No folder granted — clips must be loaded manually onto each deck.</p>
                                         `}
+                                    </div>
+                                    ` : ''}
+
+                                    <!-- Presenter Self-Fire — only when radio is selected -->
+                                    ${state.ui.playoutBackend === 'radio' ? `
+                                    <div class="bg-slate-50 border border-slate-200 rounded-xl p-5 space-y-3">
+                                        <h4 class="font-bold text-slate-800 flex items-center gap-2"><i class="fa-solid fa-microphone text-slate-400"></i>Presenter Clip Fire</h4>
+                                        <p class="text-xs text-slate-500 leading-relaxed">When enabled, [CLIP] tags in expanded presenter cards become tap-to-play buttons. Uses the same audio output and media folder as the main playout system.</p>
+                                        <div class="flex items-center justify-between">
+                                            <span class="text-sm font-medium text-slate-700">Allow presenter to fire clips</span>
+                                            <button data-action="toggle-presenter-self-fire"
+                                                class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${state.ui.presenter.selfFireEnabled ? 'bg-blue-600' : 'bg-slate-200'}">
+                                                <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${state.ui.presenter.selfFireEnabled ? 'translate-x-6' : 'translate-x-1'}"></span>
+                                            </button>
+                                        </div>
+                                        ${state.ui.presenter.selfFireEnabled && !state.radio.directoryHandle ? `
+                                        <p class="text-xs text-amber-600 font-medium"><i class="fa-solid fa-triangle-exclamation mr-1"></i>Grant a media folder above for self-fire to work.</p>` : ''}
                                     </div>
                                     ` : ''}
 
@@ -4196,6 +4338,17 @@
                     return;
                 }
 
+                if (action === 'toggle-presenter-self-fire') {
+                    state.ui.presenter.selfFireEnabled = !state.ui.presenter.selfFireEnabled;
+                    localStorage.setItem('moira_presenter_self_fire', state.ui.presenter.selfFireEnabled);
+                    render();
+                    return;
+                }
+                if (action === 'presenter-fire-clip') {
+                    const storyId = e.target.closest('[data-id]')?.getAttribute('data-id');
+                    if (storyId) await presenterFireClip(storyId);
+                    return;
+                }
                 if (action === 'grant-media-folder') {
                     if (!window.showDirectoryPicker) {
                         alert('File System Access API is not supported in this browser. Use Chrome or Edge for auto-preload.');
