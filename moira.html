@@ -50,6 +50,12 @@
         @keyframes clip-warn-flash { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
         .clip-warn-flash { animation: clip-warn-flash 0.5s ease-in-out infinite; }
 
+        /* ── INSTANT MESSAGE TOAST ── */
+        @keyframes toast-in  { from { opacity:0; transform:translateY(12px) scale(0.97); } to { opacity:1; transform:translateY(0) scale(1); } }
+        @keyframes toast-out { from { opacity:1; } to { opacity:0; transform:translateY(-8px); } }
+        .moira-toast { animation: toast-in 0.2s ease-out forwards; }
+        .moira-toast.leaving { animation: toast-out 0.4s ease-in forwards; }
+
         /* ── SEGMENT BREAK ROWS ── */
         .segment-row td { padding: 0; }
         .segment-divider { display: flex; align-items: center; gap: 0; background: #eef2ff; color: #3730a3; border-top: 1px solid #c7d2fe; border-bottom: 1px solid #c7d2fe; }
@@ -70,7 +76,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, collection, query, where, onSnapshot, updateDoc, runTransaction } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, doc, collection, query, where, orderBy, onSnapshot, updateDoc, runTransaction, addDoc, serverTimestamp, Timestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // ==========================================
         // 1. CONSTANTS & CONFIGURATION
@@ -131,6 +137,10 @@
         
         let app, auth, db;
         let txTimerInterval = null;
+
+        // Captured once at page load — used to filter the messages listener so we
+        // only receive messages sent after this client connected, not historical ones.
+        const SESSION_START = new Date();
 
         // ── WAKE LOCK ──────────────────────────────────────────────────────────
         let wakeLock = null;
@@ -239,7 +249,8 @@
 
         const getPaths = (id) => ({
             bulletins: ['artifacts', id, 'public', 'data', 'bulletins'],
-            stories: ['artifacts', id, 'public', 'data', 'rundown_stories']
+            stories: ['artifacts', id, 'public', 'data', 'rundown_stories'],
+            messages: ['artifacts', id, 'public', 'data', 'bulletins']  // sub-collection: append bulletinId + 'messages'
         });
         const paths = getPaths(appId);
 
@@ -286,6 +297,7 @@
                 selectedSinkId: '',
                 devices: [],
                 directoryHandle: null,
+                takeTimeout: null,  // stored so rapid Takes don't overlap
                 log: []
             },
             ui: {
@@ -308,7 +320,7 @@
                     lineHeight: 1.6,
                     focusMode: 'rundown',
                     pausedByUser: false,
-                    presenterMode: 'autocue',  // 'autocue' | 'presenter'
+                    presenterMode: 'presenter',  // 'autocue' | 'presenter'
                     expandedStoryId: null,
                     selfFireEnabled: localStorage.getItem('moira_presenter_self_fire') === 'true',
                     clipAudio: null,  // transient Audio element for presenter self-fire
@@ -317,7 +329,8 @@
                 playoutBackend: savedPlayoutBackend,  // 'none' | 'radio' | 'obs'
                 trash: [],           // [{id, story, orderIndex, deletedAt}]
                 storySnapshots: {},  // {storyId: previousStoryData} — set before each save
-                mediaFolderPendingHandle: null  // stored handle awaiting one-click re-grant
+                mediaFolderPendingHandle: null, // stored handle awaiting one-click re-grant
+                alertPanelOpen: false          // controls alert compose popover in newsroom
             }
         };
 
@@ -327,6 +340,63 @@
         // ==========================================
         // 3. STARTUP & FIREBASE INIT
         // ==========================================
+        // ── INSTANT MESSAGE TOAST ──────────────────────────────────────────────
+        // Injects a self-removing toast into a fixed container at the top-right.
+        // Safe to call from any view — purely DOM-level, no render() needed.
+        let _toastContainer = null;
+        function showToast(senderName, text) {
+            if (!_toastContainer) {
+                _toastContainer = document.createElement('div');
+                _toastContainer.id = 'moira-toast-container';
+                _toastContainer.style.cssText = 'position:fixed;top:1rem;right:1rem;z-index:9999;display:flex;flex-direction:column;gap:0.5rem;pointer-events:none;max-width:22rem;';
+                document.body.appendChild(_toastContainer);
+            }
+
+            const toast = document.createElement('div');
+            toast.className = 'moira-toast';
+            toast.style.cssText = 'background:#1e293b;border:1px solid #f59e0b;border-left:4px solid #f59e0b;border-radius:0.75rem;padding:0.75rem 1rem;box-shadow:0 8px 32px rgba(0,0,0,0.4);pointer-events:auto;';
+            toast.innerHTML = `
+                <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.25rem;">
+                    <span style="font-size:0.6rem;font-weight:900;color:#f59e0b;text-transform:uppercase;letter-spacing:0.1em;">&#128226; Producer</span>
+                    <span style="font-size:0.6rem;color:#64748b;font-family:monospace;">${escapeHTML(senderName)}</span>
+                </div>
+                <div style="font-size:0.875rem;font-weight:700;color:#f1f5f9;line-height:1.4;">${escapeHTML(text)}</div>`;
+
+            _toastContainer.appendChild(toast);
+
+            // Auto-dismiss after 8s with fade-out
+            const dismiss = () => {
+                toast.classList.add('leaving');
+                toast.addEventListener('animationend', () => toast.remove(), { once: true });
+            };
+            const timer = setTimeout(dismiss, 8000);
+            // Allow early tap-to-dismiss
+            toast.addEventListener('click', () => { clearTimeout(timer); dismiss(); });
+        }
+
+        /**
+         * Retrieves the persisted FileSystemDirectoryHandle from IndexedDB and
+         * restores media folder access silently (if permission is already granted)
+         * or sets the pending-handle state (if a one-click re-grant is needed).
+         * No-ops on browsers without File System Access API support.
+         */
+        async function restoreMediaFolder() {
+            if (!window.showDirectoryPicker) return;
+            try {
+                const handle = await idbLoadHandle();
+                if (!handle) return;
+                const perm = await handle.queryPermission({ mode: 'read' });
+                if (perm === 'granted') {
+                    state.radio.directoryHandle = handle;
+                    radioLog(`Media folder restored: "${handle.name}"`, 'success');
+                } else if (perm === 'prompt') {
+                    // Surface a one-click re-grant button rather than forcing the full picker
+                    state.ui.mediaFolderPendingHandle = handle;
+                }
+                // 'denied' — fall through, let user re-grant manually
+            } catch(e) { /* stale or invalid handle — ignore silently */ }
+        }
+
        /**
          * Application entry point. Restores persisted staff identity, starts the
          * 30s heartbeat that keeps lastSeen current, initialises the configured
@@ -355,26 +425,9 @@
                 populateRadioDevices();
             }
 
-            // Restore media folder handle from IndexedDB (silently if already granted,
-            // one-click permission prompt if the browser requires re-confirmation)
-            if (window.showDirectoryPicker) {
-                idbLoadHandle().then(async handle => {
-                    if (!handle) return;
-                    try {
-                        const perm = await handle.queryPermission({ mode: 'read' });
-                        if (perm === 'granted') {
-                            state.radio.directoryHandle = handle;
-                            radioLog(`Media folder restored: "${handle.name}"`, 'success');
-                            render();
-                        } else if (perm === 'prompt') {
-                            // Show a small non-blocking banner so the user can re-grant with one click
-                            state.ui.mediaFolderPendingHandle = handle;
-                            render();
-                        }
-                        // 'denied' — do nothing, let user re-grant manually
-                    } catch(e) { /* handle may be stale — ignore */ }
-                });
-            }
+            // Restore media folder handle from IndexedDB. Awaited so the handle
+            // is available before the first render and before TX start auto-load.
+            await restoreMediaFolder();
             
             if (firebaseConfig) {
                 try {
@@ -512,6 +565,7 @@
         // ==========================================
         let unsubBulletin = null;
         let unsubStories = null;
+        let unsubMessages = null;
 
         /**
          * Attaches Firestore real-time listeners for the current bulletin document
@@ -524,6 +578,7 @@
 
             if (unsubBulletin) unsubBulletin();
             if (unsubStories) unsubStories();
+            if (unsubMessages) unsubMessages();
 
             unsubBulletin = onSnapshot(doc(db, ...paths.bulletins, state.currentBulletinId), 
                 (docSnap) => {
@@ -568,6 +623,31 @@
                     render();
                 },
                 (err) => { state.connectionState = 'error'; render(); }
+            );
+
+            // ── MESSAGES LISTENER ──────────────────────────────────────────
+            // Sub-collection of the bulletin. Only receives documents created
+            // after this session started — ignores all historical messages.
+            // NOTE: Configure a Firestore TTL policy in the Firebase Console on
+            // the `timestamp` field (e.g. 10 minutes) to auto-delete old docs.
+            const messagesRef = collection(
+                db, ...paths.bulletins, state.currentBulletinId, 'messages'
+            );
+            const messagesQuery = query(
+                messagesRef,
+                where('timestamp', '>', Timestamp.fromDate(SESSION_START)),
+                orderBy('timestamp', 'asc')
+            );
+            unsubMessages = onSnapshot(messagesQuery,
+                (snapshot) => {
+                    snapshot.docChanges().forEach(change => {
+                        if (change.type === 'added') {
+                            const d = change.doc.data();
+                            showToast(d.senderName || 'Unknown', d.text || '');
+                        }
+                    });
+                },
+                (err) => console.warn('Messages listener error:', err)
             );
         }
 
@@ -1088,28 +1168,48 @@
         window._moiraUpdateScriptStats = function(ta) {
             const raw = ta.value;
 
-            // Update clip hint
+            // Clip seconds from [CLIP:m:ss] tags
             const clipMatches = raw.match(/\[CLIP:(\d+):(\d{2})\]/gi) || [];
             const clipSecs = clipMatches.reduce((sum, x) => {
                 const p = x.match(/\[CLIP:(\d+):(\d{2})\]/i);
                 return sum + (parseInt(p[1], 10) * 60 + parseInt(p[2], 10));
             }, 0);
-            const h = document.getElementById('edit-clip-hint');
-            if (h) {
-                h.textContent = clipSecs > 0
-                    ? '+' + String(Math.floor(clipSecs / 60)).padStart(2, '0') + ':' + String(clipSecs % 60).padStart(2, '0') + ' clip'
-                    : '';
-            }
 
-            // Update word count — strip all [tags], split on any whitespace including newlines
+            // Word count and estimated read time — strip all [tags]
             const stripped = raw.replace(/\[[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim();
             const words = stripped.length > 0 ? stripped.split(' ').filter(Boolean).length : 0;
-            const secs = Math.round(words / 2.8); // ~168 wpm — typical newsreader pace
+            const readSecs = Math.round(words / 2.8); // ~168 wpm — typical newsreader pace
+            const totalSecs = readSecs + clipSecs;
+
+            // Update script stats label (word count + read estimate)
             const st = document.getElementById('edit-script-stats');
             if (st) {
                 st.textContent = words > 0
-                    ? words + ' words \u00b7 ~' + String(Math.floor(secs / 60)).padStart(2, '0') + ':' + String(secs % 60).padStart(2, '0') + ' read'
+                    ? words + ' words \u00b7 ~' + String(Math.floor(readSecs / 60)).padStart(2, '0') + ':' + String(readSecs % 60).padStart(2, '0') + ' read'
                     : '';
+            }
+
+            // Auto-populate duration field with estimated total (read + clip).
+            // Only updates if the script is non-empty — preserves manual entry for
+            // stories with no script (e.g. READ with hand-set timing).
+            const durEl = document.getElementById('edit-duration');
+            if (durEl && words > 0) {
+                durEl.value = String(Math.floor(totalSecs / 60)).padStart(2, '0') + ':' + String(totalSecs % 60).padStart(2, '0');
+            }
+
+            // Update breakdown hint beneath the duration field
+            const hint = document.getElementById('edit-dur-breakdown');
+            if (hint) {
+                if (words > 0 && clipSecs > 0) {
+                    hint.textContent = '~' + String(Math.floor(readSecs/60)).padStart(2,'0') + ':' + String(readSecs%60).padStart(2,'0')
+                        + ' read + ' + String(Math.floor(clipSecs/60)).padStart(2,'0') + ':' + String(clipSecs%60).padStart(2,'0') + ' clip';
+                    hint.className = 'text-xs font-mono text-amber-600 mt-1';
+                } else if (words > 0) {
+                    hint.textContent = 'Estimated from script';
+                    hint.className = 'text-xs font-mono text-slate-400 mt-1';
+                } else {
+                    hint.textContent = '';
+                }
             }
         };
 
@@ -1679,6 +1779,12 @@
          * folder handle is available) or labels it for manual load.
          */
         async function radioExecuteTake() {
+            // Cancel any pending post-take deck swap from a previous rapid Take
+            if (state.radio.takeTimeout) {
+                clearTimeout(state.radio.takeTimeout);
+                state.radio.takeTimeout = null;
+            }
+
             const deckA = state.radio.deckA;
             const deckB = state.radio.deckB;
 
@@ -1723,9 +1829,11 @@
             if (playedQueueIdx > -1) state.radio.clipIndex = playedQueueIdx;
             render();
 
-            // Release outgoing deck and load the upcoming clip onto it
+            // Release outgoing deck and load the upcoming clip onto it.
+            // Stored so a rapid second Take can cancel this before it fires.
             if (playingDeck) {
-                setTimeout(async () => {
+                state.radio.takeTimeout = setTimeout(async () => {
+                    state.radio.takeTimeout = null;
                     if (playingDeck.audio) {
                         playingDeck.audio.pause();
                         playingDeck.audio.currentTime = 0;
@@ -1874,16 +1982,19 @@
                 const deckA = state.radio.deckA;
                 const deckB = state.radio.deckB;
 
-                // A deck is correctly loaded if it already has the right story cued/paused.
-                // Don't reload it — preserve what the operator has ready.
-                const alreadyReady = (deck, storyId) =>
+                // alreadyReady — deck has the correct story and is in a usable state.
+                // allowPlaying: for the active slot, a playing deck counts as "ready" so
+                // we don't mistakenly try to reload it or misfire the fast-path early exit.
+                const alreadyReady = (deck, storyId, allowPlaying = false) =>
                     storyId &&
                     deck.loadedStoryId === storyId &&
-                    (deck.state === 'cued' || deck.state === 'paused') &&
+                    (deck.state === 'cued' || deck.state === 'paused' ||
+                        (allowPlaying && deck.state === 'playing')) &&
                     deck.audio;
 
-                const aHasActive = alreadyReady(deckA, activeStoryId);
-                const bHasActive = alreadyReady(deckB, activeStoryId);
+                // Active slot: playing is acceptable (on-air deck should never be touched)
+                const aHasActive = alreadyReady(deckA, activeStoryId, true);
+                const bHasActive = alreadyReady(deckB, activeStoryId, true);
                 const aHasNext   = alreadyReady(deckA, nextStoryId);
                 const bHasNext   = alreadyReady(deckB, nextStoryId);
 
@@ -1897,8 +2008,8 @@
                 const loadOrLabel = async (deckKey, storyId) => {
                     if (!storyId) return;
                     const deck = state.radio[deckKey];
-                    if (alreadyReady(deck, storyId)) return; // already correct, skip
-                    if (deck.state === 'playing') return;   // never interrupt playback
+                    if (alreadyReady(deck, storyId, true)) return; // already correct, skip
+                    if (deck.state === 'playing') return;          // never interrupt on-air deck
                     // Stop and clear before reloading
                     if (deck.audio) { deck.audio.pause(); deck.audio.currentTime = 0; }
                     stopRadioMeter(deck);
@@ -2898,6 +3009,8 @@
             const isRundownLocked = state.meta.rundownLocked && state.meta.editorStaffId !== state.myStaffId;
             const isEditor = state.meta.editorStaffId === state.myStaffId;
             const editorName = (state.meta.staff||[]).find(s=>s.id===state.meta.editorStaffId)?.name || 'Editor';
+            const _alertMe = (state.meta.staff||[]).find(s => s.id === state.myStaffId);
+            const canAlert = !!_alertMe && (_alertMe.role === 'Producer' || isEditor);
 
             const rows = (state.meta.order || []).map(id => {
                 if (id === 'marker-line') {
@@ -3032,6 +3145,44 @@
                     <div class="ml-auto flex items-center gap-2">
                         ${state.meta.rundownLocked ? `<span class="flex items-center gap-1.5 text-xs font-bold px-2.5 py-1 rounded-full border ${isEditor ? 'bg-amber-50 border-amber-300 text-amber-700' : 'bg-red-50 border-red-200 text-red-600'}"><i class="fa-solid fa-lock text-xs"></i> ${isEditor ? 'You locked this' : `Locked by ${escapeHTML(editorName)}`}</span>` : ''}
                         ${isEditor ? `<button data-action="toggle-rundown-lock" class="flex items-center gap-1.5 text-xs font-bold px-2.5 py-1.5 rounded-lg border transition-colors ${state.meta.rundownLocked ? 'bg-red-100 text-red-700 border-red-200 hover:bg-red-200' : 'bg-white text-slate-500 border-slate-300 hover:border-slate-400 hover:text-slate-700'}"><i class="fa-solid ${state.meta.rundownLocked ? 'fa-lock-open' : 'fa-lock'}"></i> ${state.meta.rundownLocked ? 'Unlock' : 'Lock'}</button>` : ''}
+                        ${canAlert ? `
+                        <div class="relative">
+                            <button data-action="toggle-alert-panel"
+                                class="relative flex items-center gap-1.5 text-xs font-bold px-2.5 py-1.5 rounded-lg border transition-colors ${state.ui.alertPanelOpen ? 'bg-amber-500 text-white border-amber-600' : 'bg-white text-slate-500 border-slate-300 hover:border-amber-400 hover:text-amber-600'}"
+                                title="Alert Presenter">
+                                <i class="fa-solid fa-bullhorn text-sm"></i>
+                                ${state.meta.presenterAlert ? `<span class="absolute -top-1 -right-1 w-2.5 h-2.5 bg-red-500 rounded-full border-2 border-white animate-pulse"></span>` : ''}
+                            </button>
+                            ${state.ui.alertPanelOpen ? `
+                            <div class="absolute right-0 top-full mt-2 w-96 bg-slate-800 border border-slate-600 rounded-xl shadow-2xl z-50 overflow-hidden">
+                                <div class="px-4 py-3 border-b border-slate-700 flex items-center justify-between">
+                                    <span class="text-xs font-black text-slate-300 uppercase tracking-widest"><i class="fa-solid fa-bullhorn text-amber-400 mr-2"></i>Alert Presenter</span>
+                                    <button data-action="toggle-alert-panel" class="text-slate-500 hover:text-slate-300 text-sm transition-colors"><i class="fa-solid fa-xmark"></i></button>
+                                </div>
+                                <div class="p-4 space-y-3">
+                                    <textarea id="presenter-alert-input" maxlength="120" rows="2"
+                                        placeholder="e.g. Hold on sport — breaking news incoming…"
+                                        class="w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 outline-none focus:border-amber-400 font-mono resize-none"></textarea>
+                                    <div class="flex gap-2">
+                                        <button data-action="send-presenter-alert"
+                                            class="flex-1 py-2 bg-amber-500 hover:bg-amber-400 text-slate-900 font-black text-xs rounded-lg tracking-widest uppercase transition-colors">
+                                            <i class="fa-solid fa-paper-plane mr-1.5"></i>Send
+                                        </button>
+                                        ${state.meta.presenterAlert ? `
+                                        <button data-action="clear-presenter-alert"
+                                            class="px-4 py-2 bg-slate-600 hover:bg-slate-500 text-slate-300 font-bold text-xs rounded-lg transition-colors">
+                                            ✕ Clear
+                                        </button>` : ''}
+                                    </div>
+                                    ${state.meta.presenterAlert ? `
+                                    <div class="flex items-center gap-2 bg-amber-900/40 border border-amber-700/50 rounded-lg px-3 py-2">
+                                        <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0"></span>
+                                        <span class="text-xs font-black text-amber-400 uppercase tracking-widest shrink-0">Live</span>
+                                        <span class="text-xs text-amber-200 font-mono truncate">${escapeHTML(state.meta.presenterAlert.text)}</span>
+                                    </div>` : ''}
+                                </div>
+                            </div>` : ''}
+                        </div>` : ''}
                     </div>
                 </div>`;
 
@@ -3060,31 +3211,6 @@
                     </div>
                 </div>
                 ${txRxBar}
-                <!-- Producer → Presenter alert bar -->
-                <div class="flex items-center gap-3 bg-slate-800 border border-slate-700 px-4 py-2.5 rounded-xl mb-4">
-                    <i class="fa-solid fa-bullhorn text-amber-400 text-sm shrink-0"></i>
-                    <span class="text-xs font-black text-slate-400 uppercase tracking-widest shrink-0">Alert Presenter</span>
-                    <input type="text" id="presenter-alert-input" maxlength="120"
-                        placeholder="e.g. Hold on sport — breaking news incoming…"
-                        class="flex-1 bg-slate-700 border border-slate-600 rounded-lg px-3 py-1.5 text-sm text-white placeholder-slate-500 outline-none focus:border-amber-400 font-mono">
-                    <button data-action="send-presenter-alert"
-                        class="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-900 font-black text-xs rounded-lg tracking-widest uppercase transition-colors shrink-0">
-                        Send
-                    </button>
-                    ${state.meta.presenterAlert ? `
-                    <button data-action="clear-presenter-alert"
-                        class="px-3 py-1.5 bg-slate-600 hover:bg-slate-500 text-slate-300 font-bold text-xs rounded-lg transition-colors shrink-0" title="Clear current alert">
-                        ✕ Clear
-                    </button>` : ''}
-                </div>
-                ${state.meta.presenterAlert ? `
-                <div class="flex items-center gap-3 bg-amber-50 border border-amber-200 px-4 py-2 rounded-xl mb-3 text-xs">
-                    <span class="w-2 h-2 rounded-full bg-amber-500 animate-pulse shrink-0"></span>
-                    <span class="font-black text-amber-800 uppercase tracking-widest shrink-0">Live Alert</span>
-                    <span class="text-amber-700 font-mono truncate">${escapeHTML(state.meta.presenterAlert.text)}</span>
-                    <span class="text-amber-400 font-mono ml-auto shrink-0">${escapeHTML(state.meta.presenterAlert.sentBy || '')}</span>
-                </div>` : ''}
-
                 ${state.ui.trash.length > 0 ? `
                 <div class="flex items-center gap-3 bg-amber-50 border border-amber-200 text-amber-800 px-4 py-2.5 rounded-xl mb-4 text-sm">
                     <i class="fa-solid fa-trash-arrow-up text-amber-500"></i>
@@ -3484,10 +3610,19 @@
                             <div><label class="text-sm font-semibold block mb-1">Presenter</label><select id="edit-presenter" class="w-full border rounded-lg px-4 py-2 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${staffOptions(story.presenterId, 'Presenter')}</select></div>
                             <div><label class="text-sm font-semibold block mb-1">Reporter</label><select id="edit-reporter" class="w-full border rounded-lg px-4 py-2 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${staffOptions(story.reporterId, 'Reporter')}</select></div>
                             <div>
-                                <label class="text-sm font-semibold block mb-1">Duration <span class="font-normal text-slate-400 text-xs">(read time only)</span>
-                                    ${parseClipTags(story.script) > 0 ? `<span id="edit-clip-hint" class="ml-2 text-xs font-normal text-amber-600 font-mono">+${formatDuration(parseClipTags(story.script))} clip auto-added</span>` : `<span id="edit-clip-hint" class="ml-2 text-xs font-normal text-slate-400 font-mono"></span>`}
+                                <label class="text-sm font-semibold block mb-1">Duration
+                                    <span class="font-normal text-slate-400 text-xs ml-1">(total)</span>
                                 </label>
-                                <input type="text" id="edit-duration" value="${formatDuration(Math.max(0, story.duration - parseClipTags(story.script)))}" class="w-full border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''} placeholder="e.g. 01:30" title="Read time only — clip durations from [CLIP:] tags are added automatically">
+                                <input type="text" id="edit-duration" value="${formatDuration(story.duration)}" class="w-full border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''} placeholder="e.g. 02:15" title="Total duration — auto-estimated from script. Edit manually to override.">
+                                <div id="edit-dur-breakdown" class="text-xs font-mono mt-1 ${parseClipTags(story.script) > 0 ? 'text-amber-600' : 'text-slate-400'}">
+                                    ${(()=>{
+                                        const clip = parseClipTags(story.script);
+                                        const read = Math.max(0, story.duration - clip);
+                                        if (clip > 0) return '~' + formatDuration(read) + ' read + ' + formatDuration(clip) + ' clip';
+                                        if (story.duration > 0) return 'Estimated from script';
+                                        return '';
+                                    })()}
+                                </div>
                             </div>
                         </div>
                         <div><label class="text-sm font-semibold block mb-1">Media File</label><div class="flex gap-2"><input type="text" id="edit-media-file" value="${escapeHTML(story.mediaFile || '')}" class="flex-1 border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}><button data-action="browse-media" class="px-4 py-2 bg-slate-100 border rounded-lg text-sm font-medium hover:bg-slate-200" ${isLocked ? 'disabled' : ''}>Browse</button><input type="file" id="media-file-picker" class="hidden"></div></div>
@@ -4089,11 +4224,26 @@
                     return;
                 }
 
-                if (e.target && e.target.id === 'presenter-alert-input' && e.key === 'Enter') {
+                if (e.target && e.target.id === 'presenter-alert-input' && e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
                     const text = e.target.value.trim();
-                    if (text) {
-                        updateBulletinMeta({ presenterAlert: { text, sentAt: Date.now(), sentBy: getMyName() } });
+                    const _me = (state.meta.staff||[]).find(s => s.id === state.myStaffId);
+                    const _canAlert = !!_me && (_me.role === 'Producer' || state.meta.editorStaffId === state.myStaffId);
+                    if (text && _canAlert) {
+                        const sentBy = getMyName();
+                        updateBulletinMeta({ presenterAlert: { text, sentAt: Date.now(), sentBy } });
+                        if (!state.localMode && db) {
+                            const messagesRef = collection(
+                                db, ...paths.bulletins, state.currentBulletinId, 'messages'
+                            );
+                            addDoc(messagesRef, { senderName: sentBy, text, timestamp: serverTimestamp() })
+                                .catch(e => console.warn('Message send failed:', e));
+                        } else {
+                            showToast(sentBy, text);
+                        }
                         e.target.value = '';
+                        state.ui.alertPanelOpen = false;
+                        render();
                     }
                     return;
                 }
@@ -4198,7 +4348,7 @@
 
                 if (action === 'set-mode') {
                     if (val === 'presenter' && state.mode === 'presenter') {
-                        state.ui.presenter.presenterMode = state.ui.presenter.presenterMode === 'autocue' ? 'presenter' : 'autocue';
+                        state.ui.presenter.presenterMode = state.ui.presenter.presenterMode === 'presenter' ? 'autocue' : 'presenter';
                     } else {
                         state.mode = val;
                         state.ui.lastScrolledStoryId = null;
@@ -4292,18 +4442,47 @@
 
                     render(); return;
                 }
+                if (action === 'toggle-alert-panel') {
+                    state.ui.alertPanelOpen = !state.ui.alertPanelOpen;
+                    render();
+                    return;
+                }
+
                 if (action === 'send-presenter-alert') {
+                    // Role gate — Producer or Editor only
+                    const _me = (state.meta.staff||[]).find(s => s.id === state.myStaffId);
+                    const _canAlert = !!_me && (_me.role === 'Producer' || state.meta.editorStaffId === state.myStaffId);
+                    if (!_canAlert) return;
                     const input = document.getElementById('presenter-alert-input');
                     const text = input ? input.value.trim() : '';
                     if (!text) return;
                     const sentBy = getMyName();
+                    // 1. Persist to bulletin for late-joining clients (existing banner behaviour)
                     updateBulletinMeta({ presenterAlert: { text, sentAt: Date.now(), sentBy } });
+                    // 2. Write to messages sub-collection — fires toast on all connected clients
+                    if (!state.localMode && db) {
+                        const messagesRef = collection(
+                            db, ...paths.bulletins, state.currentBulletinId, 'messages'
+                        );
+                        addDoc(messagesRef, {
+                            senderName: sentBy,
+                            text,
+                            timestamp: serverTimestamp()
+                        }).catch(e => console.warn('Message send failed:', e));
+                    } else {
+                        // Local mode — show toast directly on this client only
+                        showToast(sentBy, text);
+                    }
                     if (input) input.value = '';
+                    state.ui.alertPanelOpen = false;
+                    render();
                     return;
                 }
 
                 if (action === 'clear-presenter-alert') {
                     updateBulletinMeta({ presenterAlert: null });
+                    state.ui.alertPanelOpen = false;
+                    render();
                     return;
                 }
 
@@ -4540,7 +4719,7 @@
                         saveStory(state.ui.editingStoryId, { slug: document.getElementById('edit-slug').value.toUpperCase(), duration: parsedDuration, rev: parseInt(document.getElementById('edit-rev').value, 10) });
                     } else {
                         const scriptText = document.getElementById('edit-script').value;
-                        parsedDuration += parseClipTags(scriptText);
+                        // duration field now holds the total (read + clip) — no need to add clip tags separately
                         saveStory(state.ui.editingStoryId, { slug: document.getElementById('edit-slug').value, format: document.getElementById('edit-format').value, presenterId: document.getElementById('edit-presenter').value, reporterId: document.getElementById('edit-reporter').value, mediaFile: document.getElementById('edit-media-file').value.trim(), duration: parsedDuration, script: scriptText, rev: parseInt(document.getElementById('edit-rev').value, 10) });
                     }
                 }
@@ -4782,6 +4961,7 @@
         window.addEventListener('beforeunload', () => {
             if (txTimerInterval) clearInterval(txTimerInterval);
             if (obsTelemetryInterval) clearInterval(obsTelemetryInterval);
+            if (unsubMessages) unsubMessages();
             releaseWakeLock();
             // Release any held story lock so other users aren't blocked
             if (state.ui.editingStoryId) unlockStory(state.ui.editingStoryId);
