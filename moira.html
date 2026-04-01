@@ -111,7 +111,8 @@
             lastMediaFiredAt: null,  // Timestamp of the last hardware 'Play' command
             mediaRootOverride: '',   // Optional path for local studio media folders
             presenterClipStoryId: null,  // Set when presenter self-fires a clip
-            presenterClipCommand: null   // 'stop' written by director to remote-stop presenter clip
+            presenterClipCommand: null,  // 'stop' written by director to remote-stop presenter clip
+            presenterAlert: null         // { text, sentAt, sentBy } — producer cue to presenter view only
         };
 
         const TAB_ACTIVE = "bg-blue-600 text-white shadow-sm";
@@ -130,6 +131,65 @@
         
         let app, auth, db;
         let txTimerInterval = null;
+
+        // ── WAKE LOCK ──────────────────────────────────────────────────────────
+        let wakeLock = null;
+        async function acquireWakeLock() {
+            if (!('wakeLock' in navigator)) return;
+            try {
+                wakeLock = await navigator.wakeLock.request('screen');
+                wakeLock.addEventListener('release', () => { wakeLock = null; });
+            } catch(e) { console.warn('Wake lock failed:', e.message); }
+        }
+        function releaseWakeLock() {
+            if (wakeLock) { wakeLock.release(); wakeLock = null; }
+        }
+        // Re-acquire after tab becomes visible again (browser releases it on hide)
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && state.meta.isTXMode) acquireWakeLock();
+        });
+
+        // ── INDEXEDDB — media folder handle persistence ────────────────────────
+        const IDB_NAME = 'moira', IDB_STORE = 'handles', IDB_KEY = 'mediaFolder';
+        function idbOpen() {
+            return new Promise((resolve, reject) => {
+                const req = indexedDB.open(IDB_NAME, 1);
+                req.onupgradeneeded = e => e.target.result.createObjectStore(IDB_STORE);
+                req.onsuccess = e => resolve(e.target.result);
+                req.onerror   = e => reject(e.target.error);
+            });
+        }
+        async function idbSaveHandle(handle) {
+            try {
+                const db = await idbOpen();
+                const tx = db.transaction(IDB_STORE, 'readwrite');
+                tx.objectStore(IDB_STORE).put(handle, IDB_KEY);
+                await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
+                db.close();
+            } catch(e) { console.warn('idbSaveHandle failed:', e); }
+        }
+        async function idbLoadHandle() {
+            try {
+                const db = await idbOpen();
+                const handle = await new Promise((res, rej) => {
+                    const tx = db.transaction(IDB_STORE, 'readonly');
+                    const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
+                    req.onsuccess = () => res(req.result);
+                    req.onerror   = () => rej(req.error);
+                });
+                db.close();
+                return handle || null;
+            } catch(e) { return null; }
+        }
+        async function idbClearHandle() {
+            try {
+                const db = await idbOpen();
+                const tx = db.transaction(IDB_STORE, 'readwrite');
+                tx.objectStore(IDB_STORE).delete(IDB_KEY);
+                await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
+                db.close();
+            } catch(e) { console.warn('idbClearHandle failed:', e); }
+        }
 
         // --- OBS WebSocket instance & config ---
         const obsWs = new OBSWebSocket();
@@ -256,7 +316,8 @@
                 },
                 playoutBackend: savedPlayoutBackend,  // 'none' | 'radio' | 'obs'
                 trash: [],           // [{id, story, orderIndex, deletedAt}]
-                storySnapshots: {}   // {storyId: previousStoryData} — set before each save
+                storySnapshots: {},  // {storyId: previousStoryData} — set before each save
+                mediaFolderPendingHandle: null  // stored handle awaiting one-click re-grant
             }
         };
 
@@ -276,9 +337,9 @@
        async function boot() {
             state.myStaffId = localStorage.getItem('moira_my_staff_id');
             if (firebaseConfig) state.connectionState = 'connecting';
-            // Start heartbeat — updates lastSeen every 30s while checked in
+            // Start heartbeat — updates lastSeen every 30s while checked in and tab is visible
             setInterval(() => {
-                if (state.myStaffId) {
+                if (state.myStaffId && document.visibilityState === 'visible') {
                     updateStaffInCloud(staff => staff.map(s =>
                         s.id === state.myStaffId ? { ...s, lastSeen: Date.now() } : s
                     ));
@@ -292,6 +353,27 @@
             } else if (state.ui.playoutBackend === 'radio') {
                 loadRadioConfig();
                 populateRadioDevices();
+            }
+
+            // Restore media folder handle from IndexedDB (silently if already granted,
+            // one-click permission prompt if the browser requires re-confirmation)
+            if (window.showDirectoryPicker) {
+                idbLoadHandle().then(async handle => {
+                    if (!handle) return;
+                    try {
+                        const perm = await handle.queryPermission({ mode: 'read' });
+                        if (perm === 'granted') {
+                            state.radio.directoryHandle = handle;
+                            radioLog(`Media folder restored: "${handle.name}"`, 'success');
+                            render();
+                        } else if (perm === 'prompt') {
+                            // Show a small non-blocking banner so the user can re-grant with one click
+                            state.ui.mediaFolderPendingHandle = handle;
+                            render();
+                        }
+                        // 'denied' — do nothing, let user re-grant manually
+                    } catch(e) { /* handle may be stale — ignore */ }
+                });
             }
             
             if (firebaseConfig) {
@@ -702,6 +784,10 @@
                 if (state.ui.playoutBackend === 'obs')        obsInitialLoad(activeOrder);
                 else if (state.ui.playoutBackend === 'radio') radioInitialLoad(activeOrder);
             }
+
+            // Wake lock — keep screen on during TX, release when off air
+            if (targetMode === 'tx') acquireWakeLock();
+            else releaseWakeLock();
         }
 
       /**
@@ -1162,24 +1248,28 @@
          * per-room key. Only runs in local mode — cloud mode uses Firebase.
          * Clears all lock fields before writing to avoid ghost locks on reload.
          */
-       function saveLocalState() {
+        let _saveLocalStateTimeout = null;
+        function saveLocalState() {
             if (!state.localMode) return;
-            try {
-                const key = `moira_local_room_${state.currentBulletinId}`;
-                const cleanedStoriesMap = {};
-                for (const [id, story] of Object.entries(state.storiesMap)) {
-                    cleanedStoriesMap[id] = {
-                        ...story,
-                        lockedBySession: null,
-                        lockedByName: null,
-                        lockedAt: null
-                    };
-                }
-                localStorage.setItem(key, JSON.stringify({
-                    storiesMap: cleanedStoriesMap,
-                    meta: state.meta
-                }));
-            } catch(e) {}
+            clearTimeout(_saveLocalStateTimeout);
+            _saveLocalStateTimeout = setTimeout(() => {
+                try {
+                    const key = `moira_local_room_${state.currentBulletinId}`;
+                    const cleanedStoriesMap = {};
+                    for (const [id, story] of Object.entries(state.storiesMap)) {
+                        cleanedStoriesMap[id] = {
+                            ...story,
+                            lockedBySession: null,
+                            lockedByName: null,
+                            lockedAt: null
+                        };
+                    }
+                    localStorage.setItem(key, JSON.stringify({
+                        storiesMap: cleanedStoriesMap,
+                        meta: state.meta
+                    }));
+                } catch(e) {}
+            }, 500);
         }
 
 
@@ -1429,6 +1519,8 @@
                     if (pbEl) pbEl.style.width = d.duration > 0
                         ? (cur / d.duration * 100).toFixed(1) + '%' : '0%';
                 }
+                const anyActive = ['deckA', 'deckB'].some(dk => state.radio[dk].audio);
+                if (!anyActive) { radioRafId = null; return; }
                 radioRafId = requestAnimationFrame(loop);
             })();
         }
@@ -2570,6 +2662,13 @@
                                         </button>
                                     </div>`;
                                 })()}
+                                ${state.meta.presenterAlert ? `
+                                <div class="border-t border-red-200 bg-red-50 px-4 py-2 flex items-center gap-3">
+                                    <span class="w-2 h-2 rounded-full bg-red-500 animate-pulse shrink-0"></span>
+                                    <span class="text-xs font-black text-red-700 uppercase tracking-widest shrink-0">Alert Live</span>
+                                    <span class="text-xs text-red-600 font-mono truncate">${escapeHTML(state.meta.presenterAlert.text)}</span>
+                                    <button data-action="clear-presenter-alert" class="ml-auto text-xs font-bold px-2 py-0.5 rounded bg-red-200 hover:bg-red-300 text-red-800 shrink-0 transition-colors">✕ Clear</button>
+                                </div>` : ''}
                             </div>
 
                             <!-- SEGMENT chip(s) — only rendered when segments fall between cur and nxt -->
@@ -2961,6 +3060,31 @@
                     </div>
                 </div>
                 ${txRxBar}
+                <!-- Producer → Presenter alert bar -->
+                <div class="flex items-center gap-3 bg-slate-800 border border-slate-700 px-4 py-2.5 rounded-xl mb-4">
+                    <i class="fa-solid fa-bullhorn text-amber-400 text-sm shrink-0"></i>
+                    <span class="text-xs font-black text-slate-400 uppercase tracking-widest shrink-0">Alert Presenter</span>
+                    <input type="text" id="presenter-alert-input" maxlength="120"
+                        placeholder="e.g. Hold on sport — breaking news incoming…"
+                        class="flex-1 bg-slate-700 border border-slate-600 rounded-lg px-3 py-1.5 text-sm text-white placeholder-slate-500 outline-none focus:border-amber-400 font-mono">
+                    <button data-action="send-presenter-alert"
+                        class="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-900 font-black text-xs rounded-lg tracking-widest uppercase transition-colors shrink-0">
+                        Send
+                    </button>
+                    ${state.meta.presenterAlert ? `
+                    <button data-action="clear-presenter-alert"
+                        class="px-3 py-1.5 bg-slate-600 hover:bg-slate-500 text-slate-300 font-bold text-xs rounded-lg transition-colors shrink-0" title="Clear current alert">
+                        ✕ Clear
+                    </button>` : ''}
+                </div>
+                ${state.meta.presenterAlert ? `
+                <div class="flex items-center gap-3 bg-amber-50 border border-amber-200 px-4 py-2 rounded-xl mb-3 text-xs">
+                    <span class="w-2 h-2 rounded-full bg-amber-500 animate-pulse shrink-0"></span>
+                    <span class="font-black text-amber-800 uppercase tracking-widest shrink-0">Live Alert</span>
+                    <span class="text-amber-700 font-mono truncate">${escapeHTML(state.meta.presenterAlert.text)}</span>
+                    <span class="text-amber-400 font-mono ml-auto shrink-0">${escapeHTML(state.meta.presenterAlert.sentBy || '')}</span>
+                </div>` : ''}
+
                 ${state.ui.trash.length > 0 ? `
                 <div class="flex items-center gap-3 bg-amber-50 border border-amber-200 text-amber-800 px-4 py-2.5 rounded-xl mb-4 text-sm">
                     <i class="fa-solid fa-trash-arrow-up text-amber-500"></i>
@@ -3258,6 +3382,18 @@
 
             return `
                 <div class="bg-slate-100 min-h-full">
+                    ${state.meta.presenterAlert ? `
+                    <div class="sticky top-0 z-10 bg-red-600 border-b-2 border-red-700 shadow-lg">
+                        <div class="max-w-2xl mx-auto px-4 py-3 flex items-center gap-4">
+                            <span class="w-3 h-3 rounded-full bg-white animate-pulse shrink-0"></span>
+                            <span class="font-black text-white tracking-widest text-sm uppercase shrink-0">Producer</span>
+                            <span class="text-white font-bold text-base leading-snug flex-1">${escapeHTML(state.meta.presenterAlert.text)}</span>
+                            <button data-action="clear-presenter-alert"
+                                class="shrink-0 px-3 py-1.5 bg-red-800 hover:bg-red-900 text-white text-xs font-black rounded-lg tracking-widest uppercase transition-colors">
+                                ✕ Dismiss
+                            </button>
+                        </div>
+                    </div>` : ''}
                     <div class="px-4 pb-8 max-w-2xl mx-auto">
                         <div class="py-4 flex items-center justify-between">
                             <span class="text-slate-500 text-sm font-bold uppercase tracking-widest">Running Order</span>
@@ -3348,10 +3484,10 @@
                             <div><label class="text-sm font-semibold block mb-1">Presenter</label><select id="edit-presenter" class="w-full border rounded-lg px-4 py-2 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${staffOptions(story.presenterId, 'Presenter')}</select></div>
                             <div><label class="text-sm font-semibold block mb-1">Reporter</label><select id="edit-reporter" class="w-full border rounded-lg px-4 py-2 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${staffOptions(story.reporterId, 'Reporter')}</select></div>
                             <div>
-                                <label class="text-sm font-semibold block mb-1">Duration
-                                    ${parseClipTags(story.script) > 0 ? `<span id="edit-clip-hint" class="ml-2 text-xs font-normal text-amber-600 font-mono">+${formatDuration(parseClipTags(story.script))} clip</span>` : `<span id="edit-clip-hint" class="ml-2 text-xs font-normal text-slate-400 font-mono"></span>`}
+                                <label class="text-sm font-semibold block mb-1">Duration <span class="font-normal text-slate-400 text-xs">(read time only)</span>
+                                    ${parseClipTags(story.script) > 0 ? `<span id="edit-clip-hint" class="ml-2 text-xs font-normal text-amber-600 font-mono">+${formatDuration(parseClipTags(story.script))} clip auto-added</span>` : `<span id="edit-clip-hint" class="ml-2 text-xs font-normal text-slate-400 font-mono"></span>`}
                                 </label>
-                                <input type="text" id="edit-duration" value="${formatDuration(Math.max(0, story.duration - parseClipTags(story.script)))}" class="w-full border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>
+                                <input type="text" id="edit-duration" value="${formatDuration(Math.max(0, story.duration - parseClipTags(story.script)))}" class="w-full border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''} placeholder="e.g. 01:30" title="Read time only — clip durations from [CLIP:] tags are added automatically">
                             </div>
                         </div>
                         <div><label class="text-sm font-semibold block mb-1">Media File</label><div class="flex gap-2"><input type="text" id="edit-media-file" value="${escapeHTML(story.mediaFile || '')}" class="flex-1 border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}><button data-action="browse-media" class="px-4 py-2 bg-slate-100 border rounded-lg text-sm font-medium hover:bg-slate-200" ${isLocked ? 'disabled' : ''}>Browse</button><input type="file" id="media-file-picker" class="hidden"></div></div>
@@ -3493,6 +3629,14 @@
                                             <span class="text-sm font-medium text-emerald-800 truncate">${escapeHTML(state.radio.directoryHandle.name)}</span>
                                             <button data-action="revoke-media-folder" class="ml-auto text-xs text-slate-400 hover:text-red-500 transition-colors font-mono shrink-0">✕ Revoke</button>
                                         </div>
+                                        ` : state.ui.mediaFolderPendingHandle ? `
+                                        <div class="flex items-center gap-3 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                                            <i class="fa-solid fa-folder text-amber-500 text-sm"></i>
+                                            <span class="text-sm font-medium text-amber-800 truncate">${escapeHTML(state.ui.mediaFolderPendingHandle.name)}</span>
+                                            <button data-action="restore-media-folder" class="ml-auto text-xs font-bold px-2.5 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded shrink-0 transition-colors">↺ Re-grant</button>
+                                            <button data-action="revoke-media-folder" class="text-xs text-slate-400 hover:text-red-500 transition-colors font-mono shrink-0">✕</button>
+                                        </div>
+                                        <p class="text-xs text-amber-600 font-medium"><i class="fa-solid fa-triangle-exclamation mr-1"></i>Tap Re-grant to restore access without choosing the folder again.</p>
                                         ` : `
                                         <button data-action="grant-media-folder" class="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors">
                                             <i class="fa-solid fa-folder-open"></i> Grant Media Folder Access
@@ -3945,6 +4089,15 @@
                     return;
                 }
 
+                if (e.target && e.target.id === 'presenter-alert-input' && e.key === 'Enter') {
+                    const text = e.target.value.trim();
+                    if (text) {
+                        updateBulletinMeta({ presenterAlert: { text, sentAt: Date.now(), sentBy: getMyName() } });
+                        e.target.value = '';
+                    }
+                    return;
+                }
+
                 if (state.mode === 'presenter' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
                     if (e.key.toLowerCase() === 'm') {
                         e.preventDefault();
@@ -3991,7 +4144,15 @@
                         render();
                     }
 
-                    if (e.key === 'Home') {
+                // Studio view keyboard shortcuts
+                if (state.mode === 'director' && !['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) {
+                    if (e.code === 'Space' && !e.repeat) {
+                        e.preventDefault();
+                        shiftActiveStory(1);
+                    }
+                }
+
+                if (e.key === 'Home') {
                         e.preventDefault();
                         const activeEl = document.getElementById(`presenter-story-${state.meta.activeStoryId}`);
                         if (activeEl) activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -4131,6 +4292,21 @@
 
                     render(); return;
                 }
+                if (action === 'send-presenter-alert') {
+                    const input = document.getElementById('presenter-alert-input');
+                    const text = input ? input.value.trim() : '';
+                    if (!text) return;
+                    const sentBy = getMyName();
+                    updateBulletinMeta({ presenterAlert: { text, sentAt: Date.now(), sentBy } });
+                    if (input) input.value = '';
+                    return;
+                }
+
+                if (action === 'clear-presenter-alert') {
+                    updateBulletinMeta({ presenterAlert: null });
+                    return;
+                }
+
                 if (action === 'director-stop-presenter-clip') {
                     // Write stop command to Firebase — presenter's onSnapshot handler will act on it
                     updateBulletinMeta({ presenterClipCommand: 'stop' });
@@ -4487,6 +4663,8 @@
                     try {
                         const handle = await window.showDirectoryPicker({ mode: 'read' });
                         state.radio.directoryHandle = handle;
+                        state.ui.mediaFolderPendingHandle = null;
+                        await idbSaveHandle(handle);
                         radioLog(`Media folder granted: "${handle.name}"`, 'success');
                         render();
                     } catch(e) {
@@ -4495,8 +4673,27 @@
                     return;
                 }
 
+                if (action === 'restore-media-folder') {
+                    // One-click re-grant from the pending handle restored from IndexedDB
+                    const pending = state.ui.mediaFolderPendingHandle;
+                    if (!pending) return;
+                    try {
+                        const perm = await pending.requestPermission({ mode: 'read' });
+                        if (perm === 'granted') {
+                            state.radio.directoryHandle = pending;
+                            state.ui.mediaFolderPendingHandle = null;
+                            await idbSaveHandle(pending);
+                            radioLog(`Media folder restored: "${pending.name}"`, 'success');
+                            render();
+                        }
+                    } catch(e) { radioLog(`Restore failed: ${e.message}`, 'error'); }
+                    return;
+                }
+
                 if (action === 'revoke-media-folder') {
                     state.radio.directoryHandle = null;
+                    state.ui.mediaFolderPendingHandle = null;
+                    await idbClearHandle();
                     radioLog('Media folder access revoked.', 'info');
                     render();
                     return;
@@ -4585,6 +4782,17 @@
         window.addEventListener('beforeunload', () => {
             if (txTimerInterval) clearInterval(txTimerInterval);
             if (obsTelemetryInterval) clearInterval(obsTelemetryInterval);
+            releaseWakeLock();
+            // Release any held story lock so other users aren't blocked
+            if (state.ui.editingStoryId) unlockStory(state.ui.editingStoryId);
+            // Clear presenter clip state so director view doesn't show a stale badge
+            if (state.meta.presenterClipStoryId) {
+                updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
+            }
+            // Clear any live presenter alert
+            if (state.meta.presenterAlert) {
+                updateBulletinMeta({ presenterAlert: null });
+            }
         });
 
         boot();
