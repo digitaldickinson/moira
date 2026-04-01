@@ -46,6 +46,10 @@
         /* Card header row used in Studio story cards */
         .card-header   { font-weight: 700; font-size: 1.125rem; padding: 0.75rem 1.5rem; letter-spacing: 0.05em; display: flex; justify-content: space-between; align-items: center; }
 
+        /* ── PRESENTER SELF-FIRE COUNTDOWN FLASH ── */
+        @keyframes clip-warn-flash { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+        .clip-warn-flash { animation: clip-warn-flash 0.5s ease-in-out infinite; }
+
         /* ── SEGMENT BREAK ROWS ── */
         .segment-row td { padding: 0; }
         .segment-divider { display: flex; align-items: center; gap: 0; background: #eef2ff; color: #3730a3; border-top: 1px solid #c7d2fe; border-bottom: 1px solid #c7d2fe; }
@@ -105,7 +109,9 @@
             cuedChannel: null,      // Tracks if the media is loaded in 'A' or 'B' playout
             automationStatus: 'off', // 'off', 'ready', 'playing', or 'error'
             lastMediaFiredAt: null,  // Timestamp of the last hardware 'Play' command
-            mediaRootOverride: ''    // Optional path for local studio media folders
+            mediaRootOverride: '',   // Optional path for local studio media folders
+            presenterClipStoryId: null,  // Set when presenter self-fires a clip
+            presenterClipCommand: null   // 'stop' written by director to remote-stop presenter clip
         };
 
         const TAB_ACTIVE = "bg-blue-600 text-white shadow-sm";
@@ -245,7 +251,8 @@
                     presenterMode: 'autocue',  // 'autocue' | 'presenter'
                     expandedStoryId: null,
                     selfFireEnabled: localStorage.getItem('moira_presenter_self_fire') === 'true',
-                    clipAudio: null   // transient Audio element for presenter self-fire
+                    clipAudio: null,  // transient Audio element for presenter self-fire
+                    clipCountdownInterval: null  // interval handle for button countdown display
                 },
                 playoutBackend: savedPlayoutBackend,  // 'none' | 'radio' | 'obs'
                 trash: [],           // [{id, story, orderIndex, deletedAt}]
@@ -439,7 +446,23 @@
             unsubBulletin = onSnapshot(doc(db, ...paths.bulletins, state.currentBulletinId), 
                 (docSnap) => {
                     state.connectionState = 'connected';
-                    if (docSnap.exists()) state.meta = { ...INITIAL_META, ...docSnap.data() };
+                    if (docSnap.exists()) {
+                        const incoming = { ...INITIAL_META, ...docSnap.data() };
+                        // If director issued a remote stop and this client has the clip playing, honour it
+                        if (incoming.presenterClipCommand === 'stop' && state.ui.presenter.playingClipStoryId) {
+                            _stopPresenterCountdown();
+                            if (state.ui.presenter.clipAudio) {
+                                state.ui.presenter.clipAudio.pause();
+                                if (state.ui.presenter.clipAudio.objectUrl)
+                                    URL.revokeObjectURL(state.ui.presenter.clipAudio.objectUrl);
+                                state.ui.presenter.clipAudio = null;
+                            }
+                            state.ui.presenter.playingClipStoryId = null;
+                            // Acknowledge: clear command and playing state in Firebase
+                            updateBulletinMeta({ presenterClipCommand: null, presenterClipStoryId: null });
+                        }
+                        state.meta = incoming;
+                    }
                     render();
                 },
                 (err) => { state.connectionState = 'error'; render(); }
@@ -479,15 +502,14 @@
             if (!canMutate()) return;
             const userName = getMyName();
             const now = Date.now();
-            if (state.localMode) {
-                if (state.storiesMap[id]) {
-                    state.storiesMap[id].lockedBySession = state.sessionId;
-                    state.storiesMap[id].lockedByName = userName;
-                    state.storiesMap[id].lockedAt = now;
-                }
-                render();
-                return;
+            // Optimistic local update — both modes, so render() sees the lock immediately
+            if (state.storiesMap[id]) {
+                state.storiesMap[id].lockedBySession = state.sessionId;
+                state.storiesMap[id].lockedByName = userName;
+                state.storiesMap[id].lockedAt = now;
             }
+            render();
+            if (state.localMode) return;
             try {
                 const storyRef = doc(db, ...paths.stories, id);
                 await runTransaction(db, async (transaction) => {
@@ -1036,22 +1058,53 @@
          * playing, stops it first. Entirely independent of the deck system.
          * @param {string} storyId - The story whose mediaFile should play.
          */
+        // Stops the presenter countdown interval and clears flash state.
+        function _stopPresenterCountdown() {
+            if (state.ui.presenter.clipCountdownInterval) {
+                clearInterval(state.ui.presenter.clipCountdownInterval);
+                state.ui.presenter.clipCountdownInterval = null;
+            }
+        }
+
+        // Starts a 250ms interval that counts down the clip timer on the fire button
+        // and flashes the button when <=5s remain. Updates DOM directly — no render().
+        function _startPresenterCountdown(audio, storyId) {
+            _stopPresenterCountdown();
+            state.ui.presenter.clipCountdownInterval = setInterval(() => {
+                const btn      = document.getElementById(`presenter-clip-btn-${storyId}`);
+                const timerEl  = document.getElementById(`presenter-clip-timer-${storyId}`);
+                if (!btn || !timerEl || !audio) { _stopPresenterCountdown(); return; }
+
+                const remaining = Math.max(0, (audio.duration || 0) - (audio.currentTime || 0));
+                const m = Math.floor(remaining / 60).toString().padStart(2, '0');
+                const s = Math.floor(remaining % 60).toString().padStart(2, '0');
+                timerEl.textContent = `${m}:${s}`;
+
+                if (remaining <= 5 && remaining > 0) {
+                    btn.classList.add('clip-warn-flash');
+                } else {
+                    btn.classList.remove('clip-warn-flash');
+                }
+            }, 250);
+        }
+
         async function presenterFireClip(storyId) {
             const story = state.storiesMap[storyId];
             if (!story?.mediaFile) return;
 
             // Stop any currently playing presenter clip
             if (state.ui.presenter.clipAudio) {
+                _stopPresenterCountdown();
                 state.ui.presenter.clipAudio.pause();
                 if (state.ui.presenter.clipAudio.objectUrl)
                     URL.revokeObjectURL(state.ui.presenter.clipAudio.objectUrl);
                 state.ui.presenter.clipAudio = null;
-                render();
             }
 
             // If same story tapped while playing it was a stop — we're done
             if (state.ui.presenter.playingClipStoryId === storyId) {
                 state.ui.presenter.playingClipStoryId = null;
+                updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
                 render();
                 return;
             }
@@ -1074,9 +1127,11 @@
             }
 
             audio.addEventListener('ended', () => {
+                _stopPresenterCountdown();
                 URL.revokeObjectURL(objectUrl);
                 state.ui.presenter.clipAudio = null;
                 state.ui.presenter.playingClipStoryId = null;
+                updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
                 render();
             });
 
@@ -1085,9 +1140,16 @@
             render();
             await audio.play().catch(e => {
                 radioLog(`Presenter clip error: ${e.message}`, 'error');
+                _stopPresenterCountdown();
                 state.ui.presenter.clipAudio = null;
                 state.ui.presenter.playingClipStoryId = null;
+                updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
             });
+            // Start countdown after play() resolves so audio.duration is available
+            if (state.ui.presenter.clipAudio) {
+                _startPresenterCountdown(audio, storyId);
+                updateBulletinMeta({ presenterClipStoryId: storyId, presenterClipCommand: null });
+            }
         }
         function renderStatusBadge(label, icon, colorClass) {
             return `<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium ${colorClass} ml-1">
@@ -2387,7 +2449,15 @@
             const curId = activeIdx > -1 ? state.meta.activeStoryId : order[0] || null;
             const cur = curId ? state.storiesMap[curId] : null;
 
-            const nxtId = activeIdx > -1 && activeIdx + 1 < order.length ? order[activeIdx + 1] : (activeIdx === -1 && order.length > 1 ? order[1] : null);
+            // Find segments immediately after the active story, then the next real story beyond them
+            const afterIdx = activeIdx > -1 ? activeIdx + 1 : (order.length > 1 ? 1 : order.length);
+            const segmentsBetween = [];
+            let nxtRealIdx = afterIdx;
+            while (nxtRealIdx < order.length && state.storiesMap[order[nxtRealIdx]]?.type === 'segment') {
+                segmentsBetween.push(state.storiesMap[order[nxtRealIdx]]);
+                nxtRealIdx++;
+            }
+            const nxtId = nxtRealIdx < order.length ? order[nxtRealIdx] : null;
             const nxt = nxtId ? state.storiesMap[nxtId] : null;
 
             const isLive = state.meta.isTXMode;
@@ -2472,9 +2542,10 @@
                     <!-- Studio body -->
                     <div class="max-w-6xl mx-auto p-6 pb-12 flex flex-col gap-6 w-full">
 
-                        <!-- Story cards: ON AIR + PREVIEW NEXT -->
-                        <div class="grid grid-cols-2 gap-6">
-                            <div class="bg-white border-2 rounded-2xl flex flex-col overflow-hidden shadow-sm ${onAirBorder}">
+                        <!-- Story cards: ON AIR + optional SEGMENT chip(s) + PREVIEW NEXT -->
+                        <div class="flex gap-3 items-stretch">
+                            <!-- ON AIR card -->
+                            <div class="flex-1 bg-white border-2 rounded-2xl flex flex-col overflow-hidden shadow-sm ${onAirBorder}">
                                 <div class="${onAirHdrBg} text-white font-bold text-lg px-6 py-3 tracking-widest flex justify-between items-center">
                                     <span class="flex items-center">ON AIR${clipTitleBadge(cur, curId)}</span>
                                     ${cur ? `<span class="font-mono bg-black/20 px-2 py-0.5 rounded text-sm">${formatDuration(cur.duration)}</span>` : ''}
@@ -2482,8 +2553,38 @@
                                 <div class="p-6 flex-1 text-center flex flex-col justify-center min-h-[100px]">
                                     ${cur ? `<h3 class="text-3xl font-black text-slate-800 uppercase">${escapeHTML(cur.slug)}</h3><p class="text-slate-400 italic mt-2 text-sm truncate">${escapeHTML(cur.script?.split('\n')[0] || '')}</p>` : '<span class="text-slate-400">No Active Story</span>'}
                                 </div>
+                                ${(() => {
+                                    const presId = state.meta.presenterClipStoryId;
+                                    if (!presId) return '';
+                                    const presStory = state.storiesMap[presId];
+                                    const presSlug = presStory ? escapeHTML(presStory.slug) : escapeHTML(presId);
+                                    return `<div class="border-t border-amber-200 bg-amber-50 px-4 py-2 flex items-center justify-between gap-3">
+                                        <div class="flex items-center gap-2">
+                                            <span class="w-2 h-2 rounded-full bg-amber-500 animate-pulse inline-block"></span>
+                                            <span class="text-xs font-black text-amber-800 uppercase tracking-widest">Presenter Clip</span>
+                                            <span class="text-xs font-bold text-amber-700 truncate max-w-[160px]">${presSlug}</span>
+                                        </div>
+                                        <button data-action="director-stop-presenter-clip"
+                                            class="text-xs font-black px-3 py-1 rounded-lg bg-red-600 hover:bg-red-500 text-white tracking-widest uppercase transition-colors shadow-sm">
+                                            ⏹ Stop
+                                        </button>
+                                    </div>`;
+                                })()}
                             </div>
-                            <div class="bg-white border-2 rounded-2xl flex flex-col overflow-hidden shadow-sm ${!nxt ? 'border-red-800' : 'border-blue-200'}">
+
+                            <!-- SEGMENT chip(s) — only rendered when segments fall between cur and nxt -->
+                            ${segmentsBetween.length > 0 ? `
+                            <div class="flex flex-col gap-2 justify-center shrink-0 w-28">
+                                ${segmentsBetween.map(seg => `
+                                <div class="bg-indigo-50 border border-indigo-200 rounded-xl px-3 py-3 flex flex-col items-center justify-center gap-1 text-center shadow-sm">
+                                    <span class="text-[9px] font-black text-indigo-400 uppercase tracking-widest leading-none">Segment</span>
+                                    <span class="text-xs font-black text-indigo-800 uppercase tracking-tight leading-tight">${escapeHTML(seg.slug)}</span>
+                                    ${seg.duration > 0 ? `<span class="text-[10px] font-mono text-indigo-500 opacity-80">${formatDuration(seg.duration)}</span>` : ''}
+                                </div>`).join('')}
+                            </div>` : ''}
+
+                            <!-- PREVIEW NEXT card -->
+                            <div class="flex-1 bg-white border-2 rounded-2xl flex flex-col overflow-hidden shadow-sm ${!nxt ? 'border-red-800' : 'border-blue-200'}">
                                 <div class="${!nxt ? 'bg-red-900' : 'bg-blue-100'} ${!nxt ? 'text-white' : 'text-blue-800'} font-bold text-lg px-6 py-3 tracking-widest flex justify-between items-center">
                                     <span class="flex items-center">${!nxt ? 'END OF PROGRAMME' : 'PREVIEW NEXT'}${nxt ? clipTitleBadge(nxt, nxtId) : ''}</span>
                                     ${nxt ? `<span class="font-mono bg-blue-200 px-2 py-0.5 rounded text-sm">${formatDuration(nxt.duration)}</span>` : ''}
@@ -3055,7 +3156,8 @@
                     const secs = parseInt(clipMatch[2], 10);
                     const dur  = formatDuration(mins * 60 + secs);
                     if (isPlaying) {
-                        return `<button data-action="presenter-fire-clip" data-id="${storyId}"
+                        // Countdown timer — initial value is full duration; interval updates it live
+                        return `<button id="presenter-clip-btn-${storyId}" data-action="presenter-fire-clip" data-id="${storyId}"
                             style="display:block; width:100%; margin:1rem 0; padding:1.1rem 1.5rem; border-radius:0.75rem;
                                    background:#dc2626; color:#fff; border:none; cursor:pointer;
                                    font-size:1.1rem; font-weight:900; letter-spacing:0.08em; text-transform:uppercase;
@@ -3063,11 +3165,11 @@
                             <span style="display:flex;align-items:center;justify-content:center;gap:1rem;">
                                 <span style="font-size:1.4rem;">⏹</span>
                                 <span>STOP CLIP</span>
-                                <span style="opacity:0.7;font-size:1.1rem;font-weight:700;">${dur}</span>
+                                <span id="presenter-clip-timer-${storyId}" style="opacity:0.85;font-size:1.2rem;font-weight:900;font-family:monospace;">${dur}</span>
                             </span>
                         </button>`;
                     } else {
-                        return `<button data-action="presenter-fire-clip" data-id="${storyId}"
+                        return `<button id="presenter-clip-btn-${storyId}" data-action="presenter-fire-clip" data-id="${storyId}"
                             style="display:block; width:100%; margin:1rem 0; padding:1.1rem 1.5rem; border-radius:0.75rem;
                                    background:#16a34a; color:#fff; border:none; cursor:pointer;
                                    font-size:1.1rem; font-weight:900; letter-spacing:0.08em; text-transform:uppercase;
@@ -3075,7 +3177,7 @@
                             <span style="display:flex;align-items:center;justify-content:center;gap:1rem;">
                                 <span style="font-size:1.4rem;">▶</span>
                                 <span>PLAY CLIP</span>
-                                <span style="opacity:0.7;font-size:1.1rem;font-weight:700;">${dur}</span>
+                                <span id="presenter-clip-timer-${storyId}" style="opacity:0.7;font-size:1.1rem;font-weight:700;font-family:monospace;">${dur}</span>
                             </span>
                         </button>`;
                     }
@@ -4029,6 +4131,24 @@
 
                     render(); return;
                 }
+                if (action === 'director-stop-presenter-clip') {
+                    // Write stop command to Firebase — presenter's onSnapshot handler will act on it
+                    updateBulletinMeta({ presenterClipCommand: 'stop' });
+                    // Also stop locally in case director and presenter are the same client
+                    if (state.ui.presenter.playingClipStoryId) {
+                        _stopPresenterCountdown();
+                        if (state.ui.presenter.clipAudio) {
+                            state.ui.presenter.clipAudio.pause();
+                            if (state.ui.presenter.clipAudio.objectUrl)
+                                URL.revokeObjectURL(state.ui.presenter.clipAudio.objectUrl);
+                            state.ui.presenter.clipAudio = null;
+                        }
+                        state.ui.presenter.playingClipStoryId = null;
+                        updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
+                        render();
+                    }
+                    return;
+                }
                 if (action === 'studio-tx-toggle') updateStudioMode(state.meta.isTXMode ? 'standby' : 'tx');
                 if (action === 'set-studio-state') updateStudioMode(val);
 
@@ -4036,12 +4156,22 @@
                 if (action === 'close-staff-modal') { state.ui.isStaffModalOpen = false; render(); }
                 if (action === 'edit-story') { state.ui.editingStoryId = id; lockStory(id); render(); }
                 if (action === 'save-tx-time') {
-                    const val = document.getElementById('tx-clock-input')?.value.trim();
-                    updateBulletinMeta({ txClockTime: val || '' });
+                    const txVal = document.getElementById('tx-clock-input')?.value.trim() || '';
+                    if (txVal && !/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(txVal)) {
+                        alert('Please enter a valid TX time (HH:MM or HH:MM:SS)');
+                        return;
+                    }
+                    updateBulletinMeta({ txClockTime: txVal });
+                    return;
                 }
                 if (action === 'save-rx-time') {
-                    const val = document.getElementById('rx-clock-input')?.value.trim();
-                    updateBulletinMeta({ rxClockTime: val || '' });
+                    const rxVal = document.getElementById('rx-clock-input')?.value.trim() || '';
+                    if (rxVal && !/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(rxVal)) {
+                        alert('Please enter a valid RX time (HH:MM or HH:MM:SS)');
+                        return;
+                    }
+                    updateBulletinMeta({ rxClockTime: rxVal });
+                    return;
                 }
 
                 // ── INLINE SLUG EDIT ─────────────────────────────────────────
@@ -4376,6 +4506,16 @@
                     populateRadioDevices();
                     return;
                 }
+
+                // ── RADIO PLAYOUT ACTIONS ────────────────────────────────────
+                const deck   = btn.getAttribute('data-deck');
+                const deckKey = deck === 'A' ? 'deckA' : 'deckB';
+                if (action === 'radio-play')  { radioPlay(deckKey);  return; }
+                if (action === 'radio-pause') { radioPause(deckKey); return; }
+                if (action === 'radio-stop')  { radioStop(deckKey);  return; }
+                if (action === 'radio-cue')   { radioCue(deckKey);   return; }
+                if (action === 'radio-take')  { radioExecuteTake();  return; }
+                if (action === 'radio-scrub') { radioScrub(deck, e); return; }
             });
 
             // --- OBS playout actions ---
@@ -4396,24 +4536,6 @@
                 if (obsAction === 'cue')   { obsSetCursor(deck, 0); return; }
             });
 
-            // Radio playout actions
-            document.body.addEventListener('click', e => {
-                const btn = e.target.closest('[data-action]');
-                if (!btn) return;
-                const action = btn.getAttribute('data-action');
-                const deck   = btn.getAttribute('data-deck');
-                const deckKey = deck === 'A' ? 'deckA' : 'deckB';
-
-                if (action === 'radio-play')  { radioPlay(deckKey);  return; }
-                if (action === 'radio-pause') { radioPause(deckKey); return; }
-                if (action === 'radio-stop')  { radioStop(deckKey);  return; }
-                if (action === 'radio-cue')   { radioCue(deckKey);   return; }
-                if (action === 'radio-take')  { radioExecuteTake();   return; }
-                if (action === 'radio-scrub') {
-                    radioScrub(deck, e);
-                    return;
-                }
-            });
 
             // Radio file load
             document.body.addEventListener('change', e => {
