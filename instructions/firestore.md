@@ -2,7 +2,7 @@
 
 ## Overview
 
-Moira runs fully in-browser with no backend server. Cloud sync is provided by **Firebase Firestore** with **Anonymous Authentication**. Out of the box the app works in local-only mode; this guide gets you to a live, multi-user cloud-synced newsroom.
+Moira runs fully in-browser with no local backend server. Out of the box, the app works in local-only mode with any data stored in the browser. To enable mutliuser/site use, it requires a cloud based database. Cloud sync is provided by **Firebase Firestore** with **Anonymous Authentication**. This guide gets you to a live, multi-user, cloud-synced newsroom.
 
 ---
 
