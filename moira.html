@@ -189,7 +189,7 @@
                     const editingId = state.ui.editingStoryId;
                     state.ui.editingStoryId = null;
                     unlockStory(editingId);
-                    render();
+                    render('main', 'modal');
                 }
             }
         });
@@ -480,12 +480,12 @@
                             seedCloudIfEmpty().then(() => setupListeners());
                         } else {
                             state.connectionState = 'offline';
-                            render();
+                            render('header');
                         }
                     });
                 } catch (e) {
                     state.connectionState = 'error';
-                    render();
+                    render('header');
                 }
             } else {
                 seedLocalData(); 
@@ -538,7 +538,7 @@
             if (!state.localMode) return;
             // Fix: ensure room-specific data is loaded correctly
             if (loadLocalState()) {
-                render();
+                render('header', 'main');
                 return;
             }
 
@@ -559,7 +559,7 @@
                 rev: 1
             };
             state.meta = { ...INITIAL_META, order: [localId, 'marker-line'] };
-            render();
+            render('header', 'main');
         }
 
         async function seedCloudIfEmpty() {
@@ -568,7 +568,7 @@
             catch(e) {
                 console.error('Cloud seed failed', e);
                 state.connectionState = 'error';
-                render();
+                render('header');
             }
         }
 
@@ -593,7 +593,7 @@
             unsubAll = DB.subscribe(
                 // onBulletin
                 (data, err) => {
-                    if (err) { state.connectionState = 'error'; render(); return; }
+                    if (err) { state.connectionState = 'error'; render('header'); return; }
                     state.connectionState = 'connected';
                     if (data) {
                         const incoming = { ...INITIAL_META, ...data };
@@ -611,18 +611,18 @@
                         }
                         state.meta = incoming;
                     }
-                    render();
+                    render('header', 'main');
                 },
                 // onStories
                 (changes, err) => {
-                    if (err) { state.connectionState = 'error'; render(); return; }
+                    if (err) { state.connectionState = 'error'; render('header'); return; }
                     const newMap = { ...state.storiesMap };
                     changes.forEach(({ type, id, data }) => {
                         if (type === 'removed') delete newMap[id];
                         else newMap[id] = data;
                     });
                     state.storiesMap = newMap;
-                    render();
+                    render('main');
                 },
                 // onMessages
                 (messages) => {
@@ -893,7 +893,7 @@
                 state.storiesMap[id].lockedByName = userName;
                 state.storiesMap[id].lockedAt = now;
             }
-            render();
+            render('main', 'modal');
             try { await DB.lockStory(id, state.sessionId, userName, now); }
             catch(e) { console.error('Lock failed', e); }
         }
@@ -912,7 +912,7 @@
                 state.storiesMap[id].lockedByName = null;
                 state.storiesMap[id].lockedAt = null;
             }
-            render();
+            render('main', 'modal');
             try { await DB.updateStory(id, { lockedBySession: null, lockedByName: null, lockedAt: null }); }
             catch(e) { console.error('Unlock failed', e); }
         }
@@ -935,11 +935,11 @@
             newData.rev = (state.storiesMap[id]?.rev || 0) + 1;
             state.storiesMap[id] = { ...state.storiesMap[id], ...newData };
             state.ui.editingStoryId = null;
-            render();
+            render('main', 'modal');
             try {
                 // Pass original rev so adapter can compare against server rev correctly
                 const result = await DB.saveStory(id, { ...newData, rev: originalRev });
-                if (result === 'conflict') render();
+                if (result === 'conflict') render('modal');
             } catch(e) { console.error('Save failed', e); }
         }
 
@@ -952,7 +952,7 @@
                 : current === 'checked-ok' ? 'checked-needs-work'
                 : null;
             state.storiesMap[id].completed = nextState;
-            render();
+            render('main');
             try { await DB.updateStory(id, { completed: nextState }); }
             catch(e) { console.error('Toggle failed', e); }
         }
@@ -964,7 +964,7 @@
             const targetIdx = order.indexOf(targetId);
             order.splice(targetIdx !== -1 ? targetIdx : order.length, 0, draggedId);
             state.meta.order = order;
-            render();
+            render('main');
             try {
                 await DB.updateBulletinOrder(current => {
                     let o = current.filter(id => id !== draggedId);
@@ -1028,7 +1028,7 @@
             }
 
             state.meta = { ...state.meta, ...updates };
-            render();
+            render('main');
             try { await DB.updateBulletin(updates); }
             catch(e) { console.error('Mode update failed', e); }
 
@@ -1081,7 +1081,7 @@
 
             state.meta.activeStoryId = nextId;
             state.meta.activeStoryStartedAt = updates.activeStoryStartedAt;
-            render();
+            render('main');
             try { await DB.updateBulletin(updates); }
             catch(e) { console.error('Shift failed', e); }
 
@@ -1104,7 +1104,7 @@
             };
             state.storiesMap[newId] = newStory;
             insertStoryIntoOrder(newId);
-            render();
+            render('main');
             try { await DB.createStory(newId, newStory); }
             catch(e) { console.error('Add story failed', e); }
         }
@@ -1128,7 +1128,7 @@
             };
             state.storiesMap[newId] = newStory;
             insertStoryIntoOrder(newId);
-            render();
+            render('main');
             try { await DB.createStory(newId, newStory); }
             catch(e) { console.error('Add segment failed', e); }
         }
@@ -1137,7 +1137,7 @@
             if (!canMutate()) return;
             const current = !!state.storiesMap[id]?.isFloated;
             state.storiesMap[id].isFloated = !current;
-            render();
+            render('main');
             try { await DB.updateStory(id, { isFloated: !current }); }
             catch(e) { console.error('Float toggle failed', e); }
         }
@@ -1152,7 +1152,7 @@
             delete state.storiesMap[id];
             state.meta.order = state.meta.order.filter(i => i !== id);
             state.ui.trash.unshift(snapshot);
-            render();
+            render('main');
             try { await DB.deleteStory(id); }
             catch(e) { console.error('Delete failed', e); }
         }
@@ -1166,7 +1166,7 @@
             const insertAt = Math.min(entry.orderIndex, state.meta.order.length);
             state.storiesMap[id] = story;
             state.meta.order.splice(insertAt, 0, id);
-            render();
+            render('main');
             try { await DB.restoreStory(id, story, insertAt); }
             catch(e) { console.error('Rescue failed', e); }
         }
@@ -1183,7 +1183,7 @@
             if (!canMutate()) return;
             const newStaff = mutatorFn(state.meta.staff || []);
             state.meta = { ...state.meta, staff: newStaff };
-            render();
+            render('header', 'main');
             try { await DB.updateStaff(mutatorFn); }
             catch(e) { console.error('Staff update failed', e); }
         }
@@ -1360,7 +1360,7 @@
             if (state.ui.presenter.playingClipStoryId === storyId) {
                 state.ui.presenter.playingClipStoryId = null;
                 updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
-                render();
+                render('main');
                 return;
             }
 
@@ -1387,12 +1387,12 @@
                 state.ui.presenter.clipAudio = null;
                 state.ui.presenter.playingClipStoryId = null;
                 updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
-                render();
+                render('main');
             });
 
             state.ui.presenter.clipAudio = audio;
             state.ui.presenter.playingClipStoryId = storyId;
-            render();
+            render('main');
             await audio.play().catch(e => {
                 radioLog(`Presenter clip error: ${e.message}`, 'error');
                 _stopPresenterCountdown();
@@ -1469,17 +1469,57 @@
          * the takeover countdown. Restores scroll position after each render.
          * Called after every state mutation.
          */
-        function render() {
-             const mainContainer = document.getElementById('main-container');
-             const savedScroll = mainContainer ? mainContainer.scrollTop : 0;
+        // ── RENDER ENGINE ─────────────────────────────────────────────────────────
+        // render() is RAF-debounced and section-aware. Multiple calls within a
+        // single frame coalesce into one DOM update covering all dirty sections.
+        //
+        // Usage:
+        //   render()                 — mark all sections dirty (default, safe)
+        //   render('main')           — only rebuild main content
+        //   render('modal')          — only rebuild modal
+        //   render('header','main')  — rebuild two sections
+        //
+        // Valid sections: 'header', 'main', 'modal'
+        // All existing render() call sites work unchanged — Phase 2 will
+        // progressively narrow them to specific sections.
 
-            const isZen = state.mode === 'presenter' && state.ui.presenter.zenMode;
-            document.getElementById('header-container').innerHTML = isZen ? '' : renderHeader();
+        const _pendingRender = { header: false, main: false, modal: false };
+        let _renderRafId = null;
+
+        function render(...sections) {
+            if (sections.length === 0) {
+                _pendingRender.header = true;
+                _pendingRender.main   = true;
+                _pendingRender.modal  = true;
+            } else {
+                sections.forEach(s => { if (s in _pendingRender) _pendingRender[s] = true; });
+            }
+            if (_renderRafId) cancelAnimationFrame(_renderRafId);
+            _renderRafId = requestAnimationFrame(() => {
+                _renderRafId = null;
+                // Snapshot and clear flags before executing so any render() calls
+                // triggered during the update are queued for the next frame.
+                const dirty = { ..._pendingRender };
+                _pendingRender.header = false;
+                _pendingRender.main   = false;
+                _pendingRender.modal  = false;
+                _renderNow(dirty);
+            });
+        }
+
+        function _renderNow(dirty = { header: true, main: true, modal: true }) {
+            const mainContainer = document.getElementById('main-container');
+            const savedScroll = mainContainer ? mainContainer.scrollTop : 0;
 
             const activeEl = document.activeElement;
             const userIsTyping = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA') && activeEl.id !== 'header-room-input';
 
-            if (!state.ui.draggedStoryId && !state.ui.inlineEditingId && !userIsTyping) {
+            if (dirty.header) {
+                const isZen = state.mode === 'presenter' && state.ui.presenter.zenMode;
+                document.getElementById('header-container').innerHTML = isZen ? '' : renderHeader();
+            }
+
+            if (dirty.main && !state.ui.draggedStoryId && !state.ui.inlineEditingId && !userIsTyping) {
                 let mainHtml = '';
                 if (state.mode === 'newsroom') mainHtml = renderNewsroom();
                 else if (state.mode === 'presenter') mainHtml = renderPresenter();
@@ -1487,10 +1527,11 @@
                 document.getElementById('main-container').innerHTML = mainHtml;
             }
 
-            if (!userIsTyping) {
+            if (dirty.modal && !userIsTyping) {
                 document.getElementById('modal-container').innerHTML = renderModals();
             }
 
+            // ── Side effects — always run regardless of dirty flags ────────────
             // TX Timer housekeeping
             if (state.meta.isTXMode && state.meta.txStartedAt) {
                 if (!txTimerInterval) startTXTimer();
@@ -1500,31 +1541,35 @@
             }
             if (state.meta.isTXMode) updateClockDisplays();
 
-
-            const newMainContainer = document.getElementById('main-container');
-            if (state.mode === 'presenter' && state.meta.activeStoryId && state.ui.lastScrolledStoryId !== state.meta.activeStoryId) {
-                const activeEl = document.getElementById(`presenter-story-${state.meta.activeStoryId}`);
-                if (activeEl && newMainContainer) {
-                    const containerRect = newMainContainer.getBoundingClientRect();
-                    const elRect = activeEl.getBoundingClientRect();
-                    newMainContainer.scrollTop += elRect.top - containerRect.top;
-                    state.ui.lastScrolledStoryId = state.meta.activeStoryId;
+            if (dirty.main) {
+                const newMainContainer = document.getElementById('main-container');
+                if (state.mode === 'presenter' && state.meta.activeStoryId && state.ui.lastScrolledStoryId !== state.meta.activeStoryId) {
+                    const presEl = document.getElementById(`presenter-story-${state.meta.activeStoryId}`);
+                    if (presEl && newMainContainer) {
+                        const containerRect = newMainContainer.getBoundingClientRect();
+                        const elRect = presEl.getBoundingClientRect();
+                        newMainContainer.scrollTop += elRect.top - containerRect.top;
+                        state.ui.lastScrolledStoryId = state.meta.activeStoryId;
+                    }
+                } else if (!state.ui.draggedStoryId && newMainContainer) {
+                    newMainContainer.scrollTop = savedScroll;
                 }
-            } else if (!state.ui.draggedStoryId && newMainContainer) {
-                newMainContainer.scrollTop = savedScroll;
             }
-             saveLocalState();
 
-            // Kick off takeover countdown if edit modal is open on a locked story
-            if (state.ui.editingStoryId && !state.ui.pendingConflict) {
-                const s = state.storiesMap[state.ui.editingStoryId];
-                if (s?.lockedBySession && s.lockedBySession !== state.sessionId && s.lockedAt) {
-                    startTakeoverCountdown(s.lockedAt);
+            saveLocalState();
+
+            // Takeover countdown — only relevant when modal is visible
+            if (dirty.modal) {
+                if (state.ui.editingStoryId && !state.ui.pendingConflict) {
+                    const s = state.storiesMap[state.ui.editingStoryId];
+                    if (s?.lockedBySession && s.lockedBySession !== state.sessionId && s.lockedAt) {
+                        startTakeoverCountdown(s.lockedAt);
+                    } else {
+                        if (takeoverCountdownInterval) { clearInterval(takeoverCountdownInterval); takeoverCountdownInterval = null; }
+                    }
                 } else {
                     if (takeoverCountdownInterval) { clearInterval(takeoverCountdownInterval); takeoverCountdownInterval = null; }
                 }
-            } else {
-                if (takeoverCountdownInterval) { clearInterval(takeoverCountdownInterval); takeoverCountdownInterval = null; }
             }
         }
 
@@ -1576,7 +1621,7 @@
      async function populateRadioDevices() {
             if (!setSinkIdSupported || !navigator.mediaDevices) {
                 state.radio.devices = [];
-                render();
+                render('modal');
                 return;
             }
             // On file:// origins mediaDevices.enumerateDevices may throw or return
@@ -1589,7 +1634,7 @@
             } catch(e) {
                 state.radio.devices = [];
             }
-            render();
+            render('modal');
         }
 
         // PPM ballistics — peak detection on time-domain data
@@ -1730,7 +1775,7 @@
             deck.filename = file.name;
             deck.slug = file.name.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ').toUpperCase();
             deck.loadedStoryId = storyId;
-            render();
+            render('main');
 
             deck.objectUrl = URL.createObjectURL(file);
             const audio = new Audio();
@@ -1775,12 +1820,12 @@
                 stopRadioMeter(deck);
                 deck.state = 'ended';
                 radioLog(`Deck ${deck.id} ended.`, 'info');
-                render();
+                render('main');
             });
 
             radioLog(`Deck ${deck.id} cued: "${deck.slug}" (${formatDuration(deck.duration)})`, 'success');
             startRadioDisplayLoop();
-            render();
+            render('main');
         }
 
         function radioPlay(deckKey) {
@@ -1792,7 +1837,7 @@
                     deck.state = 'playing';
                     startRadioMeter(deck);
                     radioLog(`Deck ${deck.id} — PLAYING`, 'success');
-                    render();
+                    render('main');
                 })
                 .catch(e => radioLog(`Deck ${deck.id} play error: ${e.message}`, 'error'));
         }
@@ -1804,7 +1849,7 @@
             stopRadioMeter(deck);
             deck.state = 'paused';
             radioLog(`Deck ${deck.id} — PAUSED`, 'warn');
-            render();
+            render('main');
         }
 
         function radioStop(deckKey) {
@@ -1815,7 +1860,7 @@
             stopRadioMeter(deck);
             deck.state = 'cued';
             radioLog(`Deck ${deck.id} — STOPPED & re-cued`, 'warn');
-            render();
+            render('main');
         }
 
         function radioCue(deckKey) {
@@ -1826,7 +1871,7 @@
             stopRadioMeter(deck);
             deck.state = 'cued';
             radioLog(`Deck ${deck.id} — cued to 0`, 'info');
-            render();
+            render('main');
         }
 
         function radioScrub(deckId, e) {
@@ -1896,7 +1941,7 @@
             // Advance queue index to match what just played
             const playedQueueIdx = state.radio.clipQueue.indexOf(cuedDeck.loadedStoryId);
             if (playedQueueIdx > -1) state.radio.clipIndex = playedQueueIdx;
-            render();
+            render('main');
 
             // Release outgoing deck and load the upcoming clip onto it.
             // Stored so a rapid second Take can cancel this before it fires.
@@ -1937,7 +1982,7 @@
                         playingDeck.loadedStoryId = null;
                         radioLog(`Deck ${playingDeck.id} cleared — end of clip queue.`, 'info');
                     }
-                    render();
+                    render('main');
                 }, 300);
             }
         }
@@ -1970,7 +2015,6 @@
             if (queue.length === 0) { radioLog('No media clips in running order.', 'info'); return; }
 
             radioLog(`Clip queue: ${queue.length} clip(s). ${state.radio.directoryHandle ? 'Auto-loading from media folder...' : 'Load files onto decks manually.'}`, 'info');
-
             // Try auto-load from directory handle for first two clips
             const deckPairs = [
                 { storyId: queue[0], deckKey: 'deckA' },
@@ -1997,7 +2041,7 @@
                     deck.loadedStoryId = storyId;
                 }
             }
-            render();
+            render('main');
         }
 
         // Syncs playout decks to match a new active story position.
@@ -2070,7 +2114,7 @@
                 if ((aHasActive || bHasActive) && (aHasNext || bHasNext || !nextStoryId)) {
                     // Both needed clips are already on decks — nothing to do
                     radioLog(`Deck sync — clips already loaded, skipping reload.`, 'info');
-                    render();
+                    render('main');
                     return;
                 }
 
@@ -2108,7 +2152,7 @@
                 }
 
                 radioLog(`Deck sync → A: "${state.storiesMap[deckA.loadedStoryId]?.mediaFile || 'empty'}"  B: "${state.storiesMap[deckB.loadedStoryId]?.mediaFile || 'empty'}"`, 'info');
-                render();
+                render('main');
 
             } else if (state.ui.playoutBackend === 'obs') {
                 const activeClipIdx = newActiveStoryId ? queue.indexOf(newActiveStoryId) : 0;
@@ -4307,7 +4351,7 @@
                         catch(e) { console.warn('Message send failed:', e); showToast(sentBy, text); }
                         e.target.value = '';
                         state.ui.alertPanelOpen = false;
-                        render();
+                        render('main');
                     }
                     return;
                 }
@@ -4316,7 +4360,7 @@
                     if (e.key.toLowerCase() === 'm') {
                         e.preventDefault();
                         state.ui.presenter.mirrorX = !state.ui.presenter.mirrorX;
-                        render();
+                        render('main');
                     }
 
                     if (e.key.toLowerCase() === 'f') {
@@ -4332,30 +4376,30 @@
                             else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
                             state.ui.presenter.zenMode = false;
                         }
-                        render();
+                        render('main');
                     }
 
                     if (e.key.toLowerCase() === 'v') {
                         e.preventDefault();
                         state.ui.presenter.mirrorY = !state.ui.presenter.mirrorY;
-                        render();
+                        render('main');
                     }
 
                     if (e.code === 'Space') {
                         e.preventDefault();
                         state.ui.presenter.autoScroll = !state.ui.presenter.autoScroll;
-                        render();
+                        render('main');
                     }
 
                     if (e.key === 'ArrowUp') {
                         e.preventDefault();
                         state.ui.presenter.scrollSpeed = Math.min(state.ui.presenter.scrollSpeed + 5, 200);
-                        render();
+                        render('main');
                     }
                     if (e.key === 'ArrowDown') {
                         e.preventDefault();
                         state.ui.presenter.scrollSpeed = Math.max(state.ui.presenter.scrollSpeed - 5, 0);
-                        render();
+                        render('main');
                     }
 
                 // Studio view keyboard shortcuts
@@ -4379,7 +4423,7 @@
                 const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
                 if (!isFs && state.ui.presenter.zenMode) {
                     state.ui.presenter.zenMode = false;
-                    render();
+                    render('main');
                 }
             }
             document.addEventListener('fullscreenchange', handleFullscreenChange);
@@ -4430,7 +4474,7 @@
                             else if (state.ui.playoutBackend === 'radio') radioInitialLoad(activeOrder);
                         }
                     }
-                    render();
+                    render('header', 'main');
                 }
 
                 if (action === 'join-room') switchRoom(document.getElementById('header-room-input').value);
@@ -4442,11 +4486,11 @@
                 if (action === 'delete-story') { if (!isRundownLocked) deleteStory(id); return; }
                 if (action === 'rescue-story') { rescueStory(id); return; }
                 if (action === 'revert-story') { revertStory(id); return; }
-                if (action === 'clear-trash') { state.ui.trash = []; render(); return; }
+                if (action === 'clear-trash') { state.ui.trash = []; render('main'); return; }
                 if (action === 'toggle-complete') toggleStoryComplete(id);
-                if (action === 'open-settings-modal') { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'connection'; render(); }
-                if (action === 'close-settings-modal') { state.ui.isSettingsModalOpen = false; state.ui.settingsTab = 'connection'; render(); }
-                if (action === 'set-settings-tab') { state.ui.settingsTab = val; render(); }
+                if (action === 'open-settings-modal') { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'connection'; render('modal'); }
+                if (action === 'close-settings-modal') { state.ui.isSettingsModalOpen = false; state.ui.settingsTab = 'connection'; render('modal'); }
+                if (action === 'set-settings-tab') { state.ui.settingsTab = val; render('modal'); }
                 if (action === 'save-settings') {
                     const newConfig = {
                         apiKey: document.getElementById('config-apikey').value.trim(),
@@ -4504,11 +4548,11 @@
                         populateRadioDevices();
                     }
 
-                    render(); return;
+                    render('main', 'modal'); return;
                 }
                 if (action === 'toggle-alert-panel') {
                     state.ui.alertPanelOpen = !state.ui.alertPanelOpen;
-                    render();
+                    render('main');
                     return;
                 }
 
@@ -4528,14 +4572,14 @@
                     catch(e) { console.warn('Message send failed:', e); showToast(sentBy, text); }
                     if (input) input.value = '';
                     state.ui.alertPanelOpen = false;
-                    render();
+                    render('main');
                     return;
                 }
 
                 if (action === 'clear-presenter-alert') {
                     updateBulletinMeta({ presenterAlert: null });
                     state.ui.alertPanelOpen = false;
-                    render();
+                    render('main');
                     return;
                 }
 
@@ -4553,16 +4597,16 @@
                         }
                         state.ui.presenter.playingClipStoryId = null;
                         updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
-                        render();
+                        render('main');
                     }
                     return;
                 }
                 if (action === 'studio-tx-toggle') updateStudioMode(state.meta.isTXMode ? 'standby' : 'tx');
                 if (action === 'set-studio-state') updateStudioMode(val);
 
-                if (action === 'open-staff-modal') { state.ui.isStaffModalOpen = true; render(); }
-                if (action === 'close-staff-modal') { state.ui.isStaffModalOpen = false; render(); }
-                if (action === 'edit-story') { state.ui.editingStoryId = id; lockStory(id); startLockRefresh(id); render(); }
+                if (action === 'open-staff-modal') { state.ui.isStaffModalOpen = true; render('modal'); }
+                if (action === 'close-staff-modal') { state.ui.isStaffModalOpen = false; render('modal'); }
+                if (action === 'edit-story') { state.ui.editingStoryId = id; lockStory(id); startLockRefresh(id); render('modal'); }
                 if (action === 'save-tx-time') {
                     const txVal = document.getElementById('tx-clock-input')?.value.trim() || '';
                     if (txVal && !/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(txVal)) {
@@ -4592,7 +4636,7 @@
                     await lockStory(id);
 
                     const liveSpan = document.querySelector(`[data-action="inline-edit-slug"][data-id="${id}"]`);
-                    if (!liveSpan) { state.ui.inlineEditingId = null; render(); return; }
+                    if (!liveSpan) { state.ui.inlineEditingId = null; render('main'); return; }
 
                     const originalSlug = state.storiesMap[id]?.slug ?? '';
 
@@ -4612,7 +4656,7 @@
                         if (save && !escapedOut && newSlug && newSlug !== originalSlug) {
                             // Optimistic update then persist via adapter
                             state.storiesMap[id].slug = newSlug;
-                            render();
+                            render('main');
                             try {
                                 await DB.saveSlug(id, newSlug, state.sessionId);
                                 // Adapter releases lock server-side; clear locally too
@@ -4624,11 +4668,11 @@
                             } catch(e) {
                                 console.error('Inline save failed', e);
                                 await unlockStory(id);
-                                render();
+                                render('main');
                             }
                         } else {
                             await unlockStory(id);
-                            render();
+                            render('main');
                         }
                     };
 
@@ -4668,12 +4712,12 @@
                         state.storiesMap[storyId].lockedByName = userName;
                         state.storiesMap[storyId].lockedAt = now;
                     }
-                    render();
+                    render('modal');
                     try { await DB.takeLock(storyId, state.sessionId, userName, now); }
                     catch(e) { console.error('Takeover failed', e); }
                 }
 
-                if (action === 'cancel-edit') { const editingId = state.ui.editingStoryId; state.ui.editingStoryId = null; stopLockRefresh(); if (editingId) unlockStory(editingId); render(); }
+                if (action === 'cancel-edit') { const editingId = state.ui.editingStoryId; state.ui.editingStoryId = null; stopLockRefresh(); if (editingId) unlockStory(editingId); render('main', 'modal'); }
 
                 if (action === 'add-staff') {
                     const nameInput = document.getElementById('new-staff-name');
@@ -4700,18 +4744,18 @@
                     state.myStaffId = id;
                     localStorage.setItem('moira_my_staff_id', id);
                     updateStaffInCloud(staff => staff.map(s => s.id === id ? { ...s, checkedIn: true, lastSeen: Date.now() } : s));
-                    render();
+                    render('header');
                 }
                 if (action === 'check-out') {
                     state.myStaffId = null;
                     localStorage.removeItem('moira_my_staff_id');
                     updateStaffInCloud(staff => staff.map(s => s.id === id ? { ...s, checkedIn: false, lastSeen: null } : s));
-                    render();
+                    render('header');
                 }
                 if (action === 'set-editor') {
                     const newEditor = state.meta.editorStaffId === id ? null : id;
                     state.meta.editorStaffId = newEditor;
-                    render();
+                    render('header', 'main');
                     if (canMutate()) {
                         try { await DB.updateBulletin({ editorStaffId: newEditor }); }
                         catch(e) { console.error('Set editor failed', e); }
@@ -4721,7 +4765,7 @@
                     if (state.meta.editorStaffId !== state.myStaffId) return;
                     const newLocked = !state.meta.rundownLocked;
                     state.meta.rundownLocked = newLocked;
-                    render();
+                    render('main');
                     if (canMutate()) {
                         try { await DB.updateBulletin({ rundownLocked: newLocked }); }
                         catch(e) { console.error('Lock toggle failed', e); }
@@ -4754,7 +4798,7 @@
                 }
                 if (action === 'resolve-conflict') {
                     const { storyId, serverData, localData } = state.ui.pendingConflict;
-                    if (val === 'overwrite') { stopLockRefresh(); localData.rev = serverData.rev; state.ui.pendingConflict = null; saveStory(storyId, localData); } else { state.ui.pendingConflict = null; state.ui.editingStoryId = null; stopLockRefresh(); unlockStory(storyId); render(); }
+                    if (val === 'overwrite') { stopLockRefresh(); localData.rev = serverData.rev; state.ui.pendingConflict = null; saveStory(storyId, localData); } else { state.ui.pendingConflict = null; state.ui.editingStoryId = null; stopLockRefresh(); unlockStory(storyId); render('main', 'modal'); }
                 }
                 if (action === 'take-next') shiftActiveStory(1);
                 if (action === 'undo-take') shiftActiveStory(-1);
@@ -4776,11 +4820,11 @@
                     return;
                 }
 
-                if (action === 'presenter-font-up') { state.ui.presenter.fontScale = Math.min(state.ui.presenter.fontScale + 0.15, 2.5); render(); return; }
-                if (action === 'presenter-font-down') { state.ui.presenter.fontScale = Math.max(state.ui.presenter.fontScale - 0.15, 0.4); render(); return; }
-                if (action === 'presenter-speed-up') { state.ui.presenter.scrollSpeed = Math.min(state.ui.presenter.scrollSpeed + 5, 200); render(); return; }
-                if (action === 'presenter-speed-down') { state.ui.presenter.scrollSpeed = Math.max(state.ui.presenter.scrollSpeed - 5, 0); render(); return; }
-                if (action === 'presenter-scroll-toggle') { state.ui.presenter.autoScroll = !state.ui.presenter.autoScroll; render(); return; }
+                if (action === 'presenter-font-up') { state.ui.presenter.fontScale = Math.min(state.ui.presenter.fontScale + 0.15, 2.5); render('main'); return; }
+                if (action === 'presenter-font-down') { state.ui.presenter.fontScale = Math.max(state.ui.presenter.fontScale - 0.15, 0.4); render('main'); return; }
+                if (action === 'presenter-speed-up') { state.ui.presenter.scrollSpeed = Math.min(state.ui.presenter.scrollSpeed + 5, 200); render('main'); return; }
+                if (action === 'presenter-speed-down') { state.ui.presenter.scrollSpeed = Math.max(state.ui.presenter.scrollSpeed - 5, 0); render('main'); return; }
+                if (action === 'presenter-scroll-toggle') { state.ui.presenter.autoScroll = !state.ui.presenter.autoScroll; render('main'); return; }
                 if (action === 'presenter-find') {
                     const activeEl = document.getElementById(`presenter-story-${state.meta.activeStoryId}`);
                     if (activeEl) activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -4796,7 +4840,7 @@
                     if (next >= 0 && next < storyIds.length) {
                         state.meta.activeStoryId = storyIds[next];
                         state.ui.lastScrolledStoryId = storyIds[next];
-                        render();
+                        render('main');
                         const container = document.getElementById('main-container');
                         const target = document.getElementById(`presenter-story-${storyIds[next]}`);
                         if (container && target) {
@@ -4812,7 +4856,7 @@
                     if (id) {
                         state.ui.presenter.expandedStoryId =
                             state.ui.presenter.expandedStoryId === id ? null : id;
-                        render();
+                        render('main');
                         setTimeout(() => {
                             const el = document.getElementById(`ref-story-${id}`);
                             if (el && state.ui.presenter.expandedStoryId === id)
@@ -4825,13 +4869,13 @@
                 if (action === 'obs-disconnect') {
                     try { await obsWs.disconnect(); } catch(e) {}
                     state.ui.isSettingsModalOpen = false;
-                    render();
+                    render('modal');
                     return;
                 }
                 if (action === 'save-obs-settings') {
                     saveObsConfig();
                     state.ui.isSettingsModalOpen = false;
-                    render();
+                    render('modal');
                     obsLog('OBS settings saved. Reconnecting...', 'info');
                     connectObs();
                 }
@@ -4848,14 +4892,14 @@
                         }
                     }
                     state.ui.isSettingsModalOpen = false;
-                    render();
+                    render('modal');
                     return;
                 }
 
                 if (action === 'toggle-presenter-self-fire') {
                     state.ui.presenter.selfFireEnabled = !state.ui.presenter.selfFireEnabled;
                     localStorage.setItem('moira_presenter_self_fire', state.ui.presenter.selfFireEnabled);
-                    render();
+                    render('modal');
                     return;
                 }
                 if (action === 'presenter-fire-clip') {
@@ -4874,7 +4918,7 @@
                         state.ui.mediaFolderPendingHandle = null;
                         await idbSaveHandle(handle);
                         radioLog(`Media folder granted: "${handle.name}"`, 'success');
-                        render();
+                        render('modal');
                     } catch(e) {
                         if (e.name !== 'AbortError') radioLog(`Folder access error: ${e.message}`, 'error');
                     }
@@ -4892,7 +4936,7 @@
                             state.ui.mediaFolderPendingHandle = null;
                             await idbSaveHandle(pending);
                             radioLog(`Media folder restored: "${pending.name}"`, 'success');
-                            render();
+                            render('modal');
                         }
                     } catch(e) { radioLog(`Restore failed: ${e.message}`, 'error'); }
                     return;
@@ -4903,7 +4947,7 @@
                     state.ui.mediaFolderPendingHandle = null;
                     await idbClearHandle();
                     radioLog('Media folder access revoked.', 'info');
-                    render();
+                    render('modal');
                     return;
                 }
 
@@ -4979,7 +5023,7 @@
             document.body.addEventListener('dragend', e => {
                 const row = e.target.closest('[data-story-id]');
                 if (row) row.classList.remove('opacity-30');
-                state.ui.draggedStoryId = null; render();
+                state.ui.draggedStoryId = null; render('main');
             });
             document.body.addEventListener('dragover', e => {
                 e.preventDefault();
