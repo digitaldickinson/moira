@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Moira Newsroom System 0.1.37</title>
+    <title>Moira Newsroom System</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
@@ -302,7 +302,7 @@
             }
             localStorage.removeItem('moira_show_playout');
         }
-        const savedPlayoutBackend = localStorage.getItem('moira_playout_backend') || 'none';
+        const savedPlayoutBackend = localStorage.getItem('moira_playout_backend') || 'radio';
 
         let state = {
             mode: "newsroom", 
@@ -341,6 +341,7 @@
                 editingStoryId: null,
                 pendingConflict: null,
                 lastScrolledStoryId: null,
+                pendingScrollToStoryId: null,
                 isStaffModalOpen: false,
                 isSettingsModalOpen: false,
                 settingsTab: 'connection',
@@ -1104,6 +1105,7 @@
             };
             state.storiesMap[newId] = newStory;
             insertStoryIntoOrder(newId);
+            state.ui.pendingScrollToStoryId = newId;
             render('main');
             try { await DB.createStory(newId, newStory); }
             catch(e) { console.error('Add story failed', e); }
@@ -1128,6 +1130,7 @@
             };
             state.storiesMap[newId] = newStory;
             insertStoryIntoOrder(newId);
+            state.ui.pendingScrollToStoryId = newId;
             render('main');
             try { await DB.createStory(newId, newStory); }
             catch(e) { console.error('Add segment failed', e); }
@@ -1183,7 +1186,7 @@
             if (!canMutate()) return;
             const newStaff = mutatorFn(state.meta.staff || []);
             state.meta = { ...state.meta, staff: newStaff };
-            render('header', 'main');
+            render('header', 'main', 'modal');
             try { await DB.updateStaff(mutatorFn); }
             catch(e) { console.error('Staff update failed', e); }
         }
@@ -1543,7 +1546,12 @@
 
             if (dirty.main) {
                 const newMainContainer = document.getElementById('main-container');
-                if (state.mode === 'presenter' && state.meta.activeStoryId && state.ui.lastScrolledStoryId !== state.meta.activeStoryId) {
+                if (state.ui.pendingScrollToStoryId) {
+                    // Scroll newly added story into view
+                    const newRow = document.querySelector(`[data-story-id="${state.ui.pendingScrollToStoryId}"]`);
+                    if (newRow) newRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    state.ui.pendingScrollToStoryId = null;
+                } else if (state.mode === 'presenter' && state.meta.activeStoryId && state.ui.lastScrolledStoryId !== state.meta.activeStoryId) {
                     const presEl = document.getElementById(`presenter-story-${state.meta.activeStoryId}`);
                     if (presEl && newMainContainer) {
                         const containerRect = newMainContainer.getBoundingClientRect();
@@ -4015,7 +4023,10 @@
                             <div class="min-w-0">
                                 <div class="flex items-center gap-2 flex-wrap">
                                     <span class="font-bold text-sm ${isMe ? 'text-blue-800' : 'text-slate-800'}">${escapeHTML(s.name)}</span>
-                                    <span class="text-xs text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded font-medium">${escapeHTML(s.role)}</span>
+                                    <select data-action="change-role" data-id="${s.id}"
+                                        class="text-xs text-slate-600 bg-slate-100 border-0 rounded px-1.5 py-0.5 font-medium outline-none focus:ring-1 focus:ring-blue-400 cursor-pointer">
+                                        ${(state.meta.roles || DEFAULT_ROLES).map(r => `<option value="${r}" ${r === s.role ? 'selected' : ''}>${r}</option>`).join('')}
+                                    </select>
                                     ${isEditor ? `<span class="text-[10px] bg-amber-400 text-amber-900 px-1.5 py-0.5 rounded font-black uppercase tracking-wide">Editor</span>` : ''}
                                     ${isMe ? `<span class="text-[10px] bg-blue-200 text-blue-800 px-1.5 py-0.5 rounded font-bold italic">You</span>` : ''}
                                 </div>
@@ -4988,6 +4999,15 @@
 
             // Radio file load
             document.body.addEventListener('change', e => {
+                // Inline role change in staff modal
+                if (e.target.dataset.action === 'change-role') {
+                    const staffId = e.target.dataset.id;
+                    const newRole = e.target.value;
+                    if (staffId && newRole) {
+                        updateStaffInCloud(staff => staff.map(s => s.id === staffId ? { ...s, role: newRole } : s));
+                    }
+                    return;
+                }
                 if (!e.target.id.startsWith('radio-file-')) return;
                 const deckId  = e.target.id.replace('radio-file-', '');
                 const deckKey = deckId === 'A' ? 'deckA' : 'deckB';
