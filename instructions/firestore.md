@@ -91,7 +91,7 @@ service cloud.firestore {
 
 3. Click **Publish**.
 
-> **Why these paths?** Moira stores data under `artifacts/{appId}/public/data/` where `appId` defaults to `moira-default`. The bulletin and stories sit at the same level. Messages are a sub-collection under each bulletin so they are scoped to the correct room automatically.
+> **Why these paths?** Moira stores data under `artifacts/{appId}/public/data/` where `appId` defaults to `moira-default`. The bulletin and stories sit at the same level. Messages are a sub-collection under each bulletin, so they are scoped to the correct room automatically.
 
 ---
 
@@ -102,14 +102,14 @@ Moira reads its Firebase config from `localStorage`. The easiest way to set it i
 1. Open `moira.html` in Chrome or Edge.
 2. Click the **gear icon** (⚙) in the top-right header.
 3. The **Connection** tab is shown by default.
-4. Paste your full `firebaseConfig` object from Step 2 into the paste field — Moira will extract the individual values automatically — or fill in the four fields manually:
+4. Paste your full `firebaseConfig` object from Step 2 into the paste field — Moira will extract the individual values automatically, or fill in the four fields manually:
    - **apiKey**
    - **authDomain**
    - **projectId**
    - **storageBucket**
 5. Click **Save & Reconnect**. The page will reload and connect.
 
-Once connected the header badge will change from **Local Mode** to **Synced**.
+Once connected, the header badge will change from **Local Mode** to **Synced**.
 
 > **Alternative — hard-code the config:** If you are deploying Moira from a server and want the config baked in without any setup step, add this before the closing `</head>` tag:
 > ```html
@@ -128,7 +128,7 @@ Once connected the header badge will change from **Local Mode** to **Synced**.
 
 ## 7. Configure Message TTL (Recommended)
 
-Producer alert messages are written to the `messages` sub-collection. They are deliberately short-lived — connected clients receive them as toasts and they should not accumulate indefinitely.
+Producer alert messages are written to the `messages` sub-collection. They are deliberately short-lived — connected clients receive them as toasts, and they should not accumulate indefinitely.
 
 Set up a Firestore TTL policy to auto-delete them:
 
@@ -186,7 +186,7 @@ Moira supports multiple simultaneous newsrooms, each with their own rundown, sta
 - Any other room name is sanitised to a slug, e.g. `6PM News` → `bulletin-6pm-news`.
 - Rooms are created automatically the first time a user joins them.
 - Switch rooms using the **Newsroom** input and **Join** button in the header.
-- Staff identity is cleared on room switch — users must re-check-in in the new room.
+- Staff identity is cleared on room switch — users must check-in again in the new room.
 
 ---
 
