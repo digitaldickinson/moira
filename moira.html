@@ -3063,7 +3063,7 @@
 
             let connectionBadge = '';
             if (state.connectionState === 'connecting') connectionBadge = renderStatusBadge('Connecting', 'fa-circle-notch fa-spin', 'bg-blue-100 text-blue-800 border border-blue-200');
-            else if (state.connectionState === 'connected') connectionBadge = renderStatusBadge('Synced', 'fa-cloud-arrow-up', 'bg-emerald-100 text-emerald-800 border border-emerald-200');
+            else if (state.connectionState === 'connected') connectionBadge = `<button data-action="export-config" title="Download pre-configured Moira file for this room" class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800 border border-emerald-200 ml-1 hover:bg-emerald-200 transition-colors cursor-pointer"><i class="fa-solid fa-cloud-arrow-down"></i> Synced</button>`;
             else if (state.connectionState === 'error') connectionBadge = renderStatusBadge('Sync Error', 'fa-triangle-exclamation', 'bg-red-100 text-red-800 border border-red-200');
             else connectionBadge = renderStatusBadge('Local Mode', 'fa-hard-drive', 'bg-amber-100 text-amber-800 border border-amber-200');
 
@@ -4342,6 +4342,71 @@
          * boot(). All UI interactions flow through here to the appropriate action
          * handlers or mutator functions.
          */
+        /**
+         * Exports a self-contained, pre-configured copy of Moira as a downloadable
+         * HTML file. The Firebase config, current room name, and playout backend
+         * are baked directly into the file so recipients open a ready-to-use
+         * newsroom with no setup steps.
+         *
+         * The exported file reads its config from window.MOIRA_CONFIG (injected
+         * inline) rather than localStorage, so it works on any machine immediately.
+         */
+        function exportConfig() {
+            const configStr = localStorage.getItem('moira_firebase_config');
+            if (!configStr) {
+                alert('No Firebase config found. Connect to Firebase first before exporting.');
+                return;
+            }
+
+            let html = document.documentElement.outerHTML;
+
+            // Inject firebase config as window.MOIRA_CONFIG so the exported file
+            // works immediately without any localStorage setup on the recipient's machine.
+            // We replace the config initialisation block with a baked-in assignment.
+            // Replace the config loader block with a baked-in assignment.
+            // Using a unique marker string avoids multi-line / quote-escaping issues.
+            const _configMarker = 'let firebaseConfig = null;';
+            if (html.includes(_configMarker)) {
+                // Find and replace the full try block that follows the marker
+                const _tryStart = html.indexOf(_configMarker);
+                const _tryEnd   = html.indexOf('} catch(e) { console.error("Config error", e); }', _tryStart)
+                                + '} catch(e) { console.error("Config error", e); }'.length;
+                html = html.slice(0, _tryStart)
+                    + `let firebaseConfig = ${configStr};`
+                    + html.slice(_tryEnd);
+            }
+
+            // Bake in the current room name so the file opens to the correct room
+            html = html.replace(
+                `const savedRoomName = localStorage.getItem('moira_room_name') || 'Main';`,
+                `const savedRoomName = ${JSON.stringify(state.roomDisplayName)};`
+            );
+
+            // Bake in the current bulletin ID
+            html = html.replace(
+                `const savedBulletinId = localStorage.getItem('moira_bulletin_id') || 'bulletin-primary';`,
+                `const savedBulletinId = ${JSON.stringify(state.currentBulletinId)};`
+            );
+
+            // Bake in the current playout backend
+            html = html.replace(
+                `const savedPlayoutBackend = localStorage.getItem('moira_playout_backend') || 'radio';`,
+                `const savedPlayoutBackend = ${JSON.stringify(state.ui.playoutBackend)};`
+            );
+
+            const safeRoomName = state.roomDisplayName.toLowerCase().replace(/[^a-z0-9]/g, '-');
+            const filename = `moira-${safeRoomName}.html`;
+
+            const blob = new Blob([html], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
+        }
+
         function bindGlobalEvents() {
             // 1. UNIFIED KEYDOWN LISTENER
             document.addEventListener('keydown', async e => {
@@ -4499,6 +4564,7 @@
                 if (action === 'revert-story') { revertStory(id); return; }
                 if (action === 'clear-trash') { state.ui.trash = []; render('main'); return; }
                 if (action === 'toggle-complete') toggleStoryComplete(id);
+                if (action === 'export-config') { exportConfig(); return; }
                 if (action === 'open-settings-modal') { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'connection'; render('modal'); }
                 if (action === 'close-settings-modal') { state.ui.isSettingsModalOpen = false; state.ui.settingsTab = 'connection'; render('modal'); }
                 if (action === 'set-settings-tab') { state.ui.settingsTab = val; render('modal'); }
