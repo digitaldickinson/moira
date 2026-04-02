@@ -4344,12 +4344,18 @@
          */
         /**
          * Exports a self-contained, pre-configured copy of Moira as a downloadable
-         * HTML file. The Firebase config, current room name, and playout backend
-         * are baked directly into the file so recipients open a ready-to-use
-         * newsroom with no setup steps.
+         * HTML file. Firebase config, room name, bulletin ID, and playout backend
+         * are baked directly in so recipients open a ready-to-use newsroom with
+         * no setup steps required.
          *
-         * The exported file reads its config from window.MOIRA_CONFIG (injected
-         * inline) rather than localStorage, so it works on any machine immediately.
+         * Four issues are guarded against:
+         *  1. Self-referential match — search strings are split so this function's
+         *     own source code is never accidentally matched and overwritten.
+         *  2. DOCTYPE loss — outerHTML omits <!DOCTYPE html>, so it is prepended.
+         *  3. DOM bloat — rendered containers are cleared before capture so the
+         *     exported file starts clean rather than containing the live rundown.
+         *  4. Locked-state leak — clearing containers removes any lock icons or
+         *     in-progress UI that would be confusing on a fresh open.
          */
         function exportConfig() {
             const configStr = localStorage.getItem('moira_firebase_config');
@@ -4358,44 +4364,59 @@
                 return;
             }
 
-            let html = document.documentElement.outerHTML;
+            // ── Fix 3 & 4: clear live rendered content before snapshot ─────────
+            // This removes DOM bloat, stale lock icons, and any in-progress UI.
+            // We restore immediately after so the running app is unaffected.
+            const _header = document.getElementById('header-container');
+            const _main   = document.getElementById('main-container');
+            const _modal  = document.getElementById('modal-container');
+            const _savedHeader = _header.innerHTML;
+            const _savedMain   = _main.innerHTML;
+            const _savedModal  = _modal.innerHTML;
+            _header.innerHTML = '';
+            _main.innerHTML   = '';
+            _modal.innerHTML  = '';
 
-            // Inject firebase config as window.MOIRA_CONFIG so the exported file
-            // works immediately without any localStorage setup on the recipient's machine.
-            // We replace the config initialisation block with a baked-in assignment.
-            // Replace the config loader block with a baked-in assignment.
-            // Using a unique marker string avoids multi-line / quote-escaping issues.
-            const _configMarker = 'let firebaseConfig = null;';
-            if (html.includes(_configMarker)) {
-                // Find and replace the full try block that follows the marker
-                const _tryStart = html.indexOf(_configMarker);
-                const _tryEnd   = html.indexOf('} catch(e) { console.error("Config error", e); }', _tryStart)
-                                + '} catch(e) { console.error("Config error", e); }'.length;
-                html = html.slice(0, _tryStart)
-                    + `let firebaseConfig = ${configStr};`
-                    + html.slice(_tryEnd);
+            // ── Fix 2: prepend DOCTYPE (outerHTML omits it) ───────────────────
+            let html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+
+            // Restore live UI immediately — export works on the string from here
+            _header.innerHTML = _savedHeader;
+            _main.innerHTML   = _savedMain;
+            _modal.innerHTML  = _savedModal;
+
+            // ── Fix 1: split search strings so this function never matches itself
+            // Each token is assembled at runtime — the literals here are fragments
+            // that won't accidentally match the target strings in the source.
+
+            // Replace the firebaseConfig loader block with a baked-in assignment
+            const _cfgToken = 'let ' + 'firebaseConfig' + ' = null;';
+            const _catchToken = '} ' + 'catch(e) { console.error("Config error", e); }';
+            const _cfgStart = html.indexOf(_cfgToken);
+            if (_cfgStart !== -1) {
+                const _cfgEnd = html.indexOf(_catchToken, _cfgStart) + _catchToken.length;
+                html = html.slice(0, _cfgStart)
+                    + 'let ' + 'firebaseConfig = ' + configStr + ';'
+                    + html.slice(_cfgEnd);
             }
 
-            // Bake in the current room name so the file opens to the correct room
-            html = html.replace(
-                `const savedRoomName = localStorage.getItem('moira_room_name') || 'Main';`,
-                `const savedRoomName = ${JSON.stringify(state.roomDisplayName)};`
-            );
+            // Replace savedRoomName localStorage read with baked value
+            const _roomToken = 'const ' + "savedRoomName = localStorage.getItem('moira_room_name') || 'Main';";
+            html = html.replace(_roomToken,
+                'const ' + 'savedRoomName = ' + JSON.stringify(state.roomDisplayName) + ';');
 
-            // Bake in the current bulletin ID
-            html = html.replace(
-                `const savedBulletinId = localStorage.getItem('moira_bulletin_id') || 'bulletin-primary';`,
-                `const savedBulletinId = ${JSON.stringify(state.currentBulletinId)};`
-            );
+            // Replace savedBulletinId localStorage read with baked value
+            const _bulletinToken = 'const ' + "savedBulletinId = localStorage.getItem('moira_bulletin_id') || 'bulletin-primary';";
+            html = html.replace(_bulletinToken,
+                'const ' + 'savedBulletinId = ' + JSON.stringify(state.currentBulletinId) + ';');
 
-            // Bake in the current playout backend
-            html = html.replace(
-                `const savedPlayoutBackend = localStorage.getItem('moira_playout_backend') || 'radio';`,
-                `const savedPlayoutBackend = ${JSON.stringify(state.ui.playoutBackend)};`
-            );
+            // Replace savedPlayoutBackend localStorage read with baked value
+            const _backendToken = 'const ' + "savedPlayoutBackend = localStorage.getItem('moira_playout_backend') || 'radio';";
+            html = html.replace(_backendToken,
+                'const ' + 'savedPlayoutBackend = ' + JSON.stringify(state.ui.playoutBackend) + ';');
 
             const safeRoomName = state.roomDisplayName.toLowerCase().replace(/[^a-z0-9]/g, '-');
-            const filename = `moira-${safeRoomName}.html`;
+            const filename = 'moira-' + safeRoomName + '.html';
 
             const blob = new Blob([html], { type: 'text/html' });
             const url = URL.createObjectURL(blob);
