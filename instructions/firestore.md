@@ -1,6 +1,6 @@
 # Moira — Firebase & Firestore Setup Guide
 
-This guide covers everything needed to connect Moira to Firebase for real-time multi-user sync, cross-device producer alerts, and persistent rundown storage.
+This guide will help you set up the "Invisible Server" that allows your reporters to collaborate in a real-time digital newsroom. Once configured, they can participate using any machine connected to the internet.
 
 ---
 
@@ -33,7 +33,7 @@ const firebaseConfig = {
 };
 ```
 
-6. Copy this — you'll need it in [Step 6](#6-connect-moira-to-firebase).
+6. **Copy this now!** — you'll need it in [Step 6](#6-connect-moira-to-firebase).
 
 ---
 
