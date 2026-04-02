@@ -83,7 +83,7 @@
         // ==========================================
         const DEFAULT_FORMATS = ["READ", "WRAP", "VOICER", "CLIP", "OOV", "ULAY", "OOV/CLIP", "ULAY/CLIP", "OVO", "FLOAT", "LIVE"];
         const DEFAULT_ROLES = ["Producer", "Reporter", "Presenter"];
-        const STALE_LOCK_MS = 1000 * 10; // 10 Seconds
+        const STALE_LOCK_MS = 1000 * 10; // 10 seconds — heartbeat refreshes every 5s while editor is open
         // PPM constants — EBU Type II ballistics
         const PPM_SEGMENTS       = 24;
         const PPM_DB_MIN         = -36;
@@ -137,6 +137,25 @@
         
         let app, auth, db;
         let txTimerInterval = null;
+        let lockRefreshInterval = null;  // keeps lockedAt current while editor is open
+
+        function startLockRefresh(id) {
+            stopLockRefresh();
+            lockRefreshInterval = setInterval(async () => {
+                // Only refresh if we still own the lock and the modal is still open
+                if (state.ui.editingStoryId !== id) { stopLockRefresh(); return; }
+                const story = state.storiesMap[id];
+                if (!story || story.lockedBySession !== state.sessionId) { stopLockRefresh(); return; }
+                const now = Date.now();
+                if (state.storiesMap[id]) state.storiesMap[id].lockedAt = now;
+                try { await DB.updateStory(id, { lockedAt: now }); }
+                catch(e) { /* non-fatal — lock will go stale naturally if writes fail */ }
+            }, 5000);
+        }
+
+        function stopLockRefresh() {
+            if (lockRefreshInterval) { clearInterval(lockRefreshInterval); lockRefreshInterval = null; }
+        }
 
         // Captured once at page load — used to filter the messages listener so we
         // only receive messages sent after this client connected, not historical ones.
@@ -154,9 +173,25 @@
         function releaseWakeLock() {
             if (wakeLock) { wakeLock.release(); wakeLock = null; }
         }
-        // Re-acquire after tab becomes visible again (browser releases it on hide)
+        // visibilitychange — two behaviours:
+        // 1. Re-acquire wake lock when tab returns to foreground during TX.
+        // 2. Release story edit lock when tab goes to background — the editor is
+        //    no longer active and the heartbeat will stop, so releasing immediately
+        //    prevents a ghost lock from blocking other users. Note: the user will
+        //    need to re-open the story on return if they want to continue editing.
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible' && state.meta.isTXMode) acquireWakeLock();
+            if (document.visibilityState === 'visible') {
+                if (state.meta.isTXMode) acquireWakeLock();
+            } else {
+                // Tab hidden — stop heartbeat and release lock if held
+                if (state.ui.editingStoryId) {
+                    stopLockRefresh();
+                    const editingId = state.ui.editingStoryId;
+                    state.ui.editingStoryId = null;
+                    unlockStory(editingId);
+                    render();
+                }
+            }
         });
 
         // ── INDEXEDDB — media folder handle persistence ────────────────────────
@@ -441,6 +476,7 @@
                     onAuthStateChanged(auth, user => {
                         if (user) {
                             state.localMode = false;
+                            DB = DB_FIREBASE;
                             seedCloudIfEmpty().then(() => setupListeners());
                         } else {
                             state.connectionState = 'offline';
@@ -527,34 +563,10 @@
         }
 
         async function seedCloudIfEmpty() {
-            if (!canMutate() || state.localMode) return;
-            const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
-            try {
-                await runTransaction(db, async (transaction) => {
-                    const docSnap = await transaction.get(bullRef);
-                    if (docSnap.exists()) return; 
-
-                    const firstStoryId = crypto.randomUUID();
-                    const firstStoryRef = doc(db, ...paths.stories, firstStoryId);
-                    transaction.set(bullRef, { ...INITIAL_META, order: [firstStoryId, 'marker-line'] });
-                    transaction.set(firstStoryRef, {
-                        bulletinId: state.currentBulletinId,
-                        slug: "TOP STORY",
-                        script: `Good evening. Welcome to the news from ${state.roomDisplayName}...`,
-                        format: "OVO",
-                        presenterId: "",
-                        reporterId: "",
-                        mediaFile: "",
-                        duration: 30,
-                        completed: false,
-                        lockedBySession: null,
-                        lockedByName: null,
-                        lockedAt: null,
-                        rev: 1
-                    });
-                });
-            } catch(e) { 
-                console.error("Cloud seed failed", e); 
+            if (state.localMode) return;
+            try { await DB.seed(); }
+            catch(e) {
+                console.error('Cloud seed failed', e);
                 state.connectionState = 'error';
                 render();
             }
@@ -563,9 +575,7 @@
         // ==========================================
         // 4. DATA SYNCHRONIZATION
         // ==========================================
-        let unsubBulletin = null;
-        let unsubStories = null;
-        let unsubMessages = null;
+
 
         /**
          * Attaches Firestore real-time listeners for the current bulletin document
@@ -573,19 +583,21 @@
          * Old listeners are unsubscribed before new ones are attached, making this
          * safe to call again after a room switch.
          */
+        // Single unsub handle returned by DB.subscribe — tears down all three listeners at once
+        let unsubAll = null;
+
         function setupListeners() {
             if (!canMutate() || state.localMode) return;
+            if (unsubAll) { unsubAll(); unsubAll = null; }
 
-            if (unsubBulletin) unsubBulletin();
-            if (unsubStories) unsubStories();
-            if (unsubMessages) unsubMessages();
-
-            unsubBulletin = onSnapshot(doc(db, ...paths.bulletins, state.currentBulletinId), 
-                (docSnap) => {
+            unsubAll = DB.subscribe(
+                // onBulletin
+                (data, err) => {
+                    if (err) { state.connectionState = 'error'; render(); return; }
                     state.connectionState = 'connected';
-                    if (docSnap.exists()) {
-                        const incoming = { ...INITIAL_META, ...docSnap.data() };
-                        // If director issued a remote stop and this client has the clip playing, honour it
+                    if (data) {
+                        const incoming = { ...INITIAL_META, ...data };
+                        // Remote stop command from director — honour it if we're playing
                         if (incoming.presenterClipCommand === 'stop' && state.ui.presenter.playingClipStoryId) {
                             _stopPresenterCountdown();
                             if (state.ui.presenter.clipAudio) {
@@ -595,61 +607,264 @@
                                 state.ui.presenter.clipAudio = null;
                             }
                             state.ui.presenter.playingClipStoryId = null;
-                            // Acknowledge: clear command and playing state in Firebase
                             updateBulletinMeta({ presenterClipCommand: null, presenterClipStoryId: null });
                         }
                         state.meta = incoming;
                     }
                     render();
                 },
-                (err) => { state.connectionState = 'error'; render(); }
-            );
-
-            // Scoped listener per current room ID
-            const storiesQuery = query(
-                collection(db, ...paths.stories),
-                where("bulletinId", "==", state.currentBulletinId)
-            );
-
-            unsubStories = onSnapshot(storiesQuery, 
-                (querySnapshot) => {
+                // onStories
+                (changes, err) => {
+                    if (err) { state.connectionState = 'error'; render(); return; }
                     const newMap = { ...state.storiesMap };
-                    querySnapshot.docChanges().forEach((change) => {
-                        const data = change.doc.data();
-                        if (change.type === "removed") delete newMap[change.doc.id];
-                        else newMap[change.doc.id] = data;
+                    changes.forEach(({ type, id, data }) => {
+                        if (type === 'removed') delete newMap[id];
+                        else newMap[id] = data;
                     });
                     state.storiesMap = newMap;
                     render();
                 },
-                (err) => { state.connectionState = 'error'; render(); }
-            );
-
-            // ── MESSAGES LISTENER ──────────────────────────────────────────
-            // Sub-collection of the bulletin. Only receives documents created
-            // after this session started — ignores all historical messages.
-            // NOTE: Configure a Firestore TTL policy in the Firebase Console on
-            // the `timestamp` field (e.g. 10 minutes) to auto-delete old docs.
-            const messagesRef = collection(
-                db, ...paths.bulletins, state.currentBulletinId, 'messages'
-            );
-            const messagesQuery = query(
-                messagesRef,
-                where('timestamp', '>', Timestamp.fromDate(SESSION_START)),
-                orderBy('timestamp', 'asc')
-            );
-            unsubMessages = onSnapshot(messagesQuery,
-                (snapshot) => {
-                    snapshot.docChanges().forEach(change => {
-                        if (change.type === 'added') {
-                            const d = change.doc.data();
-                            showToast(d.senderName || 'Unknown', d.text || '');
-                        }
-                    });
-                },
-                (err) => console.warn('Messages listener error:', err)
+                // onMessages
+                (messages) => {
+                    messages.forEach(d => showToast(d.senderName || 'Unknown', d.text || ''));
+                }
             );
         }
+
+        // ==========================================
+        // 4b. DB ADAPTER
+        // ==========================================
+        /**
+         * Platform-agnostic data layer. All mutators call DB.* instead of the
+         * Firebase SDK directly. To port to a new backend (e.g. PocketBase),
+         * replace this object with an implementation of the same interface.
+         *
+         * Local mode: DB is set to DB_NULL (all methods no-op) in boot().
+         * Cloud mode: DB is set to DB_FIREBASE after auth succeeds.
+         *
+         * Convention: mutators update state optimistically first, then call DB.*
+         * which persists to the backend. The adapter never touches state directly.
+         */
+
+        // ── NULL ADAPTER — used in local / offline mode ────────────────────────
+        const DB_NULL = {
+            seed:                async ()           => {},
+            subscribe:                 ()           => () => {},
+            updateBulletin:      async ()           => {},
+            updateBulletinOrder: async ()           => {},
+            updateStaff:         async ()           => {},
+            updateStory:         async ()           => {},
+            createStory:         async ()           => {},
+            deleteStory:         async ()           => {},
+            restoreStory:        async ()           => {},
+            saveStory:           async ()           => 'ok',
+            lockStory:           async ()           => {},
+            saveSlug:            async ()           => {},
+            takeLock:            async ()           => {},
+            sendMessage:         async ()           => {},
+        };
+
+        // ── FIREBASE ADAPTER ───────────────────────────────────────────────────
+        const DB_FIREBASE = {
+
+            // Seed the bulletin with a starter story if it doesn't exist yet
+            seed: async () => {
+                const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+                await runTransaction(db, async (transaction) => {
+                    const docSnap = await transaction.get(bullRef);
+                    if (docSnap.exists()) return;
+                    const firstStoryId = crypto.randomUUID();
+                    const firstStoryRef = doc(db, ...paths.stories, firstStoryId);
+                    transaction.set(bullRef, { ...INITIAL_META, order: [firstStoryId, 'marker-line'] });
+                    transaction.set(firstStoryRef, {
+                        bulletinId: state.currentBulletinId,
+                        slug: 'TOP STORY',
+                        script: `Good evening. Welcome to the news from ${state.roomDisplayName}...`,
+                        format: 'OVO', presenterId: '', reporterId: '', mediaFile: '',
+                        duration: 30, completed: false,
+                        lockedBySession: null, lockedByName: null, lockedAt: null, rev: 1
+                    });
+                });
+            },
+
+            // Attach all three real-time listeners. Returns a single teardown fn.
+            subscribe: (onBulletin, onStories, onMessages) => {
+                const unsubB = onSnapshot(
+                    doc(db, ...paths.bulletins, state.currentBulletinId),
+                    (snap) => onBulletin(snap.exists() ? snap.data() : null),
+                    (err) => onBulletin(null, err)
+                );
+                const storiesQuery = query(
+                    collection(db, ...paths.stories),
+                    where('bulletinId', '==', state.currentBulletinId)
+                );
+                const unsubS = onSnapshot(
+                    storiesQuery,
+                    (snap) => onStories(snap.docChanges().map(c => ({ type: c.type, id: c.doc.id, data: c.doc.data() }))),
+                    (err) => onStories([], err)
+                );
+                const messagesRef = collection(db, ...paths.bulletins, state.currentBulletinId, 'messages');
+                const messagesQuery = query(
+                    messagesRef,
+                    where('timestamp', '>', Timestamp.fromDate(SESSION_START)),
+                    orderBy('timestamp', 'asc')
+                );
+                const unsubM = onSnapshot(
+                    messagesQuery,
+                    (snap) => onMessages(snap.docChanges().filter(c => c.type === 'added').map(c => c.doc.data())),
+                    (err) => console.warn('Messages listener error:', err)
+                );
+                return () => { unsubB(); unsubS(); unsubM(); };
+            },
+
+            // Merge partial update into the bulletin document
+            updateBulletin: async (updates) => {
+                await updateDoc(doc(db, ...paths.bulletins, state.currentBulletinId), updates);
+            },
+
+            // Atomic read-modify-write on bulletin order.
+            // mutateFn receives the current order array and returns the new one.
+            updateBulletinOrder: async (mutateFn) => {
+                const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+                await runTransaction(db, async (t) => {
+                    const snap = await t.get(bullRef);
+                    if (!snap.exists()) return;
+                    t.update(bullRef, { order: mutateFn(snap.data().order || []) });
+                });
+            },
+
+            // Atomic read-modify-write on the staff array.
+            // mutateFn receives the current staff array and returns the new one.
+            updateStaff: async (mutateFn) => {
+                const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+                await runTransaction(db, async (t) => {
+                    const snap = await t.get(bullRef);
+                    if (snap.exists()) t.update(bullRef, { staff: mutateFn(snap.data().staff || []) });
+                });
+            },
+
+            // Simple partial update on a story document
+            updateStory: async (id, data) => {
+                await updateDoc(doc(db, ...paths.stories, id), data);
+            },
+
+            // Atomic: set story document + splice id into bulletin order before marker-line
+            createStory: async (id, storyData) => {
+                const storyRef = doc(db, ...paths.stories, id);
+                const bullRef  = doc(db, ...paths.bulletins, state.currentBulletinId);
+                await runTransaction(db, async (t) => {
+                    const bullSnap = await t.get(bullRef);
+                    if (!bullSnap.exists()) throw new Error('Bulletin missing');
+                    const order = [...(bullSnap.data().order || [])];
+                    const markerIdx = order.indexOf('marker-line');
+                    if (markerIdx > -1) order.splice(markerIdx, 0, id);
+                    else order.push(id, 'marker-line');
+                    t.set(storyRef, storyData);
+                    t.update(bullRef, { order });
+                });
+            },
+
+            // Atomic: delete story document + remove id from bulletin order
+            deleteStory: async (id) => {
+                const storyRef = doc(db, ...paths.stories, id);
+                const bullRef  = doc(db, ...paths.bulletins, state.currentBulletinId);
+                await runTransaction(db, async (t) => {
+                    const bullSnap = await t.get(bullRef);
+                    if (!bullSnap.exists()) return;
+                    const order = bullSnap.data().order.filter(i => i !== id);
+                    t.delete(storyRef);
+                    t.update(bullRef, { order });
+                });
+            },
+
+            // Atomic: re-create story document + splice back into bulletin order at insertAt
+            restoreStory: async (id, storyData, insertAt) => {
+                const storyRef = doc(db, ...paths.stories, id);
+                const bullRef  = doc(db, ...paths.bulletins, state.currentBulletinId);
+                await runTransaction(db, async (t) => {
+                    const bullSnap = await t.get(bullRef);
+                    if (!bullSnap.exists()) throw new Error('Bulletin missing');
+                    const order = [...(bullSnap.data().order || [])];
+                    order.splice(Math.min(insertAt, order.length), 0, id);
+                    t.set(storyRef, storyData);
+                    t.update(bullRef, { order });
+                });
+            },
+
+            // Atomic save with optimistic-concurrency rev check.
+            // Returns 'conflict' if server rev has advanced, 'ok' on success.
+            saveStory: async (id, data) => {
+                const storyRef = doc(db, ...paths.stories, id);
+                try {
+                    await runTransaction(db, async (t) => {
+                        const snap = await t.get(storyRef);
+                        if (!snap.exists()) throw new Error('Story missing');
+                        const serverData = snap.data();
+                        if (serverData.rev !== data.rev) {
+                            state.ui.pendingConflict = { storyId: id, serverData, localData: data };
+                            throw new Error('Revision conflict');
+                        }
+                        data.rev = serverData.rev + 1;
+                        t.update(storyRef, { ...data, lockedBySession: null, lockedByName: null, lockedAt: null });
+                    });
+                    return 'ok';
+                } catch(e) {
+                    if (e.message === 'Revision conflict') return 'conflict';
+                    throw e;
+                }
+            },
+
+            // Atomic stale-safe lock acquisition
+            lockStory: async (id, sessionId, userName, now) => {
+                const storyRef = doc(db, ...paths.stories, id);
+                await runTransaction(db, async (t) => {
+                    const snap = await t.get(storyRef);
+                    if (!snap.exists()) return;
+                    const data = snap.data();
+                    const isStale = data.lockedAt && (now - data.lockedAt > STALE_LOCK_MS);
+                    if (!data.lockedBySession || isStale) {
+                        t.update(storyRef, { lockedBySession: sessionId, lockedByName: userName, lockedAt: now });
+                    }
+                });
+            },
+
+            // Atomic: save slug + release lock in one transaction
+            saveSlug: async (id, slug, sessionId) => {
+                const storyRef = doc(db, ...paths.stories, id);
+                await runTransaction(db, async (t) => {
+                    const snap = await t.get(storyRef);
+                    if (!snap.exists()) throw new Error('Story missing');
+                    const data = snap.data();
+                    if (data.lockedBySession && data.lockedBySession !== sessionId) throw new Error('Lock mismatch');
+                    t.update(storyRef, { slug, rev: data.rev + 1, lockedBySession: null, lockedByName: null, lockedAt: null });
+                });
+            },
+
+            // Atomic: force-acquire lock (used in take-over-edit)
+            takeLock: async (id, sessionId, userName, now) => {
+                const storyRef = doc(db, ...paths.stories, id);
+                await runTransaction(db, async (t) => {
+                    const snap = await t.get(storyRef);
+                    if (!snap.exists()) throw new Error('Story missing');
+                    const data = snap.data();
+                    const isStale = data.lockedAt && (now - data.lockedAt > STALE_LOCK_MS);
+                    if (!data.lockedBySession || isStale || data.lockedBySession === sessionId) {
+                        t.update(storyRef, { lockedBySession: sessionId, lockedByName: userName, lockedAt: now });
+                    } else {
+                        throw new Error('Lock held by another session');
+                    }
+                });
+            },
+
+            // Write a volatile message to the bulletin's messages sub-collection
+            sendMessage: async (senderName, text) => {
+                const messagesRef = collection(db, ...paths.bulletins, state.currentBulletinId, 'messages');
+                await addDoc(messagesRef, { senderName, text, timestamp: serverTimestamp() });
+            },
+        };
+
+        // Active adapter — swapped in boot() based on mode
+        let DB = DB_NULL;
 
         // ==========================================
         // 5. CORE ACTIONS (Mutators)
@@ -664,26 +879,23 @@
             if (!canMutate()) return;
             const userName = getMyName();
             const now = Date.now();
-            // Optimistic local update — both modes, so render() sees the lock immediately
-            if (state.storiesMap[id]) {
+            const existing = state.storiesMap[id];
+            // Only apply the optimistic update if the story is not already freshly
+            // locked by another session. If it is, leave local state intact — the
+            // snapshot already has the correct lock data and the DB transaction will
+            // correctly reject our attempt. Overwriting would hide the lock banner.
+            const heldByOther = existing?.lockedBySession &&
+                existing.lockedBySession !== state.sessionId &&
+                existing.lockedAt && (now - existing.lockedAt <= STALE_LOCK_MS);
+
+            if (!heldByOther && existing) {
                 state.storiesMap[id].lockedBySession = state.sessionId;
                 state.storiesMap[id].lockedByName = userName;
                 state.storiesMap[id].lockedAt = now;
             }
             render();
-            if (state.localMode) return;
-            try {
-                const storyRef = doc(db, ...paths.stories, id);
-                await runTransaction(db, async (transaction) => {
-                    const snap = await transaction.get(storyRef);
-                    if (!snap.exists()) return;
-                    const data = snap.data();
-                    const isStale = data.lockedAt && (now - data.lockedAt > STALE_LOCK_MS);
-                    if (!data.lockedBySession || isStale) {
-                        transaction.update(storyRef, { lockedBySession: state.sessionId, lockedByName: userName, lockedAt: now });
-                    }
-                });
-            } catch(e) { console.error("Lock failed", e); }
+            try { await DB.lockStory(id, state.sessionId, userName, now); }
+            catch(e) { console.error('Lock failed', e); }
         }
 
         /**
@@ -695,19 +907,14 @@
             if (!canMutate()) return;
             const story = state.storiesMap[id];
             if (!story || story.lockedBySession !== state.sessionId) return;
-
-            if (state.localMode) {
-                if (state.storiesMap[id]) {
-                    state.storiesMap[id].lockedBySession = null;
-                    state.storiesMap[id].lockedByName = null;
-                    state.storiesMap[id].lockedAt = null;
-                }
-                render();
-                return;
+            if (state.storiesMap[id]) {
+                state.storiesMap[id].lockedBySession = null;
+                state.storiesMap[id].lockedByName = null;
+                state.storiesMap[id].lockedAt = null;
             }
-            try {
-                await updateDoc(doc(db, ...paths.stories, id), { lockedBySession: null, lockedByName: null, lockedAt: null });
-            } catch(e) { console.error("Unlock failed", e); }
+            render();
+            try { await DB.updateStory(id, { lockedBySession: null, lockedByName: null, lockedAt: null }); }
+            catch(e) { console.error('Unlock failed', e); }
         }
 
         /**
@@ -720,78 +927,52 @@
          * @param {object} newData - Fields to merge, must include current rev.
          */
         async function saveStory(id, newData) {
-            // Snapshot the current version before overwriting (enables revert)
-            if (state.storiesMap[id]) {
-                state.ui.storySnapshots[id] = { ...state.storiesMap[id] };
-            }
-            if (state.localMode) {
-                newData.rev = (state.storiesMap[id]?.rev || 0) + 1;
-                state.storiesMap[id] = { ...state.storiesMap[id], ...newData };
-                state.ui.editingStoryId = null;
-                render();
-                return;
-            }
             if (!canMutate()) return;
-            const storyRef = doc(db, ...paths.stories, id);
+            if (state.storiesMap[id]) state.ui.storySnapshots[id] = { ...state.storiesMap[id] };
+            // Preserve the original rev for the conflict check in the adapter,
+            // then bump locally for the optimistic state update.
+            const originalRev = newData.rev;
+            newData.rev = (state.storiesMap[id]?.rev || 0) + 1;
+            state.storiesMap[id] = { ...state.storiesMap[id], ...newData };
+            state.ui.editingStoryId = null;
+            render();
             try {
-                await runTransaction(db, async (transaction) => {
-                    const docSnap = await transaction.get(storyRef);
-                    if (!docSnap.exists()) throw "Story missing";
-                    const serverData = docSnap.data();
-                    if (serverData.rev !== newData.rev) {
-                        state.ui.pendingConflict = { storyId: id, serverData, localData: newData };
-                        throw "Revision conflict";
-                    }
-                    newData.rev = serverData.rev + 1;
-                    transaction.update(storyRef, { ...newData, lockedBySession: null, lockedByName: null, lockedAt: null });
-                });
-                state.ui.editingStoryId = null;
-            } catch(e) {
-                if (e === "Revision conflict") render();
-                else console.error("Save failed", e);
-            }
+                // Pass original rev so adapter can compare against server rev correctly
+                const result = await DB.saveStory(id, { ...newData, rev: originalRev });
+                if (result === 'conflict') render();
+            } catch(e) { console.error('Save failed', e); }
         }
 
         async function toggleStoryComplete(id) {
             if (!canMutate()) return;
             const current = state.storiesMap[id]?.completed;
-            // Cycle: null/false → 'needs-checking' (yellow) → 'checked-ok' (green) → 'checked-needs-work' (red) → null
             const nextState = (!current || current === false || current === null)
                 ? 'needs-checking'
                 : current === 'needs-checking' ? 'checked-ok'
                 : current === 'checked-ok' ? 'checked-needs-work'
                 : null;
-            if (state.localMode) {
-                state.storiesMap[id].completed = nextState;
-                render();
-                return;
-            }
-            try {
-                await updateDoc(doc(db, ...paths.stories, id), { completed: nextState });
-            } catch(e) { console.error("Toggle failed", e); }
+            state.storiesMap[id].completed = nextState;
+            render();
+            try { await DB.updateStory(id, { completed: nextState }); }
+            catch(e) { console.error('Toggle failed', e); }
         }
 
         async function reorderStory(draggedId, targetId) {
-            if (state.localMode) {
-                let order = state.meta.order.filter(id => id !== draggedId);
-                const targetIdx = order.indexOf(targetId);
-                order.splice(targetIdx !== -1 ? targetIdx : order.length, 0, draggedId);
-                state.meta.order = order;
-                render();
-                return;
-            }
             if (!canMutate()) return;
-            const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
+            // Optimistic update
+            let order = state.meta.order.filter(id => id !== draggedId);
+            const targetIdx = order.indexOf(targetId);
+            order.splice(targetIdx !== -1 ? targetIdx : order.length, 0, draggedId);
+            state.meta.order = order;
+            render();
             try {
-                await runTransaction(db, async (transaction) => {
-                    const snap = await transaction.get(bullRef);
-                    if (!snap.exists()) return;
-                    let order = snap.data().order.filter(id => id !== draggedId);
-                    const targetIdx = order.indexOf(targetId);
-                    order.splice(targetIdx !== -1 ? targetIdx : order.length, 0, draggedId);
-                    transaction.update(bullRef, { order });
+                await DB.updateBulletinOrder(current => {
+                    let o = current.filter(id => id !== draggedId);
+                    const idx = o.indexOf(targetId);
+                    o.splice(idx !== -1 ? idx : o.length, 0, draggedId);
+                    return o;
                 });
-            } catch(e) { console.error("Reorder failed", e); }
+            } catch(e) { console.error('Reorder failed', e); }
         }
 
         /**
@@ -801,15 +982,11 @@
          * @param {object} updates - Key/value pairs to merge into bulletin meta.
          */
         async function updateBulletinMeta(updates) {
-            if (state.localMode) {
-                state.meta = { ...state.meta, ...updates };
-                render();
-                return;
-            }
             if (!canMutate()) return;
-            try {
-                await updateDoc(doc(db, ...paths.bulletins, state.currentBulletinId), updates);
-            } catch(e) { console.error("Bulletin update failed", e); }
+            state.meta = { ...state.meta, ...updates };
+            render();
+            try { await DB.updateBulletin(updates); }
+            catch(e) { console.error('Bulletin update failed', e); }
         }
 
       /**
@@ -850,14 +1027,10 @@
                 );
             }
 
-            if (state.localMode) {
-                state.meta = { ...state.meta, ...updates };
-                render();
-            } else {
-                try {
-                    await updateDoc(doc(db, ...paths.bulletins, state.currentBulletinId), updates);
-                } catch(e) { console.error('Mode update failed', e); }
-            }
+            state.meta = { ...state.meta, ...updates };
+            render();
+            try { await DB.updateBulletin(updates); }
+            catch(e) { console.error('Mode update failed', e); }
 
             // Prime playout on TX start and on standby (entering Studio view)
             if (targetMode === 'tx' || targetMode === 'standby') {
@@ -906,15 +1079,11 @@
                 activeStoryStartedAt: nextId ? Date.now() : null
             };
 
-            if (state.localMode) {
-                state.meta.activeStoryId = nextId;
-                state.meta.activeStoryStartedAt = updates.activeStoryStartedAt;
-                render();
-            } else {
-                try {
-                    await updateDoc(doc(db, ...paths.bulletins, state.currentBulletinId), updates);
-                } catch(e) { console.error('Shift failed', e); }
-            }
+            state.meta.activeStoryId = nextId;
+            state.meta.activeStoryStartedAt = updates.activeStoryStartedAt;
+            render();
+            try { await DB.updateBulletin(updates); }
+            catch(e) { console.error('Shift failed', e); }
 
             // Sync playout decks to the new active story position
             await syncPlayoutToActive(nextId);
@@ -924,49 +1093,20 @@
 
         async function addStory() {
             if (!canMutate()) return;
-
             const newId = crypto.randomUUID();
             const newStory = {
                 bulletinId: state.currentBulletinId,
-                slug: "NEW STORY",
-                script: "",
-                format: (state.meta.formats?.[0]) || "READ",
-                presenterId: "",
-                reporterId: "",
-                mediaFile: "",
-                duration: 10,
-                isFloated: false,
-                completed: false,
-                lockedBySession: null,
-                lockedByName: null,
-                lockedAt: null,
-                rev: 1
+                slug: 'NEW STORY', script: '',
+                format: (state.meta.formats?.[0]) || 'READ',
+                presenterId: '', reporterId: '', mediaFile: '',
+                duration: 10, isFloated: false, completed: false,
+                lockedBySession: null, lockedByName: null, lockedAt: null, rev: 1
             };
-
-            if (state.localMode) {
-                state.storiesMap[newId] = newStory;
-                insertStoryIntoOrder(newId);
-                render();
-                return;
-            }
-
-            const storyRef = doc(db, ...paths.stories, newId);
-            const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
-
-            try {
-                await runTransaction(db, async (transaction) => {
-                    const bullDoc = await transaction.get(bullRef);
-                    if (!bullDoc.exists()) throw "Bulletin missing";
-                    
-                    let newOrder = [...(bullDoc.data().order || [])];
-                    const markerIdx = newOrder.indexOf('marker-line');
-                    if (markerIdx > -1) newOrder.splice(markerIdx, 0, newId);
-                    else newOrder.push(newId, 'marker-line');
-
-                    transaction.set(storyRef, newStory);
-                    transaction.update(bullRef, { order: newOrder });
-                });
-            } catch(e) { console.error("Add story failed:", e); }
+            state.storiesMap[newId] = newStory;
+            insertStoryIntoOrder(newId);
+            render();
+            try { await DB.createStory(newId, newStory); }
+            catch(e) { console.error('Add story failed', e); }
         }
 
 
@@ -981,81 +1121,40 @@
             const newId = crypto.randomUUID();
             const newStory = {
                 id: newId, bulletinId: state.currentBulletinId,
-                type: 'segment',
-                slug: 'BREAK', duration: 0,
-                rev: 1,
+                type: 'segment', slug: 'BREAK', duration: 0, rev: 1,
                 completed: false, isFloated: false,
                 lockedBySession: null, lockedByName: null, lockedAt: null,
-                // Unused fields kept for schema consistency
                 format: '', script: '', presenterId: '', reporterId: '', mediaFile: ''
             };
-            if (state.localMode) {
-                state.storiesMap[newId] = newStory;
-                insertStoryIntoOrder(newId);
-                render();
-                return;
-            }
-            try {
-                await runTransaction(db, async (transaction) => {
-                    const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
-                    const storyRef = doc(db, ...paths.stories, newId);
-                    const bullSnap = await transaction.get(bullRef);
-                    if (!bullSnap.exists()) throw 'Bulletin missing';
-                    const currentOrder = bullSnap.data().order || [];
-                    const newOrder = [...currentOrder];
-                    const markerIdx = newOrder.indexOf('marker-line');
-                    if (markerIdx > -1) newOrder.splice(markerIdx, 0, newId);
-                    else newOrder.push(newId, 'marker-line');
-                    transaction.set(storyRef, newStory);
-                    transaction.update(bullRef, { order: newOrder });
-                });
-            } catch(e) { console.error('Add segment failed', e); }
+            state.storiesMap[newId] = newStory;
+            insertStoryIntoOrder(newId);
+            render();
+            try { await DB.createStory(newId, newStory); }
+            catch(e) { console.error('Add segment failed', e); }
         }
 
         async function toggleFloat(id) {
             if (!canMutate()) return;
             const current = !!state.storiesMap[id]?.isFloated;
-            if (state.localMode) {
-                state.storiesMap[id].isFloated = !current;
-                render();
-                return;
-            }
-            try {
-                await updateDoc(doc(db, ...paths.stories, id), { isFloated: !current });
-            } catch(e) { console.error('Float toggle failed', e); }
+            state.storiesMap[id].isFloated = !current;
+            render();
+            try { await DB.updateStory(id, { isFloated: !current }); }
+            catch(e) { console.error('Float toggle failed', e); }
         }
 
 
 
         async function deleteStory(id) {
             if (!canMutate()) return;
-            if (!confirm("Are you sure you want to delete this story?")) return;
-
-            // Snapshot for rescue
+            if (!confirm('Are you sure you want to delete this story?')) return;
             const orderIndex = state.meta.order.indexOf(id);
             const snapshot = { id, story: { ...state.storiesMap[id] }, orderIndex, deletedAt: Date.now() };
-
-            if (state.localMode) {
-                delete state.storiesMap[id];
-                state.meta.order = state.meta.order.filter(itemId => itemId !== id);
-                state.ui.trash.unshift(snapshot);
-                render();
-                return;
-            }
-
-            const storyRef = doc(db, ...paths.stories, id);
-            const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
-
-            try {
-                await runTransaction(db, async (transaction) => {
-                    const bullDoc = await transaction.get(bullRef);
-                    if (!bullDoc.exists()) return;
-                    let order = bullDoc.data().order.filter(itemId => itemId !== id);
-                    transaction.delete(storyRef);
-                    transaction.update(bullRef, { order });
-                });
-                state.ui.trash.unshift(snapshot);
-            } catch(e) { console.error("Delete failed:", e); }
+            delete state.storiesMap[id];
+            state.meta.order = state.meta.order.filter(i => i !== id);
+            state.ui.trash.unshift(snapshot);
+            render();
+            try { await DB.deleteStory(id); }
+            catch(e) { console.error('Delete failed', e); }
         }
 
         async function rescueStory(id) {
@@ -1063,34 +1162,13 @@
             const entry = state.ui.trash.find(t => t.id === id);
             if (!entry) return;
             state.ui.trash = state.ui.trash.filter(t => t.id !== id);
-
-            const newId = id; // reuse original id
             const story = { ...entry.story };
-
-            if (state.localMode) {
-                state.storiesMap[newId] = story;
-                // Re-insert at original position if possible, otherwise append before marker
-                let order = [...state.meta.order];
-                const insertAt = Math.min(entry.orderIndex, order.length);
-                order.splice(insertAt, 0, newId);
-                state.meta.order = order;
-                render();
-                return;
-            }
-
-            const storyRef = doc(db, ...paths.stories, newId);
-            const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
-            try {
-                await runTransaction(db, async (transaction) => {
-                    const bullDoc = await transaction.get(bullRef);
-                    if (!bullDoc.exists()) throw "Bulletin missing";
-                    let order = [...(bullDoc.data().order || [])];
-                    const insertAt = Math.min(entry.orderIndex, order.length);
-                    order.splice(insertAt, 0, newId);
-                    transaction.set(storyRef, story);
-                    transaction.update(bullRef, { order });
-                });
-            } catch(e) { console.error("Rescue failed:", e); }
+            const insertAt = Math.min(entry.orderIndex, state.meta.order.length);
+            state.storiesMap[id] = story;
+            state.meta.order.splice(insertAt, 0, id);
+            render();
+            try { await DB.restoreStory(id, story, insertAt); }
+            catch(e) { console.error('Rescue failed', e); }
         }
 
         async function revertStory(id) {
@@ -1102,21 +1180,12 @@
         }
 
         async function updateStaffInCloud(mutatorFn) {
-            if (state.localMode) {
-                state.meta = { ...state.meta, staff: mutatorFn(state.meta.staff || []) };
-                render();
-                return;
-            }
             if (!canMutate()) return;
-            try {
-                await runTransaction(db, async (transaction) => {
-                    const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
-                    const docSnap = await transaction.get(bullRef);
-                    if (docSnap.exists()) {
-                        transaction.update(bullRef, { staff: mutatorFn(docSnap.data().staff || []) });
-                    }
-                });
-            } catch(e) { console.error("Staff transaction failed:", e); }
+            const newStaff = mutatorFn(state.meta.staff || []);
+            state.meta = { ...state.meta, staff: newStaff };
+            render();
+            try { await DB.updateStaff(mutatorFn); }
+            catch(e) { console.error('Staff update failed', e); }
         }
 
         // ==========================================
@@ -3066,7 +3135,7 @@
                 }
 
                 return `<tr class="${rowClasses}" data-story-id="${id}" draggable="true">
-                    <td class="px-3 py-1.5 text-center w-10 ${isRundownLocked ? 'text-slate-200 cursor-not-allowed' : 'text-slate-400 cursor-grab active:cursor-grabbing hover:text-blue-500'}"><i class="fa-solid fa-grip-vertical"></i></td>
+                    <td class="px-3 py-1.5 text-center w-10 ${(isRundownLocked || isLocked) ? 'text-slate-200 cursor-not-allowed' : 'text-slate-400 cursor-grab active:cursor-grabbing hover:text-blue-500'}" title="${isLocked ? `Locked by ${escapeHTML(story.lockedByName)}` : ''}"><i class="fa-solid fa-grip-vertical"></i></td>
                     <td class="px-3 py-1.5 font-semibold w-1/4">
                         ${isActive ? `<span class="inline-block w-2 h-2 ${state.meta.isTXMode ? 'bg-red-500' : 'bg-amber-400'} rounded-full animate-pulse mr-2"></span>` : ''}
                         ${story.mediaFile ? '<i class="fa-solid fa-photo-film text-amber-500 mr-2"></i>' : ''}
@@ -3101,7 +3170,9 @@
                         </button>
                     </td>
                     <td class="px-3 py-1.5 text-right w-20">
-                        <button data-action="edit-story" data-id="${id}" class="p-1.5 text-slate-400 hover:text-blue-600"><i class="fa-solid fa-pen text-xs"></i></button>
+                        <button data-action="edit-story" data-id="${id}"
+                            class="p-1.5 ${isLocked ? 'text-slate-200 cursor-not-allowed' : 'text-slate-400 hover:text-blue-600'} transition-colors"
+                            ${isLocked ? `disabled title="Locked by ${escapeHTML(story.lockedByName)}"` : ''}><i class="fa-solid fa-pen text-xs"></i></button>
                         ${!isRundownLocked ? `<button data-action="delete-story" data-id="${id}" class="p-1.5 text-slate-400 hover:text-red-600"><i class="fa-solid fa-trash text-xs"></i></button>` : ''}
                     </td>
                 </tr>`;
@@ -4218,7 +4289,7 @@
          */
         function bindGlobalEvents() {
             // 1. UNIFIED KEYDOWN LISTENER
-            document.addEventListener('keydown', e => {
+            document.addEventListener('keydown', async e => {
                 if (e.target && e.target.id === 'header-room-input' && e.key === 'Enter') {
                     switchRoom(e.target.value);
                     return;
@@ -4232,15 +4303,8 @@
                     if (text && _canAlert) {
                         const sentBy = getMyName();
                         updateBulletinMeta({ presenterAlert: { text, sentAt: Date.now(), sentBy } });
-                        if (!state.localMode && db) {
-                            const messagesRef = collection(
-                                db, ...paths.bulletins, state.currentBulletinId, 'messages'
-                            );
-                            addDoc(messagesRef, { senderName: sentBy, text, timestamp: serverTimestamp() })
-                                .catch(e => console.warn('Message send failed:', e));
-                        } else {
-                            showToast(sentBy, text);
-                        }
+                        try { await DB.sendMessage(sentBy, text); }
+                        catch(e) { console.warn('Message send failed:', e); showToast(sentBy, text); }
                         e.target.value = '';
                         state.ui.alertPanelOpen = false;
                         render();
@@ -4460,19 +4524,8 @@
                     // 1. Persist to bulletin for late-joining clients (existing banner behaviour)
                     updateBulletinMeta({ presenterAlert: { text, sentAt: Date.now(), sentBy } });
                     // 2. Write to messages sub-collection — fires toast on all connected clients
-                    if (!state.localMode && db) {
-                        const messagesRef = collection(
-                            db, ...paths.bulletins, state.currentBulletinId, 'messages'
-                        );
-                        addDoc(messagesRef, {
-                            senderName: sentBy,
-                            text,
-                            timestamp: serverTimestamp()
-                        }).catch(e => console.warn('Message send failed:', e));
-                    } else {
-                        // Local mode — show toast directly on this client only
-                        showToast(sentBy, text);
-                    }
+                    try { await DB.sendMessage(sentBy, text); }
+                    catch(e) { console.warn('Message send failed:', e); showToast(sentBy, text); }
                     if (input) input.value = '';
                     state.ui.alertPanelOpen = false;
                     render();
@@ -4509,7 +4562,7 @@
 
                 if (action === 'open-staff-modal') { state.ui.isStaffModalOpen = true; render(); }
                 if (action === 'close-staff-modal') { state.ui.isStaffModalOpen = false; render(); }
-                if (action === 'edit-story') { state.ui.editingStoryId = id; lockStory(id); render(); }
+                if (action === 'edit-story') { state.ui.editingStoryId = id; lockStory(id); startLockRefresh(id); render(); }
                 if (action === 'save-tx-time') {
                     const txVal = document.getElementById('tx-clock-input')?.value.trim() || '';
                     if (txVal && !/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(txVal)) {
@@ -4557,31 +4610,21 @@
                         state.ui.inlineEditingId = null;
                         const newSlug = input.value.trim();
                         if (save && !escapedOut && newSlug && newSlug !== originalSlug) {
-                            if (state.localMode) {
-                                state.storiesMap[id].slug = newSlug;
+                            // Optimistic update then persist via adapter
+                            state.storiesMap[id].slug = newSlug;
+                            render();
+                            try {
+                                await DB.saveSlug(id, newSlug, state.sessionId);
+                                // Adapter releases lock server-side; clear locally too
+                                if (state.storiesMap[id]) {
+                                    state.storiesMap[id].lockedBySession = null;
+                                    state.storiesMap[id].lockedByName = null;
+                                    state.storiesMap[id].lockedAt = null;
+                                }
+                            } catch(e) {
+                                console.error('Inline save failed', e);
                                 await unlockStory(id);
                                 render();
-                            } else {
-                                const storyRef = doc(db, ...paths.stories, id);
-                                try {
-                                    await runTransaction(db, async transaction => {
-                                        const snap = await transaction.get(storyRef);
-                                        if (!snap.exists()) throw new Error('Story missing');
-                                        const serverData = snap.data();
-                                        if (serverData.lockedBySession && serverData.lockedBySession !== state.sessionId) throw new Error('Lock mismatch');
-                                        transaction.update(storyRef, {
-                                            slug: newSlug,
-                                            rev: serverData.rev + 1,
-                                            lockedBySession: null,
-                                            lockedByName: null,
-                                            lockedAt: null
-                                        });
-                                    });
-                                } catch(e) {
-                                    console.error('Inline save failed', e);
-                                    await unlockStory(id);
-                                    render();
-                                }
                             }
                         } else {
                             await unlockStory(id);
@@ -4620,30 +4663,17 @@
                     if (!storyId) return;
                     const userName = getMyName();
                     const now = Date.now();
-                    if (state.localMode) {
+                    if (state.storiesMap[storyId]) {
                         state.storiesMap[storyId].lockedBySession = state.sessionId;
                         state.storiesMap[storyId].lockedByName = userName;
                         state.storiesMap[storyId].lockedAt = now;
-                        render();
-                    } else {
-                        try {
-                            const storyRef = doc(db, ...paths.stories, storyId);
-                            await runTransaction(db, async (t) => {
-                                const snap = await t.get(storyRef);
-                                if (!snap.exists()) throw "Story missing";
-                                const data = snap.data();
-                                const isStale = data.lockedAt && (now - data.lockedAt > STALE_LOCK_MS);
-                                if (isStale) {
-                                    t.update(storyRef, { lockedBySession: state.sessionId, lockedByName: userName, lockedAt: now });
-                                } else {
-                                    throw "Lock is still fresh";
-                                }
-                            });
-                        } catch(e) { console.error("Takeover failed:", e); }
                     }
+                    render();
+                    try { await DB.takeLock(storyId, state.sessionId, userName, now); }
+                    catch(e) { console.error('Takeover failed', e); }
                 }
 
-                if (action === 'cancel-edit') { const editingId = state.ui.editingStoryId; state.ui.editingStoryId = null; if (editingId) unlockStory(editingId); render(); }
+                if (action === 'cancel-edit') { const editingId = state.ui.editingStoryId; state.ui.editingStoryId = null; stopLockRefresh(); if (editingId) unlockStory(editingId); render(); }
 
                 if (action === 'add-staff') {
                     const nameInput = document.getElementById('new-staff-name');
@@ -4679,37 +4709,36 @@
                     render();
                 }
                 if (action === 'set-editor') {
-                    const currentEditor = state.meta.editorStaffId;
-                    const newEditor = currentEditor === id ? null : id;
-                    if (state.localMode) {
-                        state.meta.editorStaffId = newEditor;
-                        render();
-                    } else if (canMutate()) {
-                        const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
-                        await updateDoc(bullRef, { editorStaffId: newEditor });
+                    const newEditor = state.meta.editorStaffId === id ? null : id;
+                    state.meta.editorStaffId = newEditor;
+                    render();
+                    if (canMutate()) {
+                        try { await DB.updateBulletin({ editorStaffId: newEditor }); }
+                        catch(e) { console.error('Set editor failed', e); }
                     }
                 }
                 if (action === 'toggle-rundown-lock') {
-                    const isEditor = state.meta.editorStaffId === state.myStaffId;
-                    if (!isEditor) return;
+                    if (state.meta.editorStaffId !== state.myStaffId) return;
                     const newLocked = !state.meta.rundownLocked;
-                    if (state.localMode) {
-                        state.meta.rundownLocked = newLocked;
-                        render();
-                    } else if (canMutate()) {
-                        const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId);
-                        await updateDoc(bullRef, { rundownLocked: newLocked });
+                    state.meta.rundownLocked = newLocked;
+                    render();
+                    if (canMutate()) {
+                        try { await DB.updateBulletin({ rundownLocked: newLocked }); }
+                        catch(e) { console.error('Lock toggle failed', e); }
                     }
                 }
                 if (action === 'remove-staff') {
                     if (id === state.myStaffId) { state.myStaffId = null; localStorage.removeItem('moira_my_staff_id'); }
                     if (id === state.meta.editorStaffId) {
-                        if (state.localMode) { state.meta.editorStaffId = null; }
-                        else { const bullRef = doc(db, ...paths.bulletins, state.currentBulletinId); updateDoc(bullRef, { editorStaffId: null, rundownLocked: false }); }
+                        state.meta.editorStaffId = null;
+                        state.meta.rundownLocked = false;
+                        try { await DB.updateBulletin({ editorStaffId: null, rundownLocked: false }); }
+                        catch(e) { console.error('Editor clear failed', e); }
                     }
                     updateStaffInCloud(staff => staff.filter(s => s.id !== id));
                 }
                 if (action === 'save-edit') {
+                    stopLockRefresh();
                     let durStr = document.getElementById('edit-duration').value;
                     let parsedDuration = 0;
                     if (durStr.includes(':')) { const [m, s] = durStr.split(':'); parsedDuration = (parseInt(m, 10) || 0) * 60 + (parseInt(s, 10) || 0); } else { parsedDuration = parseInt(durStr, 10) || 0; }
@@ -4725,7 +4754,7 @@
                 }
                 if (action === 'resolve-conflict') {
                     const { storyId, serverData, localData } = state.ui.pendingConflict;
-                    if (val === 'overwrite') { localData.rev = serverData.rev; state.ui.pendingConflict = null; saveStory(storyId, localData); } else { state.ui.pendingConflict = null; state.ui.editingStoryId = null; unlockStory(storyId); render(); }
+                    if (val === 'overwrite') { stopLockRefresh(); localData.rev = serverData.rev; state.ui.pendingConflict = null; saveStory(storyId, localData); } else { state.ui.pendingConflict = null; state.ui.editingStoryId = null; stopLockRefresh(); unlockStory(storyId); render(); }
                 }
                 if (action === 'take-next') shiftActiveStory(1);
                 if (action === 'undo-take') shiftActiveStory(-1);
@@ -4933,7 +4962,19 @@
             document.body.addEventListener('dragstart', e => {
                 const row = e.target.closest('[data-story-id]');
                 const isRundownLocked = state.meta.rundownLocked && state.meta.editorStaffId !== state.myStaffId;
-                if (row && !isRundownLocked) { state.ui.draggedStoryId = row.getAttribute('data-story-id'); e.dataTransfer.effectAllowed = 'move'; setTimeout(() => row.classList.add('opacity-30'), 0); }
+                if (row && !isRundownLocked) {
+                    const dragStoryId = row.getAttribute('data-story-id');
+                    const dragStory = state.storiesMap[dragStoryId];
+                    const storyLockedByOther = dragStory?.lockedBySession && dragStory.lockedBySession !== state.sessionId &&
+                        dragStory.lockedAt && (Date.now() - dragStory.lockedAt <= STALE_LOCK_MS);
+                    if (!storyLockedByOther) {
+                        state.ui.draggedStoryId = dragStoryId;
+                        e.dataTransfer.effectAllowed = 'move';
+                        setTimeout(() => row.classList.add('opacity-30'), 0);
+                    } else {
+                        e.preventDefault();
+                    }
+                }
             });
             document.body.addEventListener('dragend', e => {
                 const row = e.target.closest('[data-story-id]');
@@ -4961,9 +5002,10 @@
         window.addEventListener('beforeunload', () => {
             if (txTimerInterval) clearInterval(txTimerInterval);
             if (obsTelemetryInterval) clearInterval(obsTelemetryInterval);
-            if (unsubMessages) unsubMessages();
+            if (unsubAll) { unsubAll(); unsubAll = null; }
             releaseWakeLock();
             // Release any held story lock so other users aren't blocked
+            stopLockRefresh();
             if (state.ui.editingStoryId) unlockStory(state.ui.editingStoryId);
             // Clear presenter clip state so director view doesn't show a stale badge
             if (state.meta.presenterClipStoryId) {
