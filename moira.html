@@ -62,6 +62,7 @@
         .segment-label  { font-size: 0.7rem; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase; padding: 0.4rem 1rem; white-space: nowrap; }
         .segment-dur    { font-size: 0.7rem; font-family: monospace; opacity: 0.6; padding-right: 1rem; }
         .segment-line   { flex: 1; height: 1px; background: #c7d2fe; }
+
     </style>
 </head>
 <body class="bg-gray-50 h-screen flex flex-col overflow-hidden text-slate-800">
@@ -149,7 +150,7 @@
                 const now = Date.now();
                 if (state.storiesMap[id]) state.storiesMap[id].lockedAt = now;
                 try { await DB.updateStory(id, { lockedAt: now }); }
-                catch(e) { /* non-fatal — lock will go stale naturally if writes fail */ }
+                catch(e) { console.warn('Lock refresh failed — lock may go stale:', e.message); }
             }, 5000);
         }
 
@@ -211,7 +212,10 @@
                 tx.objectStore(IDB_STORE).put(handle, IDB_KEY);
                 await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
                 db.close();
-            } catch(e) { console.warn('idbSaveHandle failed:', e); }
+            } catch(e) {
+                console.warn('idbSaveHandle failed:', e);
+                radioLog('Could not persist media folder — you may need to re-grant access on next load.', 'warn');
+            }
         }
         async function idbLoadHandle() {
             try {
@@ -361,6 +365,40 @@
         // ── INSTANT MESSAGE TOAST ──────────────────────────────────────────────
         // Injects a self-removing toast into a fixed container at the top-right.
         // Safe to call from any view — purely DOM-level, no render() needed.
+        // ── ERROR NOTIFICATION ────────────────────────────────────────────────
+        // Persistent (non-auto-dismissing) error banner. Stays visible until the
+        // operator dismisses it or the problem is resolved. Sits below the toast
+        // container so toasts and errors don't compete visually.
+        // Platform-agnostic: all adapters and engines call this with plain strings.
+        let _errorContainer = null;
+        function showError(message, actionLabel = null, actionFn = null) {
+            if (!_errorContainer) {
+                _errorContainer = document.createElement('div');
+                _errorContainer.id = 'moira-error-container';
+                _errorContainer.style.cssText = 'position:fixed;bottom:1rem;right:1rem;z-index:9998;display:flex;flex-direction:column;gap:0.5rem;pointer-events:none;max-width:26rem;';
+                document.body.appendChild(_errorContainer);
+            }
+
+            const el = document.createElement('div');
+            el.style.cssText = 'background:#1e293b;border:1px solid #ef4444;border-left:4px solid #ef4444;border-radius:0.75rem;padding:0.75rem 1rem;box-shadow:0 8px 32px rgba(0,0,0,0.5);pointer-events:auto;display:flex;flex-direction:column;gap:0.4rem;';
+            el.innerHTML = `
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem;">
+                    <span style="font-size:0.6rem;font-weight:900;color:#ef4444;text-transform:uppercase;letter-spacing:0.1em;">&#9888; Error</span>
+                    <button style="font-size:0.7rem;color:#64748b;background:none;border:none;cursor:pointer;padding:0;" onclick="this.closest('div[style]').remove()">&#10005; Dismiss</button>
+                </div>
+                <div style="font-size:0.82rem;font-weight:600;color:#f1f5f9;line-height:1.45;">${escapeHTML(message)}</div>
+                ${actionLabel && actionFn ? `<button style="margin-top:0.2rem;font-size:0.75rem;font-weight:700;color:#93c5fd;background:none;border:none;cursor:pointer;text-align:left;padding:0;text-decoration:underline;" id="moira-err-action">${escapeHTML(actionLabel)}</button>` : ''}`;
+
+            if (actionLabel && actionFn) {
+                el.querySelector('#moira-err-action').addEventListener('click', () => { el.remove(); actionFn(); });
+            }
+
+            _errorContainer.appendChild(el);
+
+            // Auto-dismiss after 20s — long enough to read and act, not permanent
+            setTimeout(() => { if (el.parentNode) el.remove(); }, 20000);
+        }
+
         let _toastContainer = null;
         function showToast(senderName, text) {
             if (!_toastContainer) {
@@ -412,7 +450,7 @@
                     state.ui.mediaFolderPendingHandle = handle;
                 }
                 // 'denied' — fall through, let user re-grant manually
-            } catch(e) { /* stale or invalid handle — ignore silently */ }
+            } catch(e) { radioLog(`Could not restore media folder handle — it may have been moved or deleted. Choose the folder again in Settings.`, 'warn'); }
         }
 
        /**
@@ -464,11 +502,18 @@
                         } else {
                             state.connectionState = 'offline';
                             render('header');
+                            showError('Signed out of Firebase — running in read-only mode. Reload to reconnect.', 'Reload', () => location.reload());
                         }
                     });
                 } catch (e) {
                     state.connectionState = 'error';
                     render('header');
+                    const msg = e.code === 'auth/invalid-api-key'
+                        ? 'Invalid Firebase API key — check your config in Settings.'
+                        : e.code === 'auth/network-request-failed'
+                            ? 'Could not reach Firebase — check your internet connection.'
+                            : `Firebase auth failed: ${e.message}`;
+                    showError(msg, 'Open Settings', () => { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'connection'; render('modal'); });
                 }
             } else {
                 seedLocalData(); 
@@ -549,7 +594,7 @@
             if (state.localMode) return;
             try { await DB.seed(); }
             catch(e) {
-                console.error('Cloud seed failed', e);
+                showError('Could not initialise newsroom — ' + DB.errorMessage(e), 'Open Settings', () => { state.ui.isSettingsModalOpen = true; render('modal'); });
                 state.connectionState = 'error';
                 render('header');
             }
@@ -576,7 +621,7 @@
             unsubAll = DB.subscribe(
                 // onBulletin
                 (data, err) => {
-                    if (err) { state.connectionState = 'error'; render('header'); return; }
+                    if (err) { state.connectionState = 'error'; render('header'); showError('Lost connection to database — changes are not saving. Reconnecting…'); return; }
                     state.connectionState = 'connected';
                     if (data) {
                         const incoming = { ...INITIAL_META, ...data };
@@ -598,7 +643,7 @@
                 },
                 // onStories
                 (changes, err) => {
-                    if (err) { state.connectionState = 'error'; render('header'); return; }
+                    if (err) { state.connectionState = 'error'; render('header'); showError('Story sync lost — check your connection.'); return; }
                     const newMap = { ...state.storiesMap };
                     changes.forEach(({ type, id, data }) => {
                         if (type === 'removed') delete newMap[id];
@@ -645,6 +690,9 @@
             saveSlug:            async ()           => {},
             takeLock:            async ()           => {},
             sendMessage:         async ()           => {},
+            // Translates a raw error into a user-safe string.
+            // Local mode never produces DB errors — passthrough only.
+            errorMessage:              (e)          => e?.message || 'Unknown error',
         };
 
         // ── FIREBASE ADAPTER ───────────────────────────────────────────────────
@@ -844,6 +892,22 @@
                 const messagesRef = collection(db, ...paths.bulletins, state.currentBulletinId, 'messages');
                 await addDoc(messagesRef, { senderName, text, timestamp: serverTimestamp() });
             },
+
+            // Translates a raw Firestore error into a user-safe string.
+            // Pi ports implement this for their own backend (PocketBase, etc.).
+            errorMessage: (e) => {
+                if (!e) return 'Unknown database error';
+                const code = e.code || '';
+                if (code === 'permission-denied')   return 'Permission denied — check your Firestore security rules';
+                if (code === 'unavailable')          return 'Database unavailable — check your internet connection';
+                if (code === 'not-found')            return 'Document not found — it may have been deleted by another user';
+                if (code === 'already-exists')       return 'Document already exists — refresh and try again';
+                if (code === 'resource-exhausted')   return 'Firestore quota exceeded — contact your administrator';
+                if (code === 'unauthenticated')      return 'Not authenticated — try reloading the page';
+                if (code === 'cancelled')            return 'Operation cancelled — try again';
+                if (code === 'deadline-exceeded')    return 'Database timeout — check your connection and try again';
+                return e.message || 'Database write failed';
+            },
         };
 
         // Active adapter — swapped in boot() based on mode
@@ -878,7 +942,7 @@
             }
             render('main', 'modal');
             try { await DB.lockStory(id, state.sessionId, userName, now); }
-            catch(e) { console.error('Lock failed', e); }
+            catch(e) { console.error('Lock failed', e); /* non-fatal — lock is optimistic */ }
         }
 
         /**
@@ -897,7 +961,7 @@
             }
             render('main', 'modal');
             try { await DB.updateStory(id, { lockedBySession: null, lockedByName: null, lockedAt: null }); }
-            catch(e) { console.error('Unlock failed', e); }
+            catch(e) { console.error('Unlock failed', e); /* non-fatal — stale lock clears automatically */ }
         }
 
         /**
@@ -923,7 +987,7 @@
                 // Pass original rev so adapter can compare against server rev correctly
                 const result = await DB.saveStory(id, { ...newData, rev: originalRev });
                 if (result === 'conflict') render('modal');
-            } catch(e) { console.error('Save failed', e); }
+            } catch(e) { showError('Story not saved — ' + DB.errorMessage(e), 'Retry', () => saveStory(id, newData)); }
         }
 
         async function toggleStoryComplete(id) {
@@ -937,7 +1001,7 @@
             state.storiesMap[id].completed = nextState;
             render('main');
             try { await DB.updateStory(id, { completed: nextState }); }
-            catch(e) { console.error('Toggle failed', e); }
+            catch(e) { console.error('Toggle failed', e); /* non-fatal */ }
         }
 
         async function reorderStory(draggedId, targetId) {
@@ -955,7 +1019,7 @@
                     o.splice(idx !== -1 ? idx : o.length, 0, draggedId);
                     return o;
                 });
-            } catch(e) { console.error('Reorder failed', e); }
+            } catch(e) { showError('Reorder failed — ' + DB.errorMessage(e)); }
         }
 
         /**
@@ -969,7 +1033,7 @@
             state.meta = { ...state.meta, ...updates };
             render();
             try { await DB.updateBulletin(updates); }
-            catch(e) { console.error('Bulletin update failed', e); }
+            catch(e) { showError('Bulletin update failed — ' + DB.errorMessage(e)); }
         }
 
       /**
@@ -1013,7 +1077,7 @@
             state.meta = { ...state.meta, ...updates };
             render('main');
             try { await DB.updateBulletin(updates); }
-            catch(e) { console.error('Mode update failed', e); }
+            catch(e) { showError('TX mode change failed — ' + DB.errorMessage(e)); }
 
             // Prime playout on TX start and on standby (entering Studio view)
             if (targetMode === 'tx' || targetMode === 'standby') {
@@ -1066,7 +1130,7 @@
             state.meta.activeStoryStartedAt = updates.activeStoryStartedAt;
             render('main');
             try { await DB.updateBulletin(updates); }
-            catch(e) { console.error('Shift failed', e); }
+            catch(e) { showError('Story advance failed — ' + DB.errorMessage(e)); }
 
             // Sync playout decks to the new active story position
             await syncPlayoutToActive(nextId);
@@ -1090,7 +1154,7 @@
             state.ui.pendingScrollToStoryId = newId;
             render('main');
             try { await DB.createStory(newId, newStory); }
-            catch(e) { console.error('Add story failed', e); }
+            catch(e) { showError('Could not save new story — ' + DB.errorMessage(e)); }
         }
 
 
@@ -1115,7 +1179,7 @@
             state.ui.pendingScrollToStoryId = newId;
             render('main');
             try { await DB.createStory(newId, newStory); }
-            catch(e) { console.error('Add segment failed', e); }
+            catch(e) { showError('Could not save new segment — ' + DB.errorMessage(e)); }
         }
 
         async function toggleFloat(id) {
@@ -1124,7 +1188,7 @@
             state.storiesMap[id].isFloated = !current;
             render('main');
             try { await DB.updateStory(id, { isFloated: !current }); }
-            catch(e) { console.error('Float toggle failed', e); }
+            catch(e) { console.error('Float toggle failed', e); /* non-fatal */ }
         }
 
 
@@ -1139,7 +1203,7 @@
             state.ui.trash.unshift(snapshot);
             render('main');
             try { await DB.deleteStory(id); }
-            catch(e) { console.error('Delete failed', e); }
+            catch(e) { showError('Could not delete story — ' + DB.errorMessage(e)); }
         }
 
         async function rescueStory(id) {
@@ -1153,7 +1217,7 @@
             state.meta.order.splice(insertAt, 0, id);
             render('main');
             try { await DB.restoreStory(id, story, insertAt); }
-            catch(e) { console.error('Rescue failed', e); }
+            catch(e) { showError('Could not restore story — ' + DB.errorMessage(e)); }
         }
 
         async function revertStory(id) {
@@ -1170,7 +1234,7 @@
             state.meta = { ...state.meta, staff: newStaff };
             render('header', 'main', 'modal');
             try { await DB.updateStaff(mutatorFn); }
-            catch(e) { console.error('Staff update failed', e); }
+            catch(e) { showError('Staff update failed — ' + DB.errorMessage(e)); }
         }
 
         // ==========================================
@@ -1352,6 +1416,11 @@
             // Load file from directory handle
             if (!state.radio.directoryHandle) {
                 radioLog('Presenter self-fire: no media folder granted.', 'warn');
+                showError(
+                    'Cannot fire clip — no media folder is set. Grant folder access in Settings.',
+                    'Open Settings',
+                    () => { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'playout'; render('modal'); }
+                );
                 return;
             }
             const file = await radioGetFileFromHandle(story.mediaFile);
@@ -1363,7 +1432,8 @@
             audio.objectUrl = objectUrl;
 
             if (state.radio.selectedSinkId && audio.setSinkId) {
-                try { await audio.setSinkId(state.radio.selectedSinkId); } catch(e) {}
+                try { await audio.setSinkId(state.radio.selectedSinkId); }
+                catch(e) { radioLog(`Audio output device unavailable: ${e.message}`, 'error'); }
             }
 
             audio.addEventListener('ended', () => {
@@ -1380,6 +1450,12 @@
             render('main');
             await audio.play().catch(e => {
                 radioLog(`Presenter clip error: ${e.message}`, 'error');
+                // showError here because the presenter may be on a tablet with no radio log visible
+                showError(
+                    e.name === 'NotAllowedError'
+                        ? 'Clip blocked by browser — tap or click anywhere on the page first, then try again.'
+                        : `Clip playback failed: ${e.message}`
+                );
                 _stopPresenterCountdown();
                 state.ui.presenter.clipAudio = null;
                 state.ui.presenter.playingClipStoryId = null;
@@ -1774,7 +1850,11 @@
             deck.audio = audio;
 
             if (state.radio.selectedSinkId && audio.setSinkId) {
-                try { await audio.setSinkId(state.radio.selectedSinkId); } catch(e) {}
+                try { await audio.setSinkId(state.radio.selectedSinkId); }
+                catch(e) {
+                    radioLog(`Audio output device unavailable — falling back to default: ${e.message}`, 'warn');
+                    showError('Selected audio output device is unavailable. Playing on default output instead.', 'Change Output', () => { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'playout'; render('modal'); });
+                }
             }
 
             // Audio graph: source → gain → destination (audible output)
@@ -1800,7 +1880,10 @@
                 audio.addEventListener('loadedmetadata', resolve, { once: true });
                 audio.addEventListener('error', () => reject(new Error(audio.error?.message || 'Load error')), { once: true });
                 setTimeout(() => reject(new Error('Timeout')), 10000);
-            }).catch(e => radioLog(`Deck ${deck.id} load error: ${e.message}`, 'error'));
+            }).catch(e => {
+                radioLog(`Deck ${deck.id} load error: ${e.message}`, 'error');
+                showError(`Deck ${deck.id} failed to load "${deck.filename || 'file'}" — ${e.message}. Check the file format and media folder.`);
+            });
 
             deck.duration = audio.duration || 0;
             audio.currentTime = 0;
@@ -1829,7 +1912,10 @@
                     radioLog(`Deck ${deck.id} — PLAYING`, 'success');
                     render('main');
                 })
-                .catch(e => radioLog(`Deck ${deck.id} play error: ${e.message}`, 'error'));
+                .catch(e => {
+                    radioLog(`Deck ${deck.id} play error: ${e.message}`, 'error');
+                    showError(`Deck ${deck.id} could not play — ${e.name === 'NotAllowedError' ? 'browser blocked autoplay. Click anywhere on the page first.' : e.message}`);
+                });
         }
 
         function radioPause(deckKey) {
@@ -1925,6 +2011,7 @@
                 radioLog(`Deck ${cuedDeck.id} — ON AIR`, 'success');
             } catch(e) {
                 radioLog(`Take failed: ${e.message}`, 'error');
+                showError(`Take failed — ${e.message}`);
                 return;
             }
 
@@ -1985,7 +2072,14 @@
                 const fileHandle = await state.radio.directoryHandle.getFileHandle(filename);
                 return await fileHandle.getFile();
             } catch(e) {
-                radioLog(`Could not find "${filename}" in media folder.`, 'warn');
+                radioLog(`Could not find "${filename}" in media folder.`, 'error');
+                // Surface as a visible error so operator can act — they may need to
+                // rename a file, check the folder, or re-grant access.
+                showError(
+                    `"${filename}" not found in media folder. Check the filename matches exactly or re-grant folder access.`,
+                    'Choose Folder',
+                    () => { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'playout'; render('modal'); }
+                );
                 return null;
             }
         }
@@ -3207,8 +3301,6 @@
                     </div>
                 </div>`;
         }
-
-
         /**
          * Renders the Newsroom / Rundown view. Builds the TX/RX timing bar, the
          * sortable story table with per-row clock times and clip/staff badges,
@@ -3827,7 +3919,7 @@
                             <span class="text-amber-800 text-sm">Currently being edited by <strong>${escapeHTML(story.lockedByName)}</strong>.</span>
                             <button data-action="take-over-edit" id="takeover-btn" ${!isStale ? 'disabled' : ''}
                                 class="text-xs ${isStale ? 'bg-amber-600 hover:bg-amber-700 text-white border-amber-700' : 'bg-white text-slate-400 border-slate-300 cursor-not-allowed'} border px-3 py-1.5 rounded shadow-sm font-bold transition-colors">
-                                ${isStale ? 'Take Over' : `Wait ${waitSecs}s\u2026`}
+                                ${isStale ? 'Take Over' : `Wait ${waitSecs}s…`}
                             </button>
                         </div>`;
                     })() : ''}
@@ -4072,7 +4164,7 @@
                             : `
                                 <div class="p-4 space-y-6 text-center">
                                     <div class="w-16 h-16 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-4"><i class="fa-solid fa-satellite-dish text-3xl"></i></div>
-                                    <h4 class="text-2xl font-bold text-slate-800">Moira:0.1.51</h4>
+                                    <h4 class="text-2xl font-bold text-slate-800">Moira</h4>
                                     <p class="text-sm text-slate-500 font-medium tracking-tight">A lightweight broadcast bulletin management system designed for small newsrooms</p>
                                     <div class="bg-slate-50 border border-slate-200 rounded-xl p-6 text-center">
                                         <p class="text-slate-700 mb-4 leading-relaxed"><strong>Moira - Bulletin Manager</strong> is developed by <span class="text-slate-900 font-bold">Andy Dickinson</span> and is free and open source.</p>
@@ -4181,12 +4273,45 @@
         }
 
         function renderConflictModal() {
-            const slug = state.ui.pendingConflict ? state.ui.pendingConflict.serverData.slug : 'Story';
+            const conflict = state.ui.pendingConflict;
+            if (!conflict) return '';
+            const { serverData, localData } = conflict;
+            const serverRev = serverData.rev || '?';
+            const localRev  = localData.rev  || '?';
+
+            // Surface the key differences so the editor can make an informed choice
+            const diffs = [];
+            if (serverData.slug   !== localData.slug)   diffs.push(`<tr><td class="pr-4 text-slate-500 py-1 text-xs">Slug</td><td class="text-xs text-red-700 font-mono">${escapeHTML(serverData.slug)}</td><td class="text-xs text-blue-700 font-mono">${escapeHTML(localData.slug)}</td></tr>`);
+            if (serverData.format !== localData.format) diffs.push(`<tr><td class="pr-4 text-slate-500 py-1 text-xs">Format</td><td class="text-xs text-red-700">${escapeHTML(serverData.format)}</td><td class="text-xs text-blue-700">${escapeHTML(localData.format)}</td></tr>`);
+            if ((serverData.duration||0) !== (localData.duration||0)) diffs.push(`<tr><td class="pr-4 text-slate-500 py-1 text-xs">Duration</td><td class="text-xs text-red-700 font-mono">${formatDuration(serverData.duration||0)}</td><td class="text-xs text-blue-700 font-mono">${formatDuration(localData.duration||0)}</td></tr>`);
+            if ((serverData.script||'').trim() !== (localData.script||'').trim()) diffs.push(`<tr><td class="pr-4 text-slate-500 py-1 text-xs">Script</td><td class="text-xs text-red-700">Changed</td><td class="text-xs text-blue-700">Changed</td></tr>`);
+            const diffTable = diffs.length > 0
+                ? `<table class="w-full mt-2 mb-1"><thead><tr><th class="text-left text-[10px] uppercase tracking-wide text-slate-400 pr-4">Field</th><th class="text-left text-[10px] uppercase tracking-wide text-red-500">Server (rev ${serverRev})</th><th class="text-left text-[10px] uppercase tracking-wide text-blue-500">Your edit</th></tr></thead><tbody>${diffs.join('')}</tbody></table>`
+                : `<p class="text-xs text-slate-500 mt-1 mb-1">The script was changed. Check both versions before deciding.</p>`;
+
             return `<div class="fixed inset-0 bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4 z-[80]">
-                <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
-                    <h3 class="text-xl font-bold text-slate-800 mb-4">Conflict: ${escapeHTML(slug)}</h3>
-                    <p class="text-sm text-slate-600 mb-6">Another user has modified this story while you were editing. Would you like to overwrite their changes or discard your edits?</p>
-                    <div class="flex gap-3"><button data-action="resolve-conflict" data-val="overwrite" class="flex-1 bg-amber-500 text-white py-3 rounded-lg font-bold">Overwrite Server</button><button data-action="resolve-conflict" data-val="discard" class="flex-1 bg-slate-200 text-slate-700 py-3 rounded-lg font-bold">Discard Edits</button></div>
+                <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6">
+                    <div class="flex items-start gap-3 mb-4">
+                        <span class="text-2xl mt-0.5">⚠️</span>
+                        <div>
+                            <h3 class="text-lg font-bold text-slate-800">Edit Conflict — ${escapeHTML(serverData.slug)}</h3>
+                            <p class="text-sm text-slate-500 mt-0.5">Someone else saved this story while you were editing it.</p>
+                        </div>
+                    </div>
+                    <div class="bg-slate-50 border border-slate-200 rounded-lg px-4 py-3 mb-5">
+                        ${diffTable}
+                    </div>
+                    <div class="flex gap-3">
+                        <button data-action="resolve-conflict" data-val="overwrite"
+                            class="flex-1 bg-amber-500 hover:bg-amber-600 text-white py-3 rounded-lg font-bold text-sm transition-colors">
+                            <i class="fa-solid fa-upload mr-1"></i> Use my version
+                        </button>
+                        <button data-action="resolve-conflict" data-val="discard"
+                            class="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-700 py-3 rounded-lg font-bold text-sm transition-colors">
+                            <i class="fa-solid fa-download mr-1"></i> Use server version
+                        </button>
+                    </div>
+                    <p class="text-center text-[11px] text-slate-400 mt-3">"Use my version" will overwrite the server. "Use server version" will discard your unsaved changes.</p>
                 </div>
             </div>`;
         }
@@ -4867,7 +4992,7 @@
                                     state.storiesMap[id].lockedAt = null;
                                 }
                             } catch(e) {
-                                console.error('Inline save failed', e);
+                                showError('Slug not saved — ' + DB.errorMessage(e));
                                 await unlockStory(id);
                                 render('main');
                             }
@@ -4915,7 +5040,7 @@
                     }
                     render('modal');
                     try { await DB.takeLock(storyId, state.sessionId, userName, now); }
-                    catch(e) { console.error('Takeover failed', e); }
+                    catch(e) { showError('Could not take over edit — ' + DB.errorMessage(e)); }
                 }
 
                 if (action === 'cancel-edit') { const editingId = state.ui.editingStoryId; state.ui.editingStoryId = null; stopLockRefresh(); if (editingId) unlockStory(editingId); render('main', 'modal'); }
@@ -4959,7 +5084,7 @@
                     render('header', 'main');
                     if (canMutate()) {
                         try { await DB.updateBulletin({ editorStaffId: newEditor }); }
-                        catch(e) { console.error('Set editor failed', e); }
+                        catch(e) { showError('Could not set editor — ' + DB.errorMessage(e)); }
                     }
                 }
                 if (action === 'toggle-rundown-lock') {
@@ -4969,7 +5094,7 @@
                     render('main');
                     if (canMutate()) {
                         try { await DB.updateBulletin({ rundownLocked: newLocked }); }
-                        catch(e) { console.error('Lock toggle failed', e); }
+                        catch(e) { showError('Could not toggle rundown lock — ' + DB.errorMessage(e)); }
                     }
                 }
                 if (action === 'remove-staff') {
@@ -4978,7 +5103,7 @@
                         state.meta.editorStaffId = null;
                         state.meta.rundownLocked = false;
                         try { await DB.updateBulletin({ editorStaffId: null, rundownLocked: false }); }
-                        catch(e) { console.error('Editor clear failed', e); }
+                        catch(e) { showError('Could not clear editor — ' + DB.errorMessage(e)); }
                     }
                     updateStaffInCloud(staff => staff.filter(s => s.id !== id));
                 }
@@ -5121,7 +5246,9 @@
                         radioLog(`Media folder granted: "${handle.name}"`, 'success');
                         render('modal');
                     } catch(e) {
-                        if (e.name !== 'AbortError') radioLog(`Folder access error: ${e.message}`, 'error');
+                        if (e.name === 'AbortError') return; // user cancelled picker — no error needed
+                        radioLog(`Folder access error: ${e.message}`, 'error');
+                        showError(`Could not access media folder — ${e.message}`);
                     }
                     return;
                 }
@@ -5138,7 +5265,11 @@
                             await idbSaveHandle(pending);
                             radioLog(`Media folder restored: "${pending.name}"`, 'success');
                             render('modal');
+                        } else if (perm === 'denied') {
+                            radioLog('Folder access denied by browser.', 'error');
+                            showError('Media folder access was denied. Use "Choose Folder" in Settings → Playout to grant access again.', 'Open Settings', () => { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'playout'; render('modal'); });
                         }
+                        // 'prompt' — user dismissed without choosing, leave pending so they can try again
                     } catch(e) { radioLog(`Restore failed: ${e.message}`, 'error'); }
                     return;
                 }
