@@ -236,25 +236,7 @@
             } catch(e) { console.warn('idbClearHandle failed:', e); }
         }
 
-        // --- OBS WebSocket instance & config ---
-        const obsWs = new OBSWebSocket();
-        let obsConfig = { ip: '127.0.0.1', port: '4455', pass: '', base: '' };
-        let obsTelemetryInterval = null;
-
-        function loadObsConfig() {
-            obsConfig.ip   = localStorage.getItem('OBS_IP')           || '127.0.0.1';
-            obsConfig.port = localStorage.getItem('OBS_PORT')          || '4455';
-            obsConfig.pass = localStorage.getItem('OBS_PASSWORD')      || '';
-            obsConfig.base = localStorage.getItem('OBS_BASE_FOLDER')   || '';
-        }
-
-        function saveObsConfig() {
-            localStorage.setItem('OBS_IP',          document.getElementById('obs-set-ip')?.value   || obsConfig.ip);
-            localStorage.setItem('OBS_PORT',        document.getElementById('obs-set-port')?.value || obsConfig.port);
-            localStorage.setItem('OBS_PASSWORD',    document.getElementById('obs-set-pass')?.value || obsConfig.pass);
-            localStorage.setItem('OBS_BASE_FOLDER', document.getElementById('obs-set-base')?.value || obsConfig.base);
-            loadObsConfig();
-        }
+        // OBS playout engine — see OBS module (IIFE) below
         function loadRadioConfig() {
                 state.radio.selectedSinkId = localStorage.getItem('RADIO_SINK_ID') || '';
             }
@@ -454,8 +436,8 @@
             
             // Load OBS config and attempt connection only if playout is enabled
             if (state.ui.playoutBackend === 'obs') {
-                loadObsConfig();
-                connectObs();
+                OBS.loadConfig();
+                OBS.connect();
             } else if (state.ui.playoutBackend === 'radio') {
                 loadRadioConfig();
                 populateRadioDevices();
@@ -1035,7 +1017,7 @@
 
             // Prime playout on TX start and on standby (entering Studio view)
             if (targetMode === 'tx' || targetMode === 'standby') {
-                if (state.ui.playoutBackend === 'obs')        obsInitialLoad(activeOrder);
+                if (state.ui.playoutBackend === 'obs')        OBS.initialLoad(activeOrder);
                 else if (state.ui.playoutBackend === 'radio') radioInitialLoad(activeOrder);
             }
 
@@ -2169,8 +2151,8 @@
                 if (!state.obs.connected) return;
                 state.obs.clipQueue = queue;
                 state.obs.clipIndex = Math.max(activeClipIdx - 1, -1);
-                if (deckAStoryId) { await obsLoadDeck('A', deckAStoryId); obsLog(`Sync → Deck A: "${state.storiesMap[deckAStoryId]?.mediaFile}"`, 'info'); }
-                if (deckBStoryId) { await obsLoadDeck('B', deckBStoryId); obsLog(`Sync → Deck B: "${state.storiesMap[deckBStoryId]?.mediaFile}"`, 'info'); }
+                if (deckAStoryId) { await OBS.loadDeck('A', deckAStoryId); OBS.log(`Sync → Deck A: "${state.storiesMap[deckAStoryId]?.mediaFile}"`, 'info'); }
+                if (deckBStoryId) { await OBS.loadDeck('B', deckBStoryId); OBS.log(`Sync → Deck B: "${state.storiesMap[deckBStoryId]?.mediaFile}"`, 'info'); }
             }
         }
         function renderPPMStrip(deckId) {
@@ -2295,346 +2277,468 @@
        
         // ==========================================
         // OBS PLAYOUT ENGINE
+        // Self-contained IIFE module. All OBS WebSocket state, config, and logic
+        // is encapsulated here. External code uses the OBS.* interface only.
+        //
+        // Option 3: extracted module with clean interface
+        // Option 1: event-driven load/take replacing polling loops
         // ==========================================
+        const OBS = (() => {
 
-        function obsLog(msg, type = 'info') {
-            const time = new Date().toISOString().split('T')[1].substring(0, 12);
-            state.obs.log.unshift({ time, type, msg });
-            if (state.obs.log.length > 80) state.obs.log.pop();
-            const el = document.getElementById('obs-log-container');
-            if (el) el.innerHTML = renderObsLog();
-        }
+            // ── Private state ──────────────────────────────────────────────────
+            const _ws  = new OBSWebSocket();
+            let _cfg   = { ip: '127.0.0.1', port: '4455', pass: '', base: '' };
+            let _telemetryInterval = null;
+            let _syncInterval      = null;
+            let _isTransitioning   = false; // true while a studio mode transition is in progress
+            let _retryTimeout      = null;  // pending reconnect timer — cancelled on any new connect() call
+            let _isConnecting      = false; // prevents concurrent connection attempts
 
-        async function connectObs() {
-            try {
+            // ── Logging ────────────────────────────────────────────────────────
+            function _log(msg, type = 'info') {
+                const time = new Date().toISOString().split('T')[1].substring(0, 12);
+                state.obs.log.unshift({ time, type, msg });
+                if (state.obs.log.length > 80) state.obs.log.pop();
+                const el = document.getElementById('obs-log-container');
+                if (el) el.innerHTML = _renderLog();
+            }
+
+            // ── Config ─────────────────────────────────────────────────────────
+            function _loadConfig() {
+                _cfg.ip   = localStorage.getItem('OBS_IP')          || '127.0.0.1';
+                _cfg.port = localStorage.getItem('OBS_PORT')         || '4455';
+                _cfg.pass = localStorage.getItem('OBS_PASSWORD')     || '';
+                _cfg.base = localStorage.getItem('OBS_BASE_FOLDER')  || '';
+            }
+
+            function _saveConfig() {
+                localStorage.setItem('OBS_IP',          document.getElementById('obs-set-ip')?.value   || _cfg.ip);
+                localStorage.setItem('OBS_PORT',        document.getElementById('obs-set-port')?.value || _cfg.port);
+                localStorage.setItem('OBS_PASSWORD',    document.getElementById('obs-set-pass')?.value || _cfg.pass);
+                localStorage.setItem('OBS_BASE_FOLDER', document.getElementById('obs-set-base')?.value || _cfg.base);
+                _loadConfig();
+            }
+
+            // ── Utilities ──────────────────────────────────────────────────────
+            function _formatTime(ms) {
+                ms = Math.max(0, parseInt(ms) || 0);
+                if (ms === 0) return '00:00:00';
+                const totalSeconds = Math.floor(ms / 1000);
+                const h = Math.floor(totalSeconds / 3600);
+                const m = Math.floor((totalSeconds % 3600) / 60);
+                const s = totalSeconds % 60;
+                return `${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
+            }
+
+            // ── Tally & display updates (direct DOM — bypass render cycle) ─────
+            function _updateTallies() {
+                const deckA = document.getElementById('obs-deck-A');
+                const deckB = document.getElementById('obs-deck-B');
+                const lblA  = document.getElementById('obs-tally-label-A');
+                const lblB  = document.getElementById('obs-tally-label-B');
+                if (!deckA || !deckB) return;
+
+                const base = 'bg-white border-2 rounded-xl p-4 flex flex-col gap-3 transition-all duration-300 ';
+                deckA.className = base + (state.obs.program === 'VT A' ? 'obs-tally-program border-red-400' : state.obs.preview === 'VT A' ? 'obs-tally-preview border-blue-400' : 'border-slate-200');
+                deckB.className = base + (state.obs.program === 'VT B' ? 'obs-tally-program border-red-400' : state.obs.preview === 'VT B' ? 'obs-tally-preview border-blue-400' : 'border-slate-200');
+
+                if (lblA) lblA.innerHTML = state.obs.program === 'VT A' ? '<span class="text-red-600 font-black tracking-widest text-xs">PROGRAM</span>' : state.obs.preview === 'VT A' ? '<span class="text-blue-600 font-bold tracking-widest text-xs">PREVIEW</span>' : '<span class="text-slate-400 text-xs">STANDBY</span>';
+                if (lblB) lblB.innerHTML = state.obs.program === 'VT B' ? '<span class="text-red-600 font-black tracking-widest text-xs">PROGRAM</span>' : state.obs.preview === 'VT B' ? '<span class="text-blue-600 font-bold tracking-widest text-xs">PREVIEW</span>' : '<span class="text-slate-400 text-xs">STANDBY</span>';
+            }
+
+            function _updateDeckDisplay(deck, d) {
+                const timeEl  = document.getElementById('obs-time-'  + deck);
+                const stateEl = document.getElementById('obs-state-' + deck);
+                const durEl   = document.getElementById('obs-dur-'   + deck);
+                if (!timeEl) return;
+
+                const isProgram = (deck === 'A' && state.obs.program === 'VT A') || (deck === 'B' && state.obs.program === 'VT B');
+                const baseClasses = 'font-mono text-lg font-bold px-3 py-1 rounded transition-all ';
+
+                if (isProgram && d.duration > 0) {
+                    const remaining = Math.max(0, d.duration - d.cursor);
+                    timeEl.innerText = '-' + _formatTime(remaining);
+                    if (remaining > 0 && remaining <= 10000) {
+                        timeEl.className = baseClasses + 'bg-red-600 text-white animate-pulse';
+                    } else if (remaining > 0 && remaining <= 30000) {
+                        timeEl.className = baseClasses + 'bg-yellow-100 text-yellow-800 border border-yellow-400';
+                    } else {
+                        timeEl.className = baseClasses + 'bg-red-50 text-red-600';
+                    }
+                } else {
+                    timeEl.innerText = _formatTime(d.cursor);
+                    timeEl.className = baseClasses + 'bg-slate-100 text-slate-700';
+                }
+                if (stateEl) stateEl.innerText = d.state;
+                if (durEl)   durEl.innerText   = _formatTime(d.duration);
+            }
+
+            function _updateDeckLabel(deck) {
+                const labelEl = document.getElementById('obs-deck-label-' + deck);
+                if (!labelEl) return;
+                const d = state.obs['deck' + deck];
+                const story = d.loadedStoryId ? state.storiesMap[d.loadedStoryId] : null;
+                if (story) {
+                    labelEl.innerHTML = `
+                        <span class="font-bold text-slate-800 text-sm truncate">${escapeHTML(story.slug)}</span>
+                        <span class="text-xs text-slate-400 font-mono truncate">${escapeHTML(story.mediaFile)}</span>`;
+                } else {
+                    labelEl.innerHTML = `<span class="text-slate-400 text-xs italic">No clip loaded</span>`;
+                }
+            }
+
+            function _updateConnectionBadge() {
+                const badge = document.getElementById('obs-conn-badge');
+                if (!badge) return;
+                if (state.obs.connected) {
+                    badge.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-200';
+                    badge.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> OBS Connected';
+                } else {
+                    badge.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-red-100 text-red-700 border border-red-200';
+                    badge.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span> OBS Offline';
+                }
+            }
+
+            // ── Telemetry (250ms polling for cursor/duration/state) ────────────
+            function _startTelemetry() {
+                if (_telemetryInterval) clearInterval(_telemetryInterval);
+                _telemetryInterval = setInterval(async () => {
+                    if (!state.obs.connected) return;
+                    try {
+                        for (const [deck, inputName] of [['A', 'VT A Player'], ['B', 'VT B Player']]) {
+                            const res = await _ws.call('GetMediaInputStatus', { inputName });
+                            const d = state.obs['deck' + deck];
+                            d.cursor   = res.mediaCursor   || 0;
+                            d.duration = res.mediaDuration || 0;
+                            d.state    = res.mediaState ? res.mediaState.replace('OBS_MEDIA_STATE_', '') : 'UNKNOWN';
+                            _updateDeckDisplay(deck, d);
+                        }
+                    } catch(e) { /* silently drop telemetry errors */ }
+                }, 250);
+            }
+
+            function _stopTelemetry() {
+                if (_telemetryInterval) { clearInterval(_telemetryInterval); _telemetryInterval = null; }
+            }
+
+            // ── Periodic sync (every 30s) — catches tally drift after reconnect ─
+            async function _syncState() {
+                try {
+                    const prog = await _ws.call('GetCurrentProgramScene');
+                    const prev = await _ws.call('GetCurrentPreviewScene');
+                    state.obs.program = prog.sceneName;
+                    state.obs.preview = prev.sceneName;
+                    _updateTallies();
+                } catch(e) { /* non-fatal */ }
+            }
+
+            function _startSyncInterval() {
+                if (_syncInterval) clearInterval(_syncInterval);
+                _syncInterval = setInterval(_syncState, 30000);
+            }
+
+            function _stopSyncInterval() {
+                if (_syncInterval) { clearInterval(_syncInterval); _syncInterval = null; }
+            }
+
+            // ── OBS WebSocket event listeners ──────────────────────────────────
+            _ws.on('ConnectionClosed', () => {
                 if (state.obs.connected) {
                     state.obs.connected = false;
-                    try { await obsWs.disconnect(); } catch(e) {}
+                    _isConnecting = false;
+                    _stopTelemetry();
+                    _stopSyncInterval();
+                    _log('OBS connection closed unexpectedly. Retrying in 8s...', 'error');
+                    _updateConnectionBadge();
+                    // Schedule via _retryTimeout so any subsequent connect() call cancels this
+                    if (_retryTimeout) clearTimeout(_retryTimeout);
+                    _retryTimeout = setTimeout(() => { _retryTimeout = null; connect(); }, 8000);
                 }
-                await obsWs.connect(`ws://${obsConfig.ip}:${obsConfig.port}`, obsConfig.pass, { rpcVersion: 1 });
-                state.obs.connected = true;
-                obsLog(`Connected to OBS at ws://${obsConfig.ip}:${obsConfig.port}`, 'success');
-                updateObsConnectionBadge();
-                await obsSetupEnvironment();
-                await obsSyncState();
-                startObsTelemetry();
-            } catch(err) {
-                state.obs.connected = false;
-                obsLog(`OBS connection failed: ${err.message}`, 'error');
-                updateObsConnectionBadge();
-                setTimeout(connectObs, 8000);
-            }
-        }
+            });
 
-        obsWs.on('ConnectionClosed', () => {
-            if (state.obs.connected) {
-                state.obs.connected = false;
-                obsLog('OBS connection closed unexpectedly. Retrying in 8s...', 'error');
-                updateObsConnectionBadge();
-                setTimeout(connectObs, 8000);
-            }
-        });
+            _ws.on('CurrentProgramSceneChanged', (ev) => {
+                state.obs.program = ev.sceneName;
+                _updateTallies();
+            });
 
-        obsWs.on('CurrentProgramSceneChanged', (ev) => {
-            state.obs.program = ev.sceneName;
-            updateObsTallies();
-        });
+            _ws.on('CurrentPreviewSceneChanged', (ev) => {
+                state.obs.preview = ev.sceneName;
+                _updateTallies();
+            });
 
-        obsWs.on('CurrentPreviewSceneChanged', (ev) => {
-            state.obs.preview = ev.sceneName;
-            updateObsTallies();
-        });
+            // Option 1: track transition state so executeTake can guard double-tap
+            _ws.on('SceneTransitionStarted', () => {
+                _isTransitioning = true;
+                // Safety timeout — reset after 5s in case SceneTransitionEnded is missed
+                setTimeout(() => { _isTransitioning = false; }, 5000);
+            });
 
-        function updateObsConnectionBadge() {
-            const badge = document.getElementById('obs-conn-badge');
-            if (!badge) return;
-            if (state.obs.connected) {
-                badge.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-200';
-                badge.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> OBS Connected';
-            } else {
-                badge.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-red-100 text-red-700 border border-red-200';
-                badge.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span> OBS Offline';
-            }
-        }
+            _ws.on('SceneTransitionEnded', () => {
+                _isTransitioning = false;
+            });
 
-        async function obsSetupEnvironment() {
-            try {
-                const modeRes = await obsWs.call('GetStudioModeEnabled');
-                if (!modeRes.studioModeEnabled) {
-                    await obsWs.call('SetStudioModeEnabled', { studioModeEnabled: true });
-                    obsLog('Enabled Studio Mode in OBS', 'success');
-                }
-                const { scenes } = await obsWs.call('GetSceneList');
-                const sceneNames = scenes.map(s => s.sceneName);
-                for (const name of ['VT A', 'VT B', 'Lower Third']) {
-                    if (!sceneNames.includes(name)) {
-                        await obsWs.call('CreateScene', { sceneName: name });
-                        obsLog(`Created OBS scene: ${name}`, 'success');
-                    }
-                }
-                const { inputs } = await obsWs.call('GetInputList');
-                const inputNames = inputs.map(i => i.inputName);
-                const safeSettings = { is_local_file: true, close_when_inactive: false, restart_on_activate: false, clear_on_media_end: false };
-                for (const [scene, inputName] of [['VT A', 'VT A Player'], ['VT B', 'VT B Player']]) {
-                    if (!inputNames.includes(inputName)) {
-                        await obsWs.call('CreateInput', { sceneName: scene, inputName, inputKind: 'ffmpeg_source', inputSettings: safeSettings });
-                        obsLog(`Created OBS input: ${inputName}`, 'success');
-                    } else {
-                        await obsWs.call('SetInputSettings', { inputName, inputSettings: { close_when_inactive: false, restart_on_activate: false, clear_on_media_end: false } });
-                        const { sceneItems } = await obsWs.call('GetSceneItemList', { sceneName: scene });
-                        if (!sceneItems.some(i => i.sourceName === inputName)) {
-                            await obsWs.call('CreateSceneItem', { sceneName: scene, sourceName: inputName });
-                        }
-                    }
-                }
-                for (const parent of ['VT A', 'VT B']) {
-                    const { sceneItems } = await obsWs.call('GetSceneItemList', { sceneName: parent });
-                    if (!sceneItems.some(i => i.sourceName === 'Lower Third')) {
-                        await obsWs.call('CreateSceneItem', { sceneName: parent, sourceName: 'Lower Third' });
-                        obsLog(`Nested Lower Third into ${parent}`, 'success');
-                    }
-                }
-                if (!inputNames.includes('Lower Third Text')) {
-                    try {
-                        await obsWs.call('CreateInput', { sceneName: 'Lower Third', inputName: 'Lower Third Text', inputKind: 'text_gdiplus', inputSettings: { text: 'Standby' } });
-                    } catch(e) {
-                        await obsWs.call('CreateInput', { sceneName: 'Lower Third', inputName: 'Lower Third Text', inputKind: 'text_ft2_source_v2', inputSettings: { text: 'Standby' } });
-                    }
-                    obsLog('Created Lower Third Text source', 'success');
-                }
-                const prog = await obsWs.call('GetCurrentProgramScene');
-                let curProg = prog.sceneName;
-                if (curProg !== 'VT A' && curProg !== 'VT B') {
-                    await obsWs.call('SetCurrentProgramScene', { sceneName: 'VT A' });
-                    curProg = 'VT A';
-                }
-                const expectedPrev = curProg === 'VT A' ? 'VT B' : 'VT A';
-                await obsWs.call('SetCurrentPreviewScene', { sceneName: expectedPrev });
-                obsLog('OBS environment validated and routed.', 'success');
-            } catch(err) {
-                obsLog(`OBS setup error: ${err.message}`, 'error');
-            }
-        }
+            _ws.on('SceneTransitionVideoEnded', () => {
+                _isTransitioning = false;
+            });
 
-        async function obsSyncState() {
-            try {
-                const prog = await obsWs.call('GetCurrentProgramScene');
-                const prev = await obsWs.call('GetCurrentPreviewScene');
-                state.obs.program = prog.sceneName;
-                state.obs.preview = prev.sceneName;
-                updateObsTallies();
-            } catch(e) {}
-        }
-
-        function updateObsTallies() {
-            const deckA = document.getElementById('obs-deck-A');
-            const deckB = document.getElementById('obs-deck-B');
-            const lblA  = document.getElementById('obs-tally-label-A');
-            const lblB  = document.getElementById('obs-tally-label-B');
-            if (!deckA || !deckB) return;
-
-            const base = 'bg-white border-2 rounded-xl p-4 flex flex-col gap-3 transition-all duration-300 ';
-            deckA.className = base + (state.obs.program === 'VT A' ? 'obs-tally-program border-red-400' : state.obs.preview === 'VT A' ? 'obs-tally-preview border-blue-400' : 'border-slate-200');
-            deckB.className = base + (state.obs.program === 'VT B' ? 'obs-tally-program border-red-400' : state.obs.preview === 'VT B' ? 'obs-tally-preview border-blue-400' : 'border-slate-200');
-
-            if (lblA) lblA.innerHTML = state.obs.program === 'VT A' ? '<span class="text-red-600 font-black tracking-widest text-xs">PROGRAM</span>' : state.obs.preview === 'VT A' ? '<span class="text-blue-600 font-bold tracking-widest text-xs">PREVIEW</span>' : '<span class="text-slate-400 text-xs">STANDBY</span>';
-            if (lblB) lblB.innerHTML = state.obs.program === 'VT B' ? '<span class="text-red-600 font-black tracking-widest text-xs">PROGRAM</span>' : state.obs.preview === 'VT B' ? '<span class="text-blue-600 font-bold tracking-widest text-xs">PREVIEW</span>' : '<span class="text-slate-400 text-xs">STANDBY</span>';
-        }
-
-        function obsFormatTime(ms) {
-            ms = Math.max(0, parseInt(ms) || 0);
-            if (ms === 0) return '00:00:00';
-            const totalSeconds = Math.floor(ms / 1000);
-            const h = Math.floor(totalSeconds / 3600);
-            const m = Math.floor((totalSeconds % 3600) / 60);
-            const s = totalSeconds % 60;
-            return `${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
-        }
-
-        function startObsTelemetry() {
-            if (obsTelemetryInterval) clearInterval(obsTelemetryInterval);
-            obsTelemetryInterval = setInterval(async () => {
-                if (!state.obs.connected) return;
+            // ── Environment setup ──────────────────────────────────────────────
+            async function _setupEnvironment() {
                 try {
-                    for (const [deck, inputName] of [['A', 'VT A Player'], ['B', 'VT B Player']]) {
-                        const res = await obsWs.call('GetMediaInputStatus', { inputName });
-                        const d = state.obs['deck' + deck];
-                        d.cursor   = res.mediaCursor   || 0;
-                        d.duration = res.mediaDuration || 0;
-                        d.state    = res.mediaState ? res.mediaState.replace('OBS_MEDIA_STATE_', '') : 'UNKNOWN';
-                        updateObsDeckDisplay(deck, d);
+                    const modeRes = await _ws.call('GetStudioModeEnabled');
+                    if (!modeRes.studioModeEnabled) {
+                        await _ws.call('SetStudioModeEnabled', { studioModeEnabled: true });
+                        _log('Enabled Studio Mode in OBS', 'success');
                     }
-                } catch(e) { /* silently drop telemetry errors */ }
-            }, 250);
-        }
-
-        function updateObsDeckDisplay(deck, d) {
-            const timeEl  = document.getElementById('obs-time-'  + deck);
-            const stateEl = document.getElementById('obs-state-' + deck);
-            const durEl   = document.getElementById('obs-dur-'   + deck);
-            if (!timeEl) return;
-
-            const isProgram = (deck === 'A' && state.obs.program === 'VT A') || (deck === 'B' && state.obs.program === 'VT B');
-            const baseClasses = 'font-mono text-lg font-bold px-3 py-1 rounded transition-all ';
-
-            if (isProgram && d.duration > 0) {
-                const remaining = Math.max(0, d.duration - d.cursor);
-                timeEl.innerText = '-' + obsFormatTime(remaining);
-                if (remaining > 0 && remaining <= 10000) {
-                    timeEl.className = baseClasses + 'bg-red-600 text-white animate-pulse';
-                } else if (remaining > 0 && remaining <= 30000) {
-                    timeEl.className = baseClasses + 'bg-yellow-100 text-yellow-800 border border-yellow-400';
-                } else {
-                    timeEl.className = baseClasses + 'bg-red-50 text-red-600';
-                }
-            } else {
-                timeEl.innerText = obsFormatTime(d.cursor);
-                timeEl.className = baseClasses + 'bg-slate-100 text-slate-700';
-            }
-            if (stateEl) stateEl.innerText = d.state;
-            if (durEl)   durEl.innerText   = obsFormatTime(d.duration);
-        }
-
-        async function obsMediaAction(deck, action) {
-            const inputName = deck === 'A' ? 'VT A Player' : 'VT B Player';
-            try {
-                await obsWs.call('TriggerMediaInputAction', { inputName, mediaAction: action });
-            } catch(e) { obsLog(`Media action failed: ${e.message}`, 'error'); }
-        }
-
-        async function obsSetCursor(deck, ms) {
-            const inputName = deck === 'A' ? 'VT A Player' : 'VT B Player';
-            try {
-                await obsWs.call('SetMediaInputCursor', { inputName, mediaCursor: ms });
-            } catch(e) { obsLog(`Cue failed: ${e.message}`, 'error'); }
-        }
-
-        async function obsUpdateL3Text() {
-            const el = document.getElementById('obs-l3-text');
-            if (!el) return;
-            try {
-                await obsWs.call('SetInputSettings', { inputName: 'Lower Third Text', inputSettings: { text: el.value } });
-                obsLog(`L3 text updated: "${el.value}"`, 'success');
-            } catch(e) { obsLog(`L3 text update failed: ${e.message}`, 'error'); }
-        }
-
-        async function obsToggleL3(visible) {
-            try {
-                for (const sceneName of ['VT A', 'VT B']) {
-                    const { sceneItems } = await obsWs.call('GetSceneItemList', { sceneName });
-                    const l3 = sceneItems.find(i => i.sourceName === 'Lower Third');
-                    if (l3) await obsWs.call('SetSceneItemEnabled', { sceneName, sceneItemId: l3.sceneItemId, sceneItemEnabled: visible });
-                }
-                obsLog(`Lower Third ${visible ? 'SHOWN' : 'HIDDEN'}`, 'info');
-            } catch(e) { obsLog(`L3 toggle failed: ${e.message}`, 'error'); }
-        }
-
-        async function obsReconcileL3() {
-            try {
-                const getState = async (sceneName) => {
-                    const { sceneItems } = await obsWs.call('GetSceneItemList', { sceneName });
-                    const l3 = sceneItems.find(i => i.sourceName === 'Lower Third');
-                    return l3 ? l3.sceneItemEnabled : null;
-                };
-                const [stA, stB] = await Promise.all([getState('VT A'), getState('VT B')]);
-                if (stA !== null && stB !== null && stA !== stB) {
-                    obsLog('L3 mismatch detected — forcing hidden as fail-safe.', 'warn');
-                    await obsToggleL3(false);
-                }
-            } catch(e) { obsLog('L3 reconciliation error: ' + e.message, 'error'); }
-        }
-
-        async function obsExecuteTake() {
-            if (!state.obs.connected || state.obs.isTaking) return;
-            state.obs.isTaking = true;
-            const btn = document.getElementById('obs-btn-take');
-            if (btn) btn.disabled = true;
-            obsLog('Initiating Verified Take...', 'info');
-            try {
-                await obsReconcileL3();
-
-                const outgoingScene  = state.obs.program;
-                const outgoingDeck   = outgoingScene === 'VT A' ? 'A' : outgoingScene === 'VT B' ? 'B' : null;
-
-                const isANext        = state.obs.preview === 'VT A';
-                const previewPlayer  = isANext ? 'VT A Player' : 'VT B Player';
-                const programPlayer  = isANext ? 'VT B Player' : 'VT A Player';
-
-                await obsWs.call('TriggerMediaInputAction', { inputName: previewPlayer, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY' });
-
-                let isPlaying = false;
-                for (let i = 0; i < 30; i++) {
-                    const { mediaState } = await obsWs.call('GetMediaInputStatus', { inputName: previewPlayer });
-                    if (mediaState === 'OBS_MEDIA_STATE_PLAYING') { isPlaying = true; break; }
-                    await new Promise(r => setTimeout(r, 100));
-                }
-                if (!isPlaying) throw new Error(`Timeout: ${previewPlayer} did not reach PLAYING state.`);
-
-                obsLog('Playback verified. Applying 250ms pre-roll buffer...', 'info');
-                await new Promise(r => setTimeout(r, 250));
-
-                await obsWs.call('TriggerStudioModeTransition');
-                obsLog('Transition fired.', 'success');
-
-                const queue = state.obs.clipQueue;
-                const takenIndex = state.obs.clipIndex + 1;
-                const freeDeck   = takenIndex % 2 === 0 ? 'A' : 'B';
-
-                setTimeout(async () => {
-                    try {
-                        await obsWs.call('TriggerMediaInputAction', { inputName: programPlayer, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE' });
-                        await obsWs.call('SetMediaInputCursor', { inputName: programPlayer, mediaCursor: 0 });
-                        obsLog('Outgoing deck cued to 0.', 'info');
-                    } catch(e) {}
-
-                    if (queue && takenIndex < queue.length) {
-                        state.obs.clipIndex = takenIndex;
-                        const nextIndex = takenIndex + 2;
-                        if (nextIndex < queue.length) {
-                            obsLog(`Queue [${takenIndex+1}/${queue.length}] taken. Loading clip ${nextIndex+1} onto Deck ${freeDeck}.`, 'info');
-                            obsLoadDeck(freeDeck, queue[nextIndex]);
-                        } else {
-                            obsLog(`Queue [${takenIndex+1}/${queue.length}] taken. Last clip — no further auto-load.`, 'info');
+                    const { scenes } = await _ws.call('GetSceneList');
+                    const sceneNames = scenes.map(s => s.sceneName);
+                    for (const name of ['VT A', 'VT B', 'Lower Third']) {
+                        if (!sceneNames.includes(name)) {
+                            await _ws.call('CreateScene', { sceneName: name });
+                            _log(`Created OBS scene: ${name}`, 'success');
                         }
                     }
-                }, 3000);
-
-            } catch(err) {
-                obsLog(`Verified Take failed: ${err.message}`, 'error');
-            } finally {
-                state.obs.isTaking = false;
-                if (btn) btn.disabled = false;
+                    const { inputs } = await _ws.call('GetInputList');
+                    const inputNames = inputs.map(i => i.inputName);
+                    const safeSettings = { is_local_file: true, close_when_inactive: false, restart_on_activate: false, clear_on_media_end: false };
+                    for (const [scene, inputName] of [['VT A', 'VT A Player'], ['VT B', 'VT B Player']]) {
+                        if (!inputNames.includes(inputName)) {
+                            await _ws.call('CreateInput', { sceneName: scene, inputName, inputKind: 'ffmpeg_source', inputSettings: safeSettings });
+                            _log(`Created OBS input: ${inputName}`, 'success');
+                        } else {
+                            await _ws.call('SetInputSettings', { inputName, inputSettings: { close_when_inactive: false, restart_on_activate: false, clear_on_media_end: false } });
+                            const { sceneItems } = await _ws.call('GetSceneItemList', { sceneName: scene });
+                            if (!sceneItems.some(i => i.sourceName === inputName)) {
+                                await _ws.call('CreateSceneItem', { sceneName: scene, sourceName: inputName });
+                            }
+                        }
+                    }
+                    for (const parent of ['VT A', 'VT B']) {
+                        const { sceneItems } = await _ws.call('GetSceneItemList', { sceneName: parent });
+                        if (!sceneItems.some(i => i.sourceName === 'Lower Third')) {
+                            await _ws.call('CreateSceneItem', { sceneName: parent, sourceName: 'Lower Third' });
+                            _log(`Nested Lower Third into ${parent}`, 'success');
+                        }
+                    }
+                    if (!inputNames.includes('Lower Third Text')) {
+                        try {
+                            await _ws.call('CreateInput', { sceneName: 'Lower Third', inputName: 'Lower Third Text', inputKind: 'text_gdiplus', inputSettings: { text: 'Standby' } });
+                        } catch(e) {
+                            await _ws.call('CreateInput', { sceneName: 'Lower Third', inputName: 'Lower Third Text', inputKind: 'text_ft2_source_v2', inputSettings: { text: 'Standby' } });
+                        }
+                        _log('Created Lower Third Text source', 'success');
+                    }
+                    const prog = await _ws.call('GetCurrentProgramScene');
+                    let curProg = prog.sceneName;
+                    if (curProg !== 'VT A' && curProg !== 'VT B') {
+                        await _ws.call('SetCurrentProgramScene', { sceneName: 'VT A' });
+                        curProg = 'VT A';
+                    }
+                    const expectedPrev = curProg === 'VT A' ? 'VT B' : 'VT A';
+                    await _ws.call('SetCurrentPreviewScene', { sceneName: expectedPrev });
+                    _log('OBS environment validated and routed.', 'success');
+                } catch(err) {
+                    _log(`OBS setup error: ${err.message}`, 'error');
+                }
             }
-        }
 
-        function renderObsLog() {
-            if (state.obs.log.length === 0) return '<span class="text-slate-400 italic">No OBS events yet.</span>';
-            return state.obs.log.map(e => {
-                const col = e.type === 'error' ? 'text-red-500' : e.type === 'success' ? 'text-emerald-600' : e.type === 'warn' ? 'text-amber-600' : 'text-slate-500';
-                const prefix = e.type === 'error' ? '[ERR]' : e.type === 'success' ? '[OK]' : e.type === 'warn' ? '[WARN]' : '[INFO]';
-                return `<div class="${col}"><span class="text-slate-300 mr-1">${e.time}</span><span class="font-bold mr-1">${prefix}</span>${e.msg}</div>`;
-            }).join('');
-        }
+            // ── Lower third controls ───────────────────────────────────────────
+            async function _updateL3Text() {
+                const el = document.getElementById('obs-l3-text');
+                if (!el) return;
+                try {
+                    await _ws.call('SetInputSettings', { inputName: 'Lower Third Text', inputSettings: { text: el.value } });
+                    _log(`L3 text updated: "${el.value}"`, 'success');
+                } catch(e) { _log(`L3 text update failed: ${e.message}`, 'error'); }
+            }
 
-        function renderObsDeck(deck) {
-            const d = state.obs['deck' + deck];
-            const isProgram = (deck === 'A' && state.obs.program === 'VT A') || (deck === 'B' && state.obs.program === 'VT B');
-            const isPreview = (deck === 'A' && state.obs.preview === 'VT A') || (deck === 'B' && state.obs.preview === 'VT B');
-            const tallyLabel = isProgram
-                ? '<span class="text-red-600 font-black tracking-widest text-xs">PROGRAM</span>'
-                : isPreview
-                    ? '<span class="text-blue-600 font-bold tracking-widest text-xs">PREVIEW</span>'
-                    : '<span class="text-slate-400 text-xs">STANDBY</span>';
-            const borderClass = isProgram ? 'obs-tally-program border-red-400' : isPreview ? 'obs-tally-preview border-blue-400' : 'border-slate-200';
-            const timeClass   = 'font-mono text-lg font-bold px-3 py-1 rounded bg-slate-100 text-slate-700 transition-all';
+            async function _toggleL3(visible) {
+                try {
+                    for (const sceneName of ['VT A', 'VT B']) {
+                        const { sceneItems } = await _ws.call('GetSceneItemList', { sceneName });
+                        const l3 = sceneItems.find(i => i.sourceName === 'Lower Third');
+                        if (l3) await _ws.call('SetSceneItemEnabled', { sceneName, sceneItemId: l3.sceneItemId, sceneItemEnabled: visible });
+                    }
+                    _log(`Lower Third ${visible ? 'SHOWN' : 'HIDDEN'}`, 'info');
+                } catch(e) { _log(`L3 toggle failed: ${e.message}`, 'error'); }
+            }
 
-            const loadedStory = d.loadedStoryId ? state.storiesMap[d.loadedStoryId] : null;
-            const labelContent = loadedStory
-                ? `<span class="font-bold text-slate-800 text-sm truncate">${escapeHTML(loadedStory.slug)}</span>
-                   <span class="text-xs text-slate-400 font-mono truncate">${escapeHTML(loadedStory.mediaFile)}</span>`
-                : `<span class="text-slate-400 text-xs italic">No clip loaded</span>`;
+            async function _reconcileL3() {
+                try {
+                    const getState = async (sceneName) => {
+                        const { sceneItems } = await _ws.call('GetSceneItemList', { sceneName });
+                        const l3 = sceneItems.find(i => i.sourceName === 'Lower Third');
+                        return l3 ? l3.sceneItemEnabled : null;
+                    };
+                    const [stA, stB] = await Promise.all([getState('VT A'), getState('VT B')]);
+                    if (stA !== null && stB !== null && stA !== stB) {
+                        _log('L3 mismatch detected — forcing hidden as fail-safe.', 'warn');
+                        await _toggleL3(false);
+                    }
+                } catch(e) { _log('L3 reconciliation error: ' + e.message, 'error'); }
+            }
 
-            return `
+            // ── Transport ──────────────────────────────────────────────────────
+            async function _mediaAction(deck, action) {
+                const inputName = deck === 'A' ? 'VT A Player' : 'VT B Player';
+                try {
+                    await _ws.call('TriggerMediaInputAction', { inputName, mediaAction: action });
+                } catch(e) { _log(`Media action failed: ${e.message}`, 'error'); }
+            }
+
+            async function _setCursor(deck, ms) {
+                const inputName = deck === 'A' ? 'VT A Player' : 'VT B Player';
+                try {
+                    await _ws.call('SetMediaInputCursor', { inputName, mediaCursor: ms });
+                } catch(e) { _log(`Cue failed: ${e.message}`, 'error'); }
+            }
+
+            // ── Load deck (Fire and Reconcile) ─────────────────────────────
+            async function _loadDeck(deck, storyId) {
+                if (!state.obs.connected || !storyId) return;
+                const story = state.storiesMap[storyId];
+                if (!story?.mediaFile) return;
+
+                let base = _cfg.base.split('\\').join('/');
+                if (base && !base.endsWith('/')) base += '/';
+                const fullPath  = base + story.mediaFile;
+                const inputName = deck === 'A' ? 'VT A Player' : 'VT B Player';
+
+                state.obs['deck' + deck].loadedStoryId = storyId;
+                _updateDeckLabel(deck);
+                _log(`Loading "${story.mediaFile}" → Deck ${deck}`, 'info');
+
+                try {
+                    await _ws.call('SetInputSettings', { inputName, inputSettings: { local_file: fullPath } });
+                    // Fire play then give OBS 500ms to parse file headers before pausing and cueing.
+                    // The 250ms telemetry poll picks up duration once it becomes available.
+                    await _ws.call('TriggerMediaInputAction', { inputName, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY' });
+                    setTimeout(async () => {
+                        try {
+                            await _ws.call('TriggerMediaInputAction', { inputName, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE' });
+                            await _ws.call('SetMediaInputCursor', { inputName, mediaCursor: 0 });
+                            _log(`Deck ${deck} cued: "${story.slug}"`, 'success');
+                        } catch(e) { _log(`Deck ${deck} cue failed: ${e.message}`, 'error'); }
+                    }, 500);
+                } catch(e) {
+                    _log(`Load failed for Deck ${deck}: ${e.message}`, 'error');
+                }
+            }
+
+
+            // ── Execute take (Fire and Reconcile) ─────────────────────────
+            async function _executeTake() {
+                if (!state.obs.connected || _isTransitioning || state.obs.isTaking) return;
+
+                state.obs.isTaking = true;
+                const btn = document.getElementById('obs-btn-take');
+                if (btn) btn.disabled = true;
+
+                const isANext       = state.obs.preview === 'VT A';
+                const previewPlayer = isANext ? 'VT A Player' : 'VT B Player';
+                const programPlayer = isANext ? 'VT B Player' : 'VT A Player';
+
+                try {
+                    await _reconcileL3();
+                    // Fire play and transition simultaneously — no pre-roll wait.
+                    // Decks are pre-cued by _loadDeck so the clip is ready to go.
+                    _ws.call('TriggerMediaInputAction', { inputName: previewPlayer, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY' });
+                    await _ws.call('TriggerStudioModeTransition');
+                    _log('Take fired.', 'success');
+
+                    // Background reconciliation — cue outgoing deck, advance queue
+                    setTimeout(async () => {
+                        try {
+                            await _ws.call('TriggerMediaInputAction', { inputName: programPlayer, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE' });
+                            await _ws.call('SetMediaInputCursor', { inputName: programPlayer, mediaCursor: 0 });
+
+                            const queue      = state.obs.clipQueue;
+                            const takenIndex = state.obs.clipIndex + 1;
+                            if (queue && takenIndex < queue.length) {
+                                state.obs.clipIndex = takenIndex;
+                                const nextIndex = takenIndex + 2;
+                                // Free deck is the one that was just outgoing (now in preview)
+                                // — always programPlayer's deck, never the deck that just went on air.
+                                const freeDeck  = programPlayer === 'VT A Player' ? 'A' : 'B';
+                                if (nextIndex < queue.length) {
+                                    _log(`Queue [${takenIndex+1}/${queue.length}] taken. Loading clip ${nextIndex+1} onto Deck ${freeDeck}.`, 'info');
+                                    _loadDeck(freeDeck, queue[nextIndex]);
+                                } else {
+                                    _log(`Queue [${takenIndex+1}/${queue.length}] taken. Last clip — no further auto-load.`, 'info');
+                                }
+                            }
+                        } catch(e) {}
+                    }, 1000);
+
+                } catch(err) {
+                    _log(`Take failed: ${err.message}`, 'error');
+                } finally {
+                    state.obs.isTaking = false;
+                    if (btn) btn.disabled = false;
+                }
+            }
+
+
+            // ── Initial load on TX start ───────────────────────────────────────
+            async function _initialLoad(activeOrder) {
+                if (!state.obs.connected) return;
+
+                const queue = activeOrder.filter(id => !!state.storiesMap[id]?.mediaFile);
+                state.obs.clipQueue = queue;
+                state.obs.clipIndex = -1;
+
+                if (queue.length === 0) {
+                    _log('No media clips found in running order.', 'info');
+                    return;
+                }
+
+                // Explicitly route scenes — VT B to program (holding), VT A to preview (first clip).
+                // This overrides whatever OBS had when last used and guarantees Deck A fires first.
+                try {
+                    await _ws.call('SetCurrentProgramScene', { sceneName: 'VT B' });
+                    await _ws.call('SetCurrentPreviewScene', { sceneName: 'VT A' });
+                    state.obs.program = 'VT B';
+                    state.obs.preview = 'VT A';
+                    _updateTallies();
+                } catch(e) {
+                    _log(`OBS routing failed: ${e.message}`, 'error');
+                    return;
+                }
+
+                _log(`Clip queue: ${queue.length} clip(s). Deck A primed for start.`, 'info');
+                await _loadDeck('A', queue[0]);
+                if (queue[1]) await _loadDeck('B', queue[1]);
+                _log(`Ready. Deck A: "${state.storiesMap[queue[0]]?.mediaFile}" | Deck B: "${state.storiesMap[queue[1]]?.mediaFile || 'empty'}"`, 'success');
+            }
+
+            // ── Render helpers (called from renderObsPlayout) ──────────────────
+            function _renderLog() {
+                if (state.obs.log.length === 0) return '<span class="text-slate-400 italic">No OBS events yet.</span>';
+                return state.obs.log.map(e => {
+                    const col    = e.type === 'error' ? 'text-red-500' : e.type === 'success' ? 'text-emerald-600' : e.type === 'warn' ? 'text-amber-600' : 'text-slate-500';
+                    const prefix = e.type === 'error' ? '[ERR]'        : e.type === 'success' ? '[OK]'            : e.type === 'warn' ? '[WARN]'        : '[INFO]';
+                    return `<div class="${col}"><span class="text-slate-300 mr-1">${e.time}</span><span class="font-bold mr-1">${prefix}</span>${e.msg}</div>`;
+                }).join('');
+            }
+
+            function _renderDeck(deck) {
+                const d = state.obs['deck' + deck];
+                const isProgram = (deck === 'A' && state.obs.program === 'VT A') || (deck === 'B' && state.obs.program === 'VT B');
+                const isPreview = (deck === 'A' && state.obs.preview === 'VT A') || (deck === 'B' && state.obs.preview === 'VT B');
+                const tallyLabel = isProgram
+                    ? '<span class="text-red-600 font-black tracking-widest text-xs">PROGRAM</span>'
+                    : isPreview
+                        ? '<span class="text-blue-600 font-bold tracking-widest text-xs">PREVIEW</span>'
+                        : '<span class="text-slate-400 text-xs">STANDBY</span>';
+                const borderClass = isProgram ? 'obs-tally-program border-red-400' : isPreview ? 'obs-tally-preview border-blue-400' : 'border-slate-200';
+                const timeClass   = 'font-mono text-lg font-bold px-3 py-1 rounded bg-slate-100 text-slate-700 transition-all';
+
+                const loadedStory = d.loadedStoryId ? state.storiesMap[d.loadedStoryId] : null;
+                const labelContent = loadedStory
+                    ? `<span class="font-bold text-slate-800 text-sm truncate">${escapeHTML(loadedStory.slug)}</span>
+                       <span class="text-xs text-slate-400 font-mono truncate">${escapeHTML(loadedStory.mediaFile)}</span>`
+                    : `<span class="text-slate-400 text-xs italic">No clip loaded</span>`;
+
+                return `
                 <div id="obs-deck-${deck}" class="bg-white border-2 rounded-xl p-4 flex flex-col gap-3 transition-all duration-300 ${borderClass}">
                     <div class="flex justify-between items-center">
                         <span class="font-bold text-slate-700 bg-slate-100 px-3 py-1 rounded text-sm font-mono tracking-widest">CLIP ${deck}</span>
@@ -2644,7 +2748,6 @@
                     <div id="obs-deck-label-${deck}" class="flex flex-col gap-0.5 min-w-0 bg-slate-50 border border-slate-100 rounded px-3 py-2">
                         ${labelContent}
                     </div>
-
                     <div class="flex justify-center gap-2">
                         <button data-obs-action="play"  data-deck="${deck}" class="p-2 rounded border transition-colors bg-green-500 border-green-600 hover:bg-green-400 text-white" title="Play">
                             <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd"/></svg>
@@ -2661,98 +2764,100 @@
                     </div>
                     <div class="bg-slate-50 border border-slate-100 rounded px-3 py-1.5 text-xs font-mono text-slate-500 flex justify-between">
                         <span>State: <span id="obs-state-${deck}" class="text-slate-800 font-bold">${d.state}</span></span>
-                        <span>Dur: <span id="obs-dur-${deck}" class="text-slate-800">${obsFormatTime(d.duration)}</span></span>
+                        <span>Dur: <span id="obs-dur-${deck}" class="text-slate-800">${_formatTime(d.duration)}</span></span>
                     </div>
                 </div>`;
-        }
+            }
 
-        async function obsLoadDeck(deck, storyId) {
-            if (!state.obs.connected) return;
-            if (!deck || !storyId) return;
-            const story = state.storiesMap[storyId];
-            if (!story?.mediaFile) return;
-
-            let base = obsConfig.base.split('\\').join('/');
-            if (base && !base.endsWith('/')) base += '/';
-            const fullPath = base + story.mediaFile;
-            const inputName = deck === 'A' ? 'VT A Player' : 'VT B Player';
-
-            state.obs['deck' + deck].loadedStoryId = storyId;
-            updateObsDeckLabel(deck);
-
-            obsLog(`Loading "${story.mediaFile}" → Deck ${deck}`, 'info');
-            try {
-                await obsWs.call('SetInputSettings', { inputName, inputSettings: { local_file: fullPath } });
-                await obsWs.call('TriggerMediaInputAction', { inputName, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY' });
-
-                let duration = 0;
-                for (let i = 0; i < 8; i++) {
-                    await new Promise(r => setTimeout(r, 250));
-                    const status = await obsWs.call('GetMediaInputStatus', { inputName });
-                    if (status.mediaDuration > 0) { duration = status.mediaDuration; break; }
+            // ── Public interface ───────────────────────────────────────────────
+            async function connect() {
+                // Cancel any pending retry — ensures only one retry loop is ever running
+                if (_retryTimeout) { clearTimeout(_retryTimeout); _retryTimeout = null; }
+                // Prevent concurrent connection attempts
+                if (_isConnecting) return;
+                _isConnecting = true;
+                try {
+                    if (state.obs.connected) {
+                        state.obs.connected = false;
+                        _stopTelemetry();
+                        _stopSyncInterval();
+                        try { await _ws.disconnect(); } catch(e) {}
+                    }
+                    await _ws.connect(`ws://${_cfg.ip}:${_cfg.port}`, _cfg.pass, { rpcVersion: 1 });
+                    _isConnecting = false;
+                    state.obs.connected = true;
+                    _log(`Connected to OBS at ws://${_cfg.ip}:${_cfg.port}`, 'success');
+                    _updateConnectionBadge();
+                    await _setupEnvironment();
+                    // Force VT A into preview so Deck A is always the first clip
+                    // regardless of what OBS had in preview when it last closed.
+                    try { await _ws.call('SetCurrentPreviewScene', { sceneName: 'VT A' }); } catch(e) {}
+                    await _syncState();
+                    _startTelemetry();
+                    _startSyncInterval();
+                } catch(err) {
+                    _isConnecting = false;
+                    state.obs.connected = false;
+                    _log(`OBS connection failed: ${err.message}`, 'error');
+                    _updateConnectionBadge();
+                    // Single retry path — ConnectionClosed handler does not schedule its own retry
+                    _retryTimeout = setTimeout(() => { _retryTimeout = null; connect(); }, 8000);
                 }
-
-                await obsWs.call('TriggerMediaInputAction', { inputName, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE' });
-                await obsWs.call('SetMediaInputCursor', { inputName, mediaCursor: 0 });
-
-                if (duration > 0) {
-                    obsLog(`Deck ${deck} ready: "${story.mediaFile}" (${obsFormatTime(duration)})`, 'success');
-                } else {
-                    obsLog(`Deck ${deck}: duration timeout — check file path.`, 'warn');
-                }
-            } catch(e) {
-                obsLog(`Load failed for Deck ${deck}: ${e.message}`, 'error');
-            }
-        }
-
-        function updateObsDeckLabel(deck) {
-            const labelEl = document.getElementById('obs-deck-label-' + deck);
-            if (!labelEl) return;
-            const d = state.obs['deck' + deck];
-            const story = d.loadedStoryId ? state.storiesMap[d.loadedStoryId] : null;
-            if (story) {
-                labelEl.innerHTML = `
-                    <span class="font-bold text-slate-800 text-sm truncate">${escapeHTML(story.slug)}</span>
-                    <span class="text-xs text-slate-400 font-mono truncate">${escapeHTML(story.mediaFile)}</span>`;
-            } else {
-                labelEl.innerHTML = `<span class="text-slate-400 text-xs italic">No clip loaded</span>`;
-            }
-        }
-
-        async function obsInitialLoad(activeOrder) {
-            if (!state.obs.connected) return;
-
-            const queue = activeOrder.filter(id => !!state.storiesMap[id]?.mediaFile);
-            state.obs.clipQueue = queue;
-            state.obs.clipIndex = -1;
-
-            if (queue.length === 0) {
-                obsLog('No media clips found in running order.', 'info');
-                return;
             }
 
-            try {
-                await obsWs.call('SetCurrentProgramScene', { sceneName: 'VT B' });
-                await obsWs.call('SetCurrentPreviewScene', { sceneName: 'VT A' });
-                state.obs.program = 'VT B';
-                state.obs.preview = 'VT A';
-                updateObsTallies();
-                obsLog('OBS routed: VT A = preview, VT B = program.', 'info');
-            } catch(e) {
-                obsLog(`OBS routing failed: ${e.message}`, 'error');
-                return;
+            async function disconnect() {
+                if (_retryTimeout) { clearTimeout(_retryTimeout); _retryTimeout = null; }
+                _isConnecting = false;
+                _stopTelemetry();
+                _stopSyncInterval();
+                state.obs.connected = false;
+                try { await _ws.disconnect(); } catch(e) {}
+                _updateConnectionBadge();
             }
 
-            obsLog(`Clip queue: ${queue.length} clip(s). Loading...`, 'info');
-            await obsLoadDeck('A', queue[0]);
-            if (queue[1]) await obsLoadDeck('B', queue[1]);
+            return {
+                // Lifecycle
+                connect,
+                disconnect,
+                loadConfig:  _loadConfig,
+                saveConfig:  _saveConfig,
 
-            obsLog(`Ready. Deck A: "${state.storiesMap[queue[0]]?.mediaFile}" | Deck B: "${state.storiesMap[queue[1]]?.mediaFile || 'empty'}"`, 'success');
-        }
+                // Playout
+                initialLoad: _initialLoad,
+                loadDeck:    _loadDeck,
+                executeTake: _executeTake,
+
+                // Transport
+                mediaAction: _mediaAction,
+                setCursor:   _setCursor,
+
+                // Lower third
+                updateL3Text: _updateL3Text,
+                toggleL3:     _toggleL3,
+                reconcileL3:  _reconcileL3,
+
+                // Render helpers (called from renderObsPlayout)
+                renderLog:  _renderLog,
+                renderDeck: _renderDeck,
+                formatTime: _formatTime,
+
+                // Direct DOM updaters (called from outside render cycle)
+                updateConnectionBadge: _updateConnectionBadge,
+                updateTallies:         _updateTallies,
+                updateDeckDisplay:     _updateDeckDisplay,
+
+                // Expose log function for _syncPlayoutToActive
+                log: _log,
+
+                // Read-only config access for settings modal rendering
+                getConfig: () => ({ ..._cfg }),
+            };
+        })();
 
         // ==========================================
         // END OBS PLAYOUT ENGINE
         // ==========================================
+
 
        /**
          * Renders the Studio / Director view. Structure:
@@ -2957,8 +3062,8 @@
                     </div>
                     ${state.obs.connected ? `
                     <div class="grid grid-cols-2 gap-4 mb-4">
-                        ${renderObsDeck('A')}
-                        ${renderObsDeck('B')}
+                        ${OBS.renderDeck('A')}
+                        ${OBS.renderDeck('B')}
                     </div>
                     <div class="flex items-center gap-3 bg-white border border-slate-200 rounded-xl px-4 py-3">
                         <span class="text-xs font-black uppercase tracking-widest text-slate-500 shrink-0">Lower Third</span>
@@ -2971,7 +3076,7 @@
                     <details class="mt-3">
                         <summary class="text-xs font-bold text-slate-400 uppercase tracking-widest cursor-pointer select-none hover:text-slate-600 transition-colors">OBS System Log</summary>
                         <div id="obs-log-container" class="mt-2 bg-white border border-slate-200 rounded-lg p-3 font-mono text-xs space-y-0.5 max-h-32 overflow-y-auto">
-                            ${renderObsLog()}
+                            ${OBS.renderLog()}
                         </div>
                     </details>
                     ` : `
@@ -3928,19 +4033,19 @@
                                         <div class="grid grid-cols-2 gap-4">
                                             <div>
                                                 <label class="form-label">IP Address</label>
-                                                <input type="text" id="obs-set-ip" value="${escapeHTML(obsConfig.ip)}" placeholder="127.0.0.1" class="form-input">
+                                                <input type="text" id="obs-set-ip" value="${escapeHTML(OBS.getConfig().ip)}" placeholder="127.0.0.1" class="form-input">
                                             </div>
                                             <div>
                                                 <label class="form-label">Port</label>
-                                                <input type="number" id="obs-set-port" value="${escapeHTML(obsConfig.port)}" placeholder="4455" class="form-input">
+                                                <input type="number" id="obs-set-port" value="${escapeHTML(OBS.getConfig().port)}" placeholder="4455" class="form-input">
                                             </div>
                                             <div>
                                                 <label class="form-label">WebSocket Password</label>
-                                                <input type="password" id="obs-set-pass" value="${escapeHTML(obsConfig.pass)}" class="form-input">
+                                                <input type="password" id="obs-set-pass" value="${escapeHTML(OBS.getConfig().pass)}" class="form-input">
                                             </div>
                                             <div>
                                                 <label class="form-label">Base Media Folder</label>
-                                                <input type="text" id="obs-set-base" value="${escapeHTML(obsConfig.base)}" placeholder="D:/Broadcast/Clips/" class="form-input">
+                                                <input type="text" id="obs-set-base" value="${escapeHTML(OBS.getConfig().base)}" placeholder="D:/Broadcast/Clips/" class="form-input">
                                                 <p class="text-xs text-slate-400 mt-1">Include trailing slash. Prepended to all media filenames.</p>
                                             </div>
                                         </div>
@@ -4567,7 +4672,7 @@
                                 state.meta.isCued = true;
                             }
                             const activeOrder = storyIds.filter(id => !state.storiesMap[id]?.isFloated);
-                            if (state.ui.playoutBackend === 'obs')        obsInitialLoad(activeOrder);
+                            if (state.ui.playoutBackend === 'obs')        OBS.initialLoad(activeOrder);
                             else if (state.ui.playoutBackend === 'radio') radioInitialLoad(activeOrder);
                         }
                     }
@@ -4615,9 +4720,7 @@
 
                     // Tear down the outgoing backend
                     if (oldBackend === 'obs') {
-                        if (obsTelemetryInterval) { clearInterval(obsTelemetryInterval); obsTelemetryInterval = null; }
-                        try { await obsWs.disconnect(); } catch(e) {}
-                        state.obs.connected = false;
+                        await OBS.disconnect();
                     } else if (oldBackend === 'radio') {
                         for (const dk of ['deckA', 'deckB']) {
                             const deck = state.radio[dk];
@@ -4639,8 +4742,8 @@
                     localStorage.setItem('moira_playout_backend', newBackend);
 
                     if (newBackend === 'obs') {
-                        loadObsConfig();
-                        connectObs();
+                        OBS.loadConfig();
+                        OBS.connect();
                     } else if (newBackend === 'radio') {
                         loadRadioConfig();
                         populateRadioDevices();
@@ -4965,17 +5068,17 @@
                 }
 
                 if (action === 'obs-disconnect') {
-                    try { await obsWs.disconnect(); } catch(e) {}
+                    await OBS.disconnect();
                     state.ui.isSettingsModalOpen = false;
                     render('modal');
                     return;
                 }
                 if (action === 'save-obs-settings') {
-                    saveObsConfig();
+                    OBS.saveConfig();
                     state.ui.isSettingsModalOpen = false;
                     render('modal');
-                    obsLog('OBS settings saved. Reconnecting...', 'info');
-                    connectObs();
+                    OBS.log('OBS settings saved. Reconnecting...', 'info');
+                    OBS.connect();
                 }
                 if (action === 'save-radio-settings') {
                     const sel = document.getElementById('radio-sink-select');
@@ -5072,15 +5175,15 @@
                 const obsAction = btn.getAttribute('data-obs-action');
                 const deck = btn.getAttribute('data-deck');
 
-                if (obsAction === 'reconnect') { connectObs(); return; }
-                if (obsAction === 'take')      { obsExecuteTake(); return; }
-                if (obsAction === 'l3-update') { obsUpdateL3Text(); return; }
-                if (obsAction === 'l3-show')   { obsToggleL3(true); return; }
-                if (obsAction === 'l3-hide')   { obsToggleL3(false); return; }
-                if (obsAction === 'play')  { obsMediaAction(deck, 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY');  return; }
-                if (obsAction === 'pause') { obsMediaAction(deck, 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE'); return; }
-                if (obsAction === 'stop')  { obsMediaAction(deck, 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP');  return; }
-                if (obsAction === 'cue')   { obsSetCursor(deck, 0); return; }
+                if (obsAction === 'reconnect') { OBS.connect(); return; }
+                if (obsAction === 'take')      { OBS.executeTake(); return; }
+                if (obsAction === 'l3-update') { OBS.updateL3Text(); return; }
+                if (obsAction === 'l3-show')   { OBS.toggleL3(true); return; }
+                if (obsAction === 'l3-hide')   { OBS.toggleL3(false); return; }
+                if (obsAction === 'play')  { OBS.mediaAction(deck, 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY');  return; }
+                if (obsAction === 'pause') { OBS.mediaAction(deck, 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE'); return; }
+                if (obsAction === 'stop')  { OBS.mediaAction(deck, 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP');  return; }
+                if (obsAction === 'cue')   { OBS.setCursor(deck, 0); return; }
             });
 
 
@@ -5152,7 +5255,7 @@
 
         window.addEventListener('beforeunload', () => {
             if (txTimerInterval) clearInterval(txTimerInterval);
-            if (obsTelemetryInterval) clearInterval(obsTelemetryInterval);
+            // OBS telemetry cleared by OBS.disconnect() / module teardown
             if (unsubAll) { unsubAll(); unsubAll = null; }
             releaseWakeLock();
             // Release any held story lock so other users aren't blocked
