@@ -635,7 +635,7 @@
                                 state.ui.presenter.clipAudio = null;
                             }
                             state.ui.presenter.playingClipStoryId = null;
-                            updateBulletinMeta({ presenterClipCommand: null, presenterClipStoryId: null });
+                            updatePresenterClip(null, null);
                         }
                         state.meta = incoming;
                     }
@@ -1028,12 +1028,67 @@
          * roles, and any other top-level meta fields.
          * @param {object} updates - Key/value pairs to merge into bulletin meta.
          */
+        // ── Purpose-specific bulletin mutators ───────────────────────────────────
+        // Each knows exactly which sections it dirties, eliminating the bare render()
+        // in the old generic updateBulletinMeta. All call DB.updateBulletin() so the
+        // Pi adapter gets the same benefit automatically.
+
+        // Presenter clip commands — dirties main (director/presenter clip badge only)
+        async function updatePresenterClip(storyId, command) {
+            if (!canMutate()) return;
+            const updates = { presenterClipStoryId: storyId, presenterClipCommand: command };
+            state.meta.presenterClipStoryId = storyId;
+            state.meta.presenterClipCommand = command;
+            render('main');
+            try { await DB.updateBulletin(updates); }
+            catch(e) { /* non-fatal — clip state clears naturally */ }
+        }
+
+        // Presenter alert — dirties header (alert dot) + main (banner + alert panel)
+        async function updatePresenterAlert(alert) {
+            if (!canMutate()) return;
+            state.meta.presenterAlert = alert;
+            render('header', 'main');
+            try { await DB.updateBulletin({ presenterAlert: alert }); }
+            catch(e) { showError('Alert failed to sync — ' + DB.errorMessage(e)); }
+        }
+
+        // TX/RX clock times — dirties main (timing bar only)
+        async function updateClockTime(field, value) {
+            if (!canMutate()) return;
+            state.meta[field] = value;
+            render('main');
+            try { await DB.updateBulletin({ [field]: value }); }
+            catch(e) { showError('Clock time update failed — ' + DB.errorMessage(e)); }
+        }
+
+        // Formats and roles — dirties modal (settings form) + main (format dropdowns)
+        async function updateFormatsAndRoles(formats, roles) {
+            if (!canMutate()) return;
+            state.meta.formats = formats;
+            state.meta.roles   = roles;
+            render('main', 'modal');
+            try { await DB.updateBulletin({ formats, roles }); }
+            catch(e) { showError('Settings not saved — ' + DB.errorMessage(e)); }
+        }
+
+        // Reset runorder active pointer — dirties main only
+        async function updateActivePointer(updates) {
+            if (!canMutate()) return;
+            state.meta = { ...state.meta, ...updates };
+            render('main');
+            try { await DB.updateBulletin(updates); }
+            catch(e) { showError('Runorder reset failed — ' + DB.errorMessage(e)); }
+        }
+
+        // Generic fallback — kept for the beforeunload best-effort fire-and-forget
+        // path and any edge case not covered by the specific mutators above.
+        // Do NOT add new call sites — use a specific mutator instead.
         async function updateBulletinMeta(updates) {
             if (!canMutate()) return;
             state.meta = { ...state.meta, ...updates };
-            render();
             try { await DB.updateBulletin(updates); }
-            catch(e) { showError('Bulletin update failed — ' + DB.errorMessage(e)); }
+            catch(e) { /* best-effort — called from beforeunload or fallback paths */ }
         }
 
       /**
@@ -1408,7 +1463,7 @@
             // If same story tapped while playing it was a stop — we're done
             if (state.ui.presenter.playingClipStoryId === storyId) {
                 state.ui.presenter.playingClipStoryId = null;
-                updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
+                updatePresenterClip(null, null);
                 render('main');
                 return;
             }
@@ -1441,7 +1496,7 @@
                 URL.revokeObjectURL(objectUrl);
                 state.ui.presenter.clipAudio = null;
                 state.ui.presenter.playingClipStoryId = null;
-                updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
+                updatePresenterClip(null, null);
                 render('main');
             });
 
@@ -1459,12 +1514,12 @@
                 _stopPresenterCountdown();
                 state.ui.presenter.clipAudio = null;
                 state.ui.presenter.playingClipStoryId = null;
-                updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
+                updatePresenterClip(null, null);
             });
             // Start countdown after play() resolves so audio.duration is available
             if (state.ui.presenter.clipAudio) {
                 _startPresenterCountdown(audio, storyId);
-                updateBulletinMeta({ presenterClipStoryId: storyId, presenterClipCommand: null });
+                updatePresenterClip(storyId, null);
             }
         }
         function renderStatusBadge(label, icon, colorClass) {
@@ -4673,7 +4728,7 @@
                     const _canAlert = !!_me && (_me.role === 'Producer' || state.meta.editorStaffId === state.myStaffId);
                     if (text && _canAlert) {
                         const sentBy = getMyName();
-                        updateBulletinMeta({ presenterAlert: { text, sentAt: Date.now(), sentBy } });
+                        updatePresenterAlert({ text, sentAt: Date.now(), sentBy });
                         try { await DB.sendMessage(sentBy, text); }
                         catch(e) { console.warn('Message send failed:', e); showToast(sentBy, text); }
                         e.target.value = '';
@@ -4773,438 +4828,42 @@
             });
 
             // 3. GLOBAL CLICK DELEGATION
-            document.body.addEventListener('click', async e => {
-                const btn = e.target.closest('[data-action]');
-                if (!btn) return;
+            // Thin dispatcher — routes data-action values to named handler groups.
+            // Each group is responsible for one domain of the application.
 
-                const action = btn.getAttribute('data-action');
-                const id = btn.getAttribute('data-id');
-                const val = btn.getAttribute('data-val');
-
-                if (action === 'set-mode') {
-                    if (val === 'presenter' && state.mode === 'presenter') {
-                        state.ui.presenter.presenterMode = state.ui.presenter.presenterMode === 'presenter' ? 'autocue' : 'presenter';
-                    } else {
-                        state.mode = val;
-                        state.ui.lastScrolledStoryId = null;
-                        if (val === 'director') {
-                            const order = state.meta.order || [];
-                            const markerIdx = order.indexOf('marker-line');
-                            const storyIds = markerIdx > -1 ? order.slice(0, markerIdx) : order;
-                            const firstPlayable = storyIds.find(id => state.storiesMap[id]?.type !== 'segment');
-                            if (firstPlayable) {
-                                state.meta.activeStoryId = firstPlayable;
-                                state.meta.isCued = true;
-                            }
-                            const activeOrder = storyIds.filter(id => !state.storiesMap[id]?.isFloated);
-                            if (state.ui.playoutBackend === 'obs')        OBS.initialLoad(activeOrder);
-                            else if (state.ui.playoutBackend === 'radio') radioInitialLoad(activeOrder);
-                        }
-                    }
-                    render('header', 'main');
+            const _handleSettings = async ({ action, val }) => {
+                if (action === 'export-config')        { exportConfig(); return true; }
+                if (action === 'open-settings-modal')  { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'connection'; render('modal'); return true; }
+                if (action === 'close-settings-modal') { state.ui.isSettingsModalOpen = false; state.ui.settingsTab = 'connection'; render('modal'); return true; }
+                if (action === 'set-settings-tab')     { state.ui.settingsTab = val; render('modal'); return true; }
+                if (action === 'clear-settings')       { localStorage.removeItem('moira_firebase_config'); window.location.reload(); return true; }
+                if (action === 'factory-reset') {
+                    if (!confirm('This will clear all local settings and reload. Are you sure?')) return true;
+                    ['moira_firebase_config','moira_room_name','moira_bulletin_id','moira_my_staff_id','moira_playout_backend','OBS_IP','OBS_PORT','OBS_PASSWORD','OBS_BASE_FOLDER','RADIO_SINK_ID'].forEach(k => localStorage.removeItem(k));
+                    window.location.reload();
+                    return true;
                 }
-
-                if (action === 'join-room') switchRoom(document.getElementById('header-room-input').value);
-
-                const isRundownLocked = state.meta.rundownLocked && state.meta.editorStaffId !== state.myStaffId;
-                if (action === 'add-story') { if (!isRundownLocked) addStory(); return; }
-                if (action === 'add-segment') { if (!isRundownLocked) addSegment(); return; }
-                if (action === 'toggle-float') { if (!isRundownLocked) toggleFloat(id); return; }
-                if (action === 'delete-story') { if (!isRundownLocked) deleteStory(id); return; }
-                if (action === 'rescue-story') { rescueStory(id); return; }
-                if (action === 'revert-story') { revertStory(id); return; }
-                if (action === 'clear-trash') { state.ui.trash = []; render('main'); return; }
-                if (action === 'toggle-complete') toggleStoryComplete(id);
-                if (action === 'export-config') { exportConfig(); return; }
-                if (action === 'open-settings-modal') { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'connection'; render('modal'); }
-                if (action === 'close-settings-modal') { state.ui.isSettingsModalOpen = false; state.ui.settingsTab = 'connection'; render('modal'); }
-                if (action === 'set-settings-tab') { state.ui.settingsTab = val; render('modal'); }
                 if (action === 'save-settings') {
                     const newConfig = {
-                        apiKey: document.getElementById('config-apikey').value.trim(),
-                        authDomain: document.getElementById('config-authdomain').value.trim(),
-                        projectId: document.getElementById('config-projectid').value.trim(),
+                        apiKey:        document.getElementById('config-apikey').value.trim(),
+                        authDomain:    document.getElementById('config-authdomain').value.trim(),
+                        projectId:     document.getElementById('config-projectid').value.trim(),
                         storageBucket: document.getElementById('config-storagebucket').value.trim()
                     };
-                    if (newConfig.apiKey) { localStorage.setItem('moira_firebase_config', JSON.stringify(newConfig)); window.location.reload(); }
-                }
-                if (action === 'clear-settings') { localStorage.removeItem('moira_firebase_config'); window.location.reload(); }
-                if (action === 'factory-reset') {
-                    Object.keys(localStorage).forEach(key => { if (key.startsWith('moira_')) localStorage.removeItem(key); });
-                    window.location.reload();
+                    if (newConfig.apiKey && newConfig.projectId) {
+                        localStorage.setItem('moira_firebase_config', JSON.stringify(newConfig));
+                        window.location.reload();
+                    }
+                    return true;
                 }
                 if (action === 'save-editorial-settings') {
                     const formats = document.getElementById('settings-formats-input').value.split('\n').map(f => f.trim()).filter(f => f.length > 0);
-                    const roles = document.getElementById('settings-roles-input').value.split('\n').map(r => r.trim()).filter(r => r.length > 0);
-                    updateBulletinMeta({ formats, roles });
+                    const roles   = document.getElementById('settings-roles-input').value.split('\n').map(r => r.trim()).filter(r => r.length > 0);
+                    updateFormatsAndRoles(formats, roles);
+                    return true;
                 }
-                if (action === 'set-playout-backend') {
-                    const newBackend = val; // 'none' | 'radio' | 'obs'
-                    const oldBackend = state.ui.playoutBackend;
-                    if (newBackend === oldBackend) return;
-
-                    // Tear down the outgoing backend
-                    if (oldBackend === 'obs') {
-                        await OBS.disconnect();
-                    } else if (oldBackend === 'radio') {
-                        for (const dk of ['deckA', 'deckB']) {
-                            const deck = state.radio[dk];
-                            if (deck.audio) { deck.audio.pause(); }
-                            stopRadioMeter(deck);
-                            for (const n of [deck.sourceNode, deck.splitter, deck.analyserL, deck.analyserR, deck.gainNode]) {
-                                if (n) try { n.disconnect(); } catch(e) {}
-                            }
-                            if (deck.objectUrl) { URL.revokeObjectURL(deck.objectUrl); }
-                            state.radio[dk] = makeRadioDeckState(dk === 'deckA' ? 'A' : 'B');
-                        }
-                        if (radioAudioCtx) { try { await radioAudioCtx.close(); } catch(e) {} radioAudioCtx = null; }
-                        if (radioRafId) { cancelAnimationFrame(radioRafId); radioRafId = null; }
-                        state.radio.log = [];
-                    }
-
-                    // Start up the incoming backend
-                    state.ui.playoutBackend = newBackend;
-                    localStorage.setItem('moira_playout_backend', newBackend);
-
-                    if (newBackend === 'obs') {
-                        OBS.loadConfig();
-                        OBS.connect();
-                    } else if (newBackend === 'radio') {
-                        loadRadioConfig();
-                        populateRadioDevices();
-                    }
-
-                    render('main', 'modal'); return;
-                }
-                if (action === 'toggle-alert-panel') {
-                    state.ui.alertPanelOpen = !state.ui.alertPanelOpen;
-                    render('main');
-                    return;
-                }
-
-                if (action === 'send-presenter-alert') {
-                    // Role gate — Producer or Editor only
-                    const _me = (state.meta.staff||[]).find(s => s.id === state.myStaffId);
-                    const _canAlert = !!_me && (_me.role === 'Producer' || state.meta.editorStaffId === state.myStaffId);
-                    if (!_canAlert) return;
-                    const input = document.getElementById('presenter-alert-input');
-                    const text = input ? input.value.trim() : '';
-                    if (!text) return;
-                    const sentBy = getMyName();
-                    // 1. Persist to bulletin for late-joining clients (existing banner behaviour)
-                    updateBulletinMeta({ presenterAlert: { text, sentAt: Date.now(), sentBy } });
-                    // 2. Write to messages sub-collection — fires toast on all connected clients
-                    try { await DB.sendMessage(sentBy, text); }
-                    catch(e) { console.warn('Message send failed:', e); showToast(sentBy, text); }
-                    if (input) input.value = '';
-                    state.ui.alertPanelOpen = false;
-                    render('main');
-                    return;
-                }
-
-                if (action === 'clear-presenter-alert') {
-                    updateBulletinMeta({ presenterAlert: null });
-                    state.ui.alertPanelOpen = false;
-                    render('main');
-                    return;
-                }
-
-                if (action === 'director-stop-presenter-clip') {
-                    // Write stop command to Firebase — presenter's onSnapshot handler will act on it
-                    updateBulletinMeta({ presenterClipCommand: 'stop' });
-                    // Also stop locally in case director and presenter are the same client
-                    if (state.ui.presenter.playingClipStoryId) {
-                        _stopPresenterCountdown();
-                        if (state.ui.presenter.clipAudio) {
-                            state.ui.presenter.clipAudio.pause();
-                            if (state.ui.presenter.clipAudio.objectUrl)
-                                URL.revokeObjectURL(state.ui.presenter.clipAudio.objectUrl);
-                            state.ui.presenter.clipAudio = null;
-                        }
-                        state.ui.presenter.playingClipStoryId = null;
-                        updateBulletinMeta({ presenterClipStoryId: null, presenterClipCommand: null });
-                        render('main');
-                    }
-                    return;
-                }
-                if (action === 'studio-tx-toggle') updateStudioMode(state.meta.isTXMode ? 'standby' : 'tx');
-                if (action === 'set-studio-state') updateStudioMode(val);
-
-                if (action === 'open-staff-modal') { state.ui.isStaffModalOpen = true; render('modal'); }
-                if (action === 'close-staff-modal') { state.ui.isStaffModalOpen = false; render('modal'); }
-                if (action === 'edit-story') { state.ui.editingStoryId = id; lockStory(id); startLockRefresh(id); render('modal'); }
-                if (action === 'save-tx-time') {
-                    const txVal = document.getElementById('tx-clock-input')?.value.trim() || '';
-                    if (txVal && !/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(txVal)) {
-                        alert('Please enter a valid TX time (HH:MM or HH:MM:SS)');
-                        return;
-                    }
-                    updateBulletinMeta({ txClockTime: txVal });
-                    return;
-                }
-                if (action === 'save-rx-time') {
-                    const rxVal = document.getElementById('rx-clock-input')?.value.trim() || '';
-                    if (rxVal && !/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(rxVal)) {
-                        alert('Please enter a valid RX time (HH:MM or HH:MM:SS)');
-                        return;
-                    }
-                    updateBulletinMeta({ rxClockTime: rxVal });
-                    return;
-                }
-
-                // ── INLINE SLUG EDIT ─────────────────────────────────────────
-                if (action === 'inline-edit-slug') {
-                    const story = state.storiesMap[id];
-                    if (!canMutate()) return;
-                    if (!story || (story.lockedBySession && story.lockedBySession !== state.sessionId)) return;
-
-                    state.ui.inlineEditingId = id;
-                    await lockStory(id);
-
-                    const liveSpan = document.querySelector(`[data-action="inline-edit-slug"][data-id="${id}"]`);
-                    if (!liveSpan) { state.ui.inlineEditingId = null; render('main'); return; }
-
-                    const originalSlug = state.storiesMap[id]?.slug ?? '';
-
-                    const input = document.createElement('input');
-                    input.type = 'text';
-                    input.value = originalSlug;
-                    input.className = 'w-full border-2 border-blue-500 rounded px-1 text-slate-800 font-semibold outline-none bg-white shadow-sm ring-2 ring-blue-100';
-
-                    let committed = false;
-                    let escapedOut = false; // explicit cancel flag — set synchronously before any await
-
-                    const finish = async (save) => {
-                        if (committed) return;
-                        committed = true;
-                        state.ui.inlineEditingId = null;
-                        const newSlug = input.value.trim();
-                        if (save && !escapedOut && newSlug && newSlug !== originalSlug) {
-                            // Optimistic update then persist via adapter
-                            state.storiesMap[id].slug = newSlug;
-                            render('main');
-                            try {
-                                await DB.saveSlug(id, newSlug, state.sessionId);
-                                // Adapter releases lock server-side; clear locally too
-                                if (state.storiesMap[id]) {
-                                    state.storiesMap[id].lockedBySession = null;
-                                    state.storiesMap[id].lockedByName = null;
-                                    state.storiesMap[id].lockedAt = null;
-                                }
-                            } catch(e) {
-                                showError('Slug not saved — ' + DB.errorMessage(e));
-                                await unlockStory(id);
-                                render('main');
-                            }
-                        } else {
-                            await unlockStory(id);
-                            render('main');
-                        }
-                    };
-
-                    input.addEventListener('keydown', async ev => {
-                        if (ev.key === 'Enter') {
-                            ev.preventDefault();
-                            ev.stopPropagation();
-                            // Blur removes focus so render() isn't suppressed by userIsTyping.
-                            // The blur handler then calls finish(true).
-                            input.blur();
-                        } else if (ev.key === 'Escape') {
-                            ev.preventDefault();
-                            ev.stopPropagation();
-                            escapedOut = true;   // block blur handler from saving
-                            input.blur();        // remove focus; blur sees escapedOut and does nothing
-                            await finish(false); // discard and render
-                        }
-                    });
-
-                    input.addEventListener('blur', () => { if (!escapedOut) finish(true); });
-
-                    liveSpan.replaceWith(input);
-                    input.focus();
-                    input.select();
-                }
-
-                if (action === 'print-scripts') { printScripts(); }
-                if (action === 'browse-media') document.getElementById('media-file-picker').click();
-
-                if (action === 'take-over-edit') {
-                    const storyId = state.ui.editingStoryId;
-                    if (!storyId) return;
-                    const userName = getMyName();
-                    const now = Date.now();
-                    if (state.storiesMap[storyId]) {
-                        state.storiesMap[storyId].lockedBySession = state.sessionId;
-                        state.storiesMap[storyId].lockedByName = userName;
-                        state.storiesMap[storyId].lockedAt = now;
-                    }
-                    render('modal');
-                    try { await DB.takeLock(storyId, state.sessionId, userName, now); }
-                    catch(e) { showError('Could not take over edit — ' + DB.errorMessage(e)); }
-                }
-
-                if (action === 'cancel-edit') { const editingId = state.ui.editingStoryId; state.ui.editingStoryId = null; stopLockRefresh(); if (editingId) unlockStory(editingId); render('main', 'modal'); }
-
-                if (action === 'add-staff') {
-                    const nameInput = document.getElementById('new-staff-name');
-                    const roleInput = document.getElementById('new-staff-role');
-                    if (!nameInput || !roleInput) return;
-                    const name = nameInput.value.trim();
-                    const role = roleInput.value;
-                    if (name) {
-                        const newId = crypto.randomUUID();
-                        await updateStaffInCloud(currentStaff => [...currentStaff, { id: newId, name, role, checkedIn: false }]);
-                        nameInput.value = '';
-                    }
-                }
-                if (action === 'bulk-add-staff') {
-                    const bulkInput = document.getElementById('bulk-staff-input');
-                    if (!bulkInput) return;
-                    const names = bulkInput.value.split('\n').map(n => n.trim()).filter(n => n.length > 0);
-                    if (names.length > 0) {
-                        await updateStaffInCloud(currentStaff => [...currentStaff, ...names.map(name => ({ id: crypto.randomUUID(), name, role: 'Reporter', checkedIn: false }))]);
-                        bulkInput.value = '';
-                    }
-                }
-                if (action === 'check-in') {
-                    state.myStaffId = id;
-                    localStorage.setItem('moira_my_staff_id', id);
-                    updateStaffInCloud(staff => staff.map(s => s.id === id ? { ...s, checkedIn: true, lastSeen: Date.now() } : s));
-                    render('header');
-                }
-                if (action === 'check-out') {
-                    state.myStaffId = null;
-                    localStorage.removeItem('moira_my_staff_id');
-                    updateStaffInCloud(staff => staff.map(s => s.id === id ? { ...s, checkedIn: false, lastSeen: null } : s));
-                    render('header');
-                }
-                if (action === 'set-editor') {
-                    const newEditor = state.meta.editorStaffId === id ? null : id;
-                    state.meta.editorStaffId = newEditor;
-                    render('header', 'main');
-                    if (canMutate()) {
-                        try { await DB.updateBulletin({ editorStaffId: newEditor }); }
-                        catch(e) { showError('Could not set editor — ' + DB.errorMessage(e)); }
-                    }
-                }
-                if (action === 'toggle-rundown-lock') {
-                    if (state.meta.editorStaffId !== state.myStaffId) return;
-                    const newLocked = !state.meta.rundownLocked;
-                    state.meta.rundownLocked = newLocked;
-                    render('main');
-                    if (canMutate()) {
-                        try { await DB.updateBulletin({ rundownLocked: newLocked }); }
-                        catch(e) { showError('Could not toggle rundown lock — ' + DB.errorMessage(e)); }
-                    }
-                }
-                if (action === 'remove-staff') {
-                    if (id === state.myStaffId) { state.myStaffId = null; localStorage.removeItem('moira_my_staff_id'); }
-                    if (id === state.meta.editorStaffId) {
-                        state.meta.editorStaffId = null;
-                        state.meta.rundownLocked = false;
-                        try { await DB.updateBulletin({ editorStaffId: null, rundownLocked: false }); }
-                        catch(e) { showError('Could not clear editor — ' + DB.errorMessage(e)); }
-                    }
-                    updateStaffInCloud(staff => staff.filter(s => s.id !== id));
-                }
-                if (action === 'save-edit') {
-                    stopLockRefresh();
-                    let durStr = document.getElementById('edit-duration').value;
-                    let parsedDuration = 0;
-                    if (durStr.includes(':')) { const [m, s] = durStr.split(':'); parsedDuration = (parseInt(m, 10) || 0) * 60 + (parseInt(s, 10) || 0); } else { parsedDuration = parseInt(durStr, 10) || 0; }
-                    const editingStory = state.storiesMap[state.ui.editingStoryId];
-                    if (editingStory?.type === 'segment') {
-                        // Segment save — label and duration only
-                        saveStory(state.ui.editingStoryId, { slug: document.getElementById('edit-slug').value.toUpperCase(), duration: parsedDuration, rev: parseInt(document.getElementById('edit-rev').value, 10) });
-                    } else {
-                        const scriptText = document.getElementById('edit-script').value;
-                        // duration field now holds the total (read + clip) — no need to add clip tags separately
-                        saveStory(state.ui.editingStoryId, { slug: document.getElementById('edit-slug').value, format: document.getElementById('edit-format').value, presenterId: document.getElementById('edit-presenter').value, reporterId: document.getElementById('edit-reporter').value, mediaFile: document.getElementById('edit-media-file').value.trim(), duration: parsedDuration, script: scriptText, rev: parseInt(document.getElementById('edit-rev').value, 10) });
-                    }
-                }
-                if (action === 'resolve-conflict') {
-                    const { storyId, serverData, localData } = state.ui.pendingConflict;
-                    if (val === 'overwrite') { stopLockRefresh(); localData.rev = serverData.rev; state.ui.pendingConflict = null; saveStory(storyId, localData); } else { state.ui.pendingConflict = null; state.ui.editingStoryId = null; stopLockRefresh(); unlockStory(storyId); render('main', 'modal'); }
-                }
-                if (action === 'take-next') shiftActiveStory(1);
-                if (action === 'undo-take') shiftActiveStory(-1);
-                if (action === 'reset-runorder') {
-                    const rawOrder = state.meta.order || [];
-                    const markerIdx = rawOrder.indexOf('marker-line');
-                    const storyIds = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
-                        .filter(id => !state.storiesMap[id]?.isFloated && state.storiesMap[id]?.type !== 'segment');
-                    const firstId = storyIds[0] || null;
-                    const now = Date.now();
-                    const updates = {
-                        activeStoryId: firstId,
-                        activeStoryStartedAt: firstId ? now : null,
-                        showStartTime: state.meta.isTXMode ? now : state.meta.showStartTime,
-                        txStartedAt: state.meta.isTXMode ? now : state.meta.txStartedAt,
-                    };
-                    updateBulletinMeta(updates);
-                    await syncPlayoutToActive(firstId);
-                    return;
-                }
-
-                if (action === 'presenter-font-up') { state.ui.presenter.fontScale = Math.min(state.ui.presenter.fontScale + 0.15, 2.5); render('main'); return; }
-                if (action === 'presenter-font-down') { state.ui.presenter.fontScale = Math.max(state.ui.presenter.fontScale - 0.15, 0.4); render('main'); return; }
-                if (action === 'presenter-speed-up') { state.ui.presenter.scrollSpeed = Math.min(state.ui.presenter.scrollSpeed + 5, 200); render('main'); return; }
-                if (action === 'presenter-speed-down') { state.ui.presenter.scrollSpeed = Math.max(state.ui.presenter.scrollSpeed - 5, 0); render('main'); return; }
-                if (action === 'presenter-scroll-toggle') { state.ui.presenter.autoScroll = !state.ui.presenter.autoScroll; render('main'); return; }
-                if (action === 'presenter-find') {
-                    const activeEl = document.getElementById(`presenter-story-${state.meta.activeStoryId}`);
-                    if (activeEl) activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    return;
-                }
-                if (action === 'presenter-story-prev' || action === 'presenter-story-next') {
-                    const rawOrder = state.meta.order || [];
-                    const markerIdx = rawOrder.indexOf('marker-line');
-                    const storyIds = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
-                        .filter(id => !state.storiesMap[id]?.isFloated);
-                    const cur = storyIds.indexOf(state.meta.activeStoryId);
-                    const next = action === 'presenter-story-next' ? cur + 1 : cur - 1;
-                    if (next >= 0 && next < storyIds.length) {
-                        state.meta.activeStoryId = storyIds[next];
-                        state.ui.lastScrolledStoryId = storyIds[next];
-                        render('main');
-                        const container = document.getElementById('main-container');
-                        const target = document.getElementById(`presenter-story-${storyIds[next]}`);
-                        if (container && target) {
-                            const containerRect = container.getBoundingClientRect();
-                            const targetRect = target.getBoundingClientRect();
-                            container.scrollTop += targetRect.top - containerRect.top;
-                        }
-                    }
-                    return;
-                }
-                if (action === 'ref-toggle-expand') {
-                    const id = e.target.closest('[data-id]')?.getAttribute('data-id');
-                    if (id) {
-                        state.ui.presenter.expandedStoryId =
-                            state.ui.presenter.expandedStoryId === id ? null : id;
-                        render('main');
-                        setTimeout(() => {
-                            const el = document.getElementById(`ref-story-${id}`);
-                            if (el && state.ui.presenter.expandedStoryId === id)
-                                el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-                        }, 50);
-                    }
-                    return;
-                }
-
-                if (action === 'obs-disconnect') {
-                    await OBS.disconnect();
-                    state.ui.isSettingsModalOpen = false;
-                    render('modal');
-                    return;
-                }
-                if (action === 'save-obs-settings') {
-                    OBS.saveConfig();
-                    state.ui.isSettingsModalOpen = false;
-                    render('modal');
-                    OBS.log('OBS settings saved. Reconnecting...', 'info');
-                    OBS.connect();
-                }
+                if (action === 'obs-disconnect')    { await OBS.disconnect(); state.ui.isSettingsModalOpen = false; render('modal'); return true; }
+                if (action === 'save-obs-settings') { OBS.saveConfig(); state.ui.isSettingsModalOpen = false; OBS.log('OBS settings saved. Reconnecting...', 'info'); OBS.connect(); render('modal'); return true; }
                 if (action === 'save-radio-settings') {
                     const sel = document.getElementById('radio-sink-select');
                     if (sel) {
@@ -5212,32 +4871,21 @@
                         localStorage.setItem('RADIO_SINK_ID', sel.value);
                         for (const dk of ['deckA', 'deckB']) {
                             const deck = state.radio[dk];
-                            if (deck.audio?.setSinkId) {
-                                deck.audio.setSinkId(sel.value).catch(() => {});
-                            }
+                            if (deck.audio?.setSinkId) deck.audio.setSinkId(sel.value).catch(() => {});
                         }
                     }
                     state.ui.isSettingsModalOpen = false;
                     render('modal');
-                    return;
+                    return true;
                 }
-
                 if (action === 'toggle-presenter-self-fire') {
                     state.ui.presenter.selfFireEnabled = !state.ui.presenter.selfFireEnabled;
                     localStorage.setItem('moira_presenter_self_fire', state.ui.presenter.selfFireEnabled);
                     render('modal');
-                    return;
-                }
-                if (action === 'presenter-fire-clip') {
-                    const storyId = e.target.closest('[data-id]')?.getAttribute('data-id');
-                    if (storyId) await presenterFireClip(storyId);
-                    return;
+                    return true;
                 }
                 if (action === 'grant-media-folder') {
-                    if (!window.showDirectoryPicker) {
-                        alert('File System Access API is not supported in this browser. Use Chrome or Edge for auto-preload.');
-                        return;
-                    }
+                    if (!window.showDirectoryPicker) { alert('File System Access API is not supported in this browser. Use Chrome or Edge.'); return true; }
                     try {
                         const handle = await window.showDirectoryPicker({ mode: 'read' });
                         state.radio.directoryHandle = handle;
@@ -5246,17 +4894,15 @@
                         radioLog(`Media folder granted: "${handle.name}"`, 'success');
                         render('modal');
                     } catch(e) {
-                        if (e.name === 'AbortError') return; // user cancelled picker — no error needed
+                        if (e.name === 'AbortError') return true;
                         radioLog(`Folder access error: ${e.message}`, 'error');
                         showError(`Could not access media folder — ${e.message}`);
                     }
-                    return;
+                    return true;
                 }
-
                 if (action === 'restore-media-folder') {
-                    // One-click re-grant from the pending handle restored from IndexedDB
                     const pending = state.ui.mediaFolderPendingHandle;
-                    if (!pending) return;
+                    if (!pending) return true;
                     try {
                         const perm = await pending.requestPermission({ mode: 'read' });
                         if (perm === 'granted') {
@@ -5269,37 +4915,441 @@
                             radioLog('Folder access denied by browser.', 'error');
                             showError('Media folder access was denied. Use "Choose Folder" in Settings → Playout to grant access again.', 'Open Settings', () => { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'playout'; render('modal'); });
                         }
-                        // 'prompt' — user dismissed without choosing, leave pending so they can try again
                     } catch(e) { radioLog(`Restore failed: ${e.message}`, 'error'); }
-                    return;
+                    return true;
                 }
-
                 if (action === 'revoke-media-folder') {
                     state.radio.directoryHandle = null;
                     state.ui.mediaFolderPendingHandle = null;
                     await idbClearHandle();
                     radioLog('Media folder access revoked.', 'info');
                     render('modal');
-                    return;
+                    return true;
                 }
-
-                if (action === 'radio-refresh-devices') {
-                    populateRadioDevices();
-                    return;
+                if (action === 'radio-refresh-devices') { populateRadioDevices(); return true; }
+                if (action === 'set-playout-backend') {
+                    const newBackend = val;
+                    const oldBackend = state.ui.playoutBackend;
+                    if (newBackend === oldBackend) return true;
+                    if (oldBackend === 'obs') {
+                        await OBS.disconnect();
+                    } else if (oldBackend === 'radio') {
+                        for (const dk of ['deckA', 'deckB']) {
+                            const d = state.radio[dk];
+                            if (d.audio) { d.audio.pause(); }
+                            stopRadioMeter(d);
+                            for (const n of [d.sourceNode, d.splitter, d.analyserL, d.analyserR, d.gainNode]) {
+                                if (n) try { n.disconnect(); } catch(e2) {}
+                            }
+                            if (d.objectUrl) { URL.revokeObjectURL(d.objectUrl); }
+                            state.radio[dk] = makeRadioDeckState(dk === 'deckA' ? 'A' : 'B');
+                        }
+                        if (radioAudioCtx) { try { await radioAudioCtx.close(); } catch(e2) {} radioAudioCtx = null; }
+                        if (radioRafId) { cancelAnimationFrame(radioRafId); radioRafId = null; }
+                        state.radio.log = [];
+                    }
+                    state.ui.playoutBackend = newBackend;
+                    localStorage.setItem('moira_playout_backend', newBackend);
+                    if (newBackend === 'obs')   { OBS.loadConfig(); OBS.connect(); }
+                    else if (newBackend === 'radio') { loadRadioConfig(); populateRadioDevices(); }
+                    render('main', 'modal');
+                    return true;
                 }
+                return false;
+            };
 
-                // ── RADIO PLAYOUT ACTIONS ────────────────────────────────────
-                const deck   = btn.getAttribute('data-deck');
-                const deckKey = deck === 'A' ? 'deckA' : 'deckB';
-                if (action === 'radio-play')  { radioPlay(deckKey);  return; }
-                if (action === 'radio-pause') { radioPause(deckKey); return; }
-                if (action === 'radio-stop')  { radioStop(deckKey);  return; }
-                if (action === 'radio-cue')   { radioCue(deckKey);   return; }
-                if (action === 'radio-take')  { radioExecuteTake();  return; }
-                if (action === 'radio-scrub') { radioScrub(deck, e); return; }
+            const _handleStaff = async ({ action, id, val }) => {
+                if (action === 'open-staff-modal')  { state.ui.isStaffModalOpen = true; render('modal'); return true; }
+                if (action === 'close-staff-modal') { state.ui.isStaffModalOpen = false; render('modal'); return true; }
+                if (action === 'add-staff') {
+                    const nameInput = document.getElementById('new-staff-name');
+                    const roleInput = document.getElementById('new-staff-role');
+                    if (!nameInput || !roleInput) return true;
+                    const name = nameInput.value.trim();
+                    const role = roleInput.value;
+                    if (name) {
+                        const newId = crypto.randomUUID();
+                        await updateStaffInCloud(current => [...current, { id: newId, name, role, checkedIn: false }]);
+                        nameInput.value = '';
+                    }
+                    return true;
+                }
+                if (action === 'bulk-add-staff') {
+                    const bulkInput = document.getElementById('bulk-staff-input');
+                    if (!bulkInput) return true;
+                    const names = bulkInput.value.split('\n').map(n => n.trim()).filter(n => n.length > 0);
+                    if (names.length > 0) {
+                        await updateStaffInCloud(current => [...current, ...names.map(name => ({ id: crypto.randomUUID(), name, role: 'Reporter', checkedIn: false }))]);
+                        bulkInput.value = '';
+                    }
+                    return true;
+                }
+                if (action === 'check-in') {
+                    state.myStaffId = id;
+                    localStorage.setItem('moira_my_staff_id', id);
+                    updateStaffInCloud(staff => staff.map(s => s.id === id ? { ...s, checkedIn: true, lastSeen: Date.now() } : s));
+                    render('header');
+                    return true;
+                }
+                if (action === 'check-out') {
+                    state.myStaffId = null;
+                    localStorage.removeItem('moira_my_staff_id');
+                    updateStaffInCloud(staff => staff.map(s => s.id === id ? { ...s, checkedIn: false, lastSeen: null } : s));
+                    render('header');
+                    return true;
+                }
+                if (action === 'set-editor') {
+                    const newEditor = state.meta.editorStaffId === id ? null : id;
+                    state.meta.editorStaffId = newEditor;
+                    render('header', 'main');
+                    if (canMutate()) {
+                        try { await DB.updateBulletin({ editorStaffId: newEditor }); }
+                        catch(e) { showError('Could not set editor — ' + DB.errorMessage(e)); }
+                    }
+                    return true;
+                }
+                if (action === 'toggle-rundown-lock') {
+                    if (state.meta.editorStaffId !== state.myStaffId) return true;
+                    const newLocked = !state.meta.rundownLocked;
+                    state.meta.rundownLocked = newLocked;
+                    render('main');
+                    if (canMutate()) {
+                        try { await DB.updateBulletin({ rundownLocked: newLocked }); }
+                        catch(e) { showError('Could not toggle rundown lock — ' + DB.errorMessage(e)); }
+                    }
+                    return true;
+                }
+                if (action === 'remove-staff') {
+                    if (id === state.myStaffId) { state.myStaffId = null; localStorage.removeItem('moira_my_staff_id'); }
+                    if (id === state.meta.editorStaffId) {
+                        state.meta.editorStaffId = null;
+                        state.meta.rundownLocked = false;
+                        try { await DB.updateBulletin({ editorStaffId: null, rundownLocked: false }); }
+                        catch(e) { showError('Could not clear editor — ' + DB.errorMessage(e)); }
+                    }
+                    updateStaffInCloud(staff => staff.filter(s => s.id !== id));
+                    return true;
+                }
+                return false;
+            };
+
+            const _handleRundown = async ({ action, id, val }) => {
+                if (action === 'set-mode') {
+                    if (val === 'presenter' && state.mode === 'presenter') {
+                        // Toggle between presenter and autocue if already in presenter mode
+                        state.ui.presenter.presenterMode = state.ui.presenter.presenterMode === 'presenter' ? 'autocue' : 'presenter';
+                    } else {
+                        state.mode = val;
+                        state.ui.lastScrolledStoryId = null;
+                        if (val === 'director') {
+                            const order     = state.meta.order || [];
+                            const markerIdx = order.indexOf('marker-line');
+                            const storyIds  = markerIdx > -1 ? order.slice(0, markerIdx) : order;
+                            const firstPlayable = storyIds.find(id => state.storiesMap[id]?.type !== 'segment');
+                            if (firstPlayable) { state.meta.activeStoryId = firstPlayable; state.meta.isCued = true; }
+                            const activeOrder = storyIds.filter(id => !state.storiesMap[id]?.isFloated);
+                            if (state.ui.playoutBackend === 'obs')        OBS.initialLoad(activeOrder);
+                            else if (state.ui.playoutBackend === 'radio') radioInitialLoad(activeOrder);
+                        }
+                    }
+                    render('header', 'main');
+                    return true;
+                }
+                const isRundownLocked = state.meta.rundownLocked && state.meta.editorStaffId !== state.myStaffId;
+                if (action === 'add-story')       { if (!isRundownLocked) addStory(); return true; }
+                if (action === 'add-segment')     { if (!isRundownLocked) addSegment(); return true; }
+                if (action === 'toggle-float')    { if (!isRundownLocked) toggleFloat(id); return true; }
+                if (action === 'delete-story')    { if (!isRundownLocked) deleteStory(id); return true; }
+                if (action === 'rescue-story')    { rescueStory(id); return true; }
+                if (action === 'revert-story')    { revertStory(id); return true; }
+                if (action === 'clear-trash')     { state.ui.trash = []; render('main'); return true; }
+                if (action === 'toggle-complete') { toggleStoryComplete(id); return true; }
+                if (action === 'join-room')       { switchRoom(document.getElementById('header-room-input').value); return true; }
+                if (action === 'print-scripts')   { printScripts(); return true; }
+                if (action === 'browse-media')    { document.getElementById('media-file-picker').click(); return true; }
+                if (action === 'save-tx-time') {
+                    const txVal = document.getElementById('tx-clock-input')?.value.trim() || '';
+                    updateClockTime('txClockTime', txVal || null);
+                    return true;
+                }
+                if (action === 'save-rx-time') {
+                    const rxVal = document.getElementById('rx-clock-input')?.value.trim() || '';
+                    updateClockTime('rxClockTime', rxVal || null);
+                    return true;
+                }
+                if (action === 'reset-runorder') {
+                    const rawOrder  = state.meta.order || [];
+                    const markerIdx = rawOrder.indexOf('marker-line');
+                    const storyIds  = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
+                        .filter(sid => !state.storiesMap[sid]?.isFloated && state.storiesMap[sid]?.type !== 'segment');
+                    const firstId = storyIds[0] || null;
+                    const now = Date.now();
+                    const updates = {
+                        activeStoryId:       firstId,
+                        activeStoryStartedAt: firstId ? now : null,
+                        showStartTime:        state.meta.isTXMode ? now : state.meta.showStartTime,
+                        txStartedAt:          state.meta.isTXMode ? now : state.meta.txStartedAt,
+                    };
+                    updateActivePointer(updates);
+                    await syncPlayoutToActive(firstId);
+                    return true;
+                }
+                return false;
+            };
+
+            const _handleEdit = async ({ action, id, val, e }) => {
+                if (action === 'edit-story') {
+                    state.ui.editingStoryId = id;
+                    lockStory(id);
+                    startLockRefresh(id);
+                    render('modal');
+                    return true;
+                }
+                if (action === 'cancel-edit') {
+                    const editingId = state.ui.editingStoryId;
+                    state.ui.editingStoryId = null;
+                    stopLockRefresh();
+                    if (editingId) unlockStory(editingId);
+                    render('main', 'modal');
+                    return true;
+                }
+                if (action === 'take-over-edit') {
+                    const storyId  = state.ui.editingStoryId;
+                    if (!storyId) return true;
+                    const userName = getMyName();
+                    const now      = Date.now();
+                    if (state.storiesMap[storyId]) {
+                        state.storiesMap[storyId].lockedBySession = state.sessionId;
+                        state.storiesMap[storyId].lockedByName    = userName;
+                        state.storiesMap[storyId].lockedAt        = now;
+                    }
+                    render('modal');
+                    try { await DB.takeLock(storyId, state.sessionId, userName, now); }
+                    catch(e) { showError('Could not take over edit — ' + DB.errorMessage(e)); }
+                    return true;
+                }
+                if (action === 'save-edit') {
+                    stopLockRefresh();
+                    let durStr = document.getElementById('edit-duration').value;
+                    let parsedDuration = 0;
+                    if (durStr.includes(':')) {
+                        const [m, s] = durStr.split(':');
+                        parsedDuration = (parseInt(m, 10) || 0) * 60 + (parseInt(s, 10) || 0);
+                    } else {
+                        parsedDuration = parseInt(durStr, 10) || 0;
+                    }
+                    const editingStory = state.storiesMap[state.ui.editingStoryId];
+                    if (editingStory?.type === 'segment') {
+                        saveStory(state.ui.editingStoryId, {
+                            slug:     document.getElementById('edit-slug').value.toUpperCase(),
+                            duration: parsedDuration,
+                            rev:      parseInt(document.getElementById('edit-rev').value, 10)
+                        });
+                    } else {
+                        saveStory(state.ui.editingStoryId, {
+                            slug:        document.getElementById('edit-slug').value,
+                            format:      document.getElementById('edit-format').value,
+                            presenterId: document.getElementById('edit-presenter').value,
+                            reporterId:  document.getElementById('edit-reporter').value,
+                            mediaFile:   document.getElementById('edit-media-file').value.trim(),
+                            duration:    parsedDuration,
+                            script:      document.getElementById('edit-script').value,
+                            rev:         parseInt(document.getElementById('edit-rev').value, 10)
+                        });
+                    }
+                    return true;
+                }
+                if (action === 'resolve-conflict') {
+                    const { storyId, serverData, localData } = state.ui.pendingConflict;
+                    if (val === 'overwrite') {
+                        stopLockRefresh();
+                        localData.rev = serverData.rev;
+                        state.ui.pendingConflict = null;
+                        saveStory(storyId, localData);
+                    } else {
+                        state.ui.pendingConflict  = null;
+                        state.ui.editingStoryId   = null;
+                        stopLockRefresh();
+                        unlockStory(storyId);
+                        render('main', 'modal');
+                    }
+                    return true;
+                }
+                if (action === 'inline-edit-slug') {
+                    const story = state.storiesMap[id];
+                    if (!canMutate()) return true;
+                    if (!story || (story.lockedBySession && story.lockedBySession !== state.sessionId)) return true;
+                    state.ui.inlineEditingId = id;
+                    await lockStory(id);
+                    const liveSpan = document.querySelector(`[data-action="inline-edit-slug"][data-id="${id}"]`);
+                    if (!liveSpan) { state.ui.inlineEditingId = null; render('main'); return true; }
+                    const originalSlug = state.storiesMap[id]?.slug ?? '';
+                    const input = document.createElement('input');
+                    input.type = 'text';
+                    input.value = originalSlug;
+                    input.className = 'w-full border-2 border-blue-500 rounded px-1 text-slate-800 font-semibold outline-none bg-white shadow-sm ring-2 ring-blue-100';
+                    let committed  = false;
+                    let escapedOut = false;
+                    const finish = async (save) => {
+                        if (committed) return;
+                        committed = true;
+                        state.ui.inlineEditingId = null;
+                        const newSlug = input.value.trim();
+                        if (save && !escapedOut && newSlug && newSlug !== originalSlug) {
+                            state.storiesMap[id].slug = newSlug;
+                            render('main');
+                            try {
+                                await DB.saveSlug(id, newSlug, state.sessionId);
+                                if (state.storiesMap[id]) {
+                                    state.storiesMap[id].lockedBySession = null;
+                                    state.storiesMap[id].lockedByName    = null;
+                                    state.storiesMap[id].lockedAt        = null;
+                                }
+                            } catch(e) {
+                                showError('Slug not saved — ' + DB.errorMessage(e));
+                                await unlockStory(id);
+                                render('main');
+                            }
+                        } else {
+                            await unlockStory(id);
+                            render('main');
+                        }
+                    };
+                    input.addEventListener('keydown', async ev => {
+                        if (ev.key === 'Enter')  { ev.preventDefault(); ev.stopPropagation(); input.blur(); }
+                        else if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); escapedOut = true; input.blur(); await finish(false); }
+                    });
+                    input.addEventListener('blur', () => { if (!escapedOut) finish(true); });
+                    liveSpan.replaceWith(input);
+                    input.focus();
+                    input.select();
+                    return true;
+                }
+                return false;
+            };
+
+            const _handleTX = ({ action, val }) => {
+                if (action === 'studio-tx-toggle') { updateStudioMode(state.meta.isTXMode ? 'standby' : 'tx'); return true; }
+                if (action === 'set-studio-state') { updateStudioMode(val); return true; }
+                if (action === 'take-next')         { shiftActiveStory(1);  return true; }
+                if (action === 'undo-take')         { shiftActiveStory(-1); return true; }
+                return false;
+            };
+
+            const _handlePresenter = async ({ action, id, val, e }) => {
+                if (action === 'presenter-font-up')       { state.ui.presenter.fontScale   = Math.min(state.ui.presenter.fontScale + 0.15, 2.5);   render('main'); return true; }
+                if (action === 'presenter-font-down')     { state.ui.presenter.fontScale   = Math.max(state.ui.presenter.fontScale - 0.15, 0.4);   render('main'); return true; }
+                if (action === 'presenter-speed-up')      { state.ui.presenter.scrollSpeed = Math.min(state.ui.presenter.scrollSpeed + 5, 200);     render('main'); return true; }
+                if (action === 'presenter-speed-down')    { state.ui.presenter.scrollSpeed = Math.max(state.ui.presenter.scrollSpeed - 5, 0);       render('main'); return true; }
+                if (action === 'presenter-scroll-toggle') { state.ui.presenter.autoScroll  = !state.ui.presenter.autoScroll;                        render('main'); return true; }
+                if (action === 'presenter-find') {
+                    const term = document.getElementById('presenter-search')?.value.trim();
+                    if (term) { state.ui.presenter.searchTerm = term; render('main'); }
+                    return true;
+                }
+                if (action === 'presenter-story-prev' || action === 'presenter-story-next') {
+                    const dir       = action === 'presenter-story-next' ? 1 : -1;
+                    const rawOrder  = state.meta.order || [];
+                    const markerIdx = rawOrder.indexOf('marker-line');
+                    const storyIds  = (markerIdx > -1 ? rawOrder.slice(0, markerIdx) : rawOrder)
+                        .filter(sid => !state.storiesMap[sid]?.isFloated && state.storiesMap[sid]?.type !== 'segment');
+                    const cur = storyIds.indexOf(state.meta.activeStoryId);
+                    const nxt = cur + dir;
+                    if (nxt >= 0 && nxt < storyIds.length) {
+                        state.meta.activeStoryId      = storyIds[nxt];
+                        state.ui.lastScrolledStoryId  = storyIds[nxt];
+                        render('main');
+                    }
+                    return true;
+                }
+                if (action === 'ref-toggle-expand') {
+                    state.ui.presenter.expandedStoryId = state.ui.presenter.expandedStoryId === id ? null : id;
+                    render('main');
+                    return true;
+                }
+                if (action === 'toggle-alert-panel') {
+                    state.ui.alertPanelOpen = !state.ui.alertPanelOpen;
+                    render('main');
+                    return true;
+                }
+                if (action === 'send-presenter-alert') {
+                    const input   = document.getElementById('presenter-alert-input');
+                    const text    = input?.value.trim();
+                    const me      = (state.meta.staff||[]).find(s => s.id === state.myStaffId);
+                    const canAlert = !!me && (me.role === 'Producer' || state.meta.editorStaffId === state.myStaffId);
+                    if (text && canAlert) {
+                        const sentBy = getMyName();
+                        updatePresenterAlert({ text, sentAt: Date.now(), sentBy });
+                        try { await DB.sendMessage(sentBy, text); }
+                        catch(e) { console.warn('Message send failed:', e); showToast(sentBy, text); }
+                        if (input) input.value = '';
+                        state.ui.alertPanelOpen = false;
+                        render('main');
+                    }
+                    return true;
+                }
+                if (action === 'clear-presenter-alert') {
+                    updatePresenterAlert(null);
+                    state.ui.alertPanelOpen = false;
+                    render('main');
+                    return true;
+                }
+                if (action === 'director-stop-presenter-clip') {
+                    updatePresenterClip(state.meta.presenterClipStoryId, 'stop');
+                    if (state.ui.presenter.playingClipStoryId) {
+                        _stopPresenterCountdown();
+                        if (state.ui.presenter.clipAudio) {
+                            state.ui.presenter.clipAudio.pause();
+                            if (state.ui.presenter.clipAudio.objectUrl) URL.revokeObjectURL(state.ui.presenter.clipAudio.objectUrl);
+                            state.ui.presenter.clipAudio = null;
+                        }
+                        state.ui.presenter.playingClipStoryId = null;
+                        updatePresenterClip(null, null);
+                        render('main');
+                    }
+                    return true;
+                }
+                if (action === 'presenter-fire-clip') {
+                    const storyId = e.target.closest('[data-id]')?.dataset.id || id;
+                    if (storyId) presenterFireClip(storyId);
+                    return true;
+                }
+                return false;
+            };
+
+            const _handleRadio = ({ action, id, e }) => {
+                const deckKey = id === 'B' ? 'deckB' : 'deckA';
+                const deck    = id === 'B' ? 'B' : 'A';
+                if (action === 'radio-play')  { radioPlay(deckKey);   return true; }
+                if (action === 'radio-pause') { radioPause(deckKey);  return true; }
+                if (action === 'radio-stop')  { radioStop(deckKey);   return true; }
+                if (action === 'radio-cue')   { radioCue(deckKey);    return true; }
+                if (action === 'radio-take')  { radioExecuteTake();   return true; }
+                if (action === 'radio-scrub') { radioScrub(deck, e);  return true; }
+                return false;
+            };
+
+            // Dispatcher — routes to the appropriate handler group in priority order
+            document.body.addEventListener('click', async e => {
+                const btn = e.target.closest('[data-action]');
+                if (!btn) return;
+                const ctx = {
+                    action: btn.getAttribute('data-action'),
+                    id:     btn.getAttribute('data-id'),
+                    val:    btn.getAttribute('data-val'),
+                    e
+                };
+
+                if (await _handleSettings(ctx))  return;
+                if (await _handleStaff(ctx))     return;
+                if (await _handleRundown(ctx))   return;
+                if (await _handleEdit(ctx))      return;
+                if (      _handleTX(ctx))        return;
+                if (await _handlePresenter(ctx)) return;
+                          _handleRadio(ctx);
             });
 
-            // --- OBS playout actions ---
+
             document.body.addEventListener('click', e => {
                 const btn = e.target.closest('[data-obs-action]');
                 if (!btn) return;
