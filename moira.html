@@ -346,7 +346,8 @@
                     expandedStoryId: null,
                     selfFireEnabled: localStorage.getItem('moira_presenter_self_fire') === 'true',
                     clipAudio: null,  // transient Audio element for presenter self-fire
-                    clipCountdownInterval: null  // interval handle for button countdown display
+                    clipCountdownInterval: null,  // interval handle for button countdown display
+                    cardsFontLarge: false,  // presenter cards script font size toggle
                 },
                 playoutBackend: savedPlayoutBackend,  // 'none' | 'radio' | 'obs'
                 trash: [],           // [{id, story, orderIndex, deletedAt}]
@@ -3883,7 +3884,7 @@
                     // Render [INSTRUCTION] blocks
                     const formatted = escaped.replace(/\[([^\]]+)\]/g,
                         '<span style="display:inline-block;background:#e2e8f0;color:#1e293b;padding:0.15rem 0.6rem;border-radius:0.375rem;font-size:0.75em;font-weight:900;text-transform:uppercase;letter-spacing:0.05em;margin:0 0.2rem;">[$1]</span>');
-                    return `<span style="font-size:1.05rem;line-height:1.8;color:#1e293b;">${formatted}</span>`;
+                    return `<span style="font-size:${state.ui.presenter.cardsFontLarge ? '1.25rem' : '1.05rem'};line-height:1.8;color:#1e293b;">${formatted}</span>`;
                 }
                 return '';
             }).join('');
@@ -3926,7 +3927,7 @@
 
                 return `
                     <div id="ref-story-${id}" class="rounded-xl overflow-hidden ${cardStyle} select-none">
-                        <div class="px-4 py-2 flex items-center justify-between ${headerStyle} cursor-pointer"
+                        <div class="px-4 py-3 min-h-[48px] flex items-center justify-between ${headerStyle} cursor-pointer"
                             data-action="ref-toggle-expand" data-id="${id}">
                             <div class="flex items-center gap-3">
                                 <span class="font-black text-xs tracking-widest uppercase">${escapeHTML(story.format)}</span>
@@ -3944,7 +3945,7 @@
                         <div class="px-5 py-4 bg-white">
                             ${selfFire && story.mediaFile
                                 ? renderPresenterScriptWithFire(story.script, id)
-                                : `<p class="text-base text-slate-800 leading-relaxed whitespace-pre-wrap">${escapeHTML(story.script || 'No script.')}</p>`
+                                : `<p class="${state.ui.presenter.cardsFontLarge ? 'text-xl' : 'text-base'} text-slate-800 leading-relaxed whitespace-pre-wrap">${escapeHTML(story.script || 'No script.')}</p>`
                             }
                         </div>` : (isActive || isNext) ? `
                         <div class="px-4 py-2">
@@ -3962,7 +3963,7 @@
                             <span class="font-black text-white tracking-widest text-sm uppercase shrink-0">Producer</span>
                             <span class="text-white font-bold text-base leading-snug flex-1">${escapeHTML(state.meta.presenterAlert.text)}</span>
                             <button data-action="clear-presenter-alert"
-                                class="shrink-0 px-3 py-1.5 bg-red-800 hover:bg-red-900 text-white text-xs font-black rounded-lg tracking-widest uppercase transition-colors">
+                                class="shrink-0 px-4 py-2 min-h-[44px] bg-red-800 hover:bg-red-900 text-white text-xs font-black rounded-lg tracking-widest uppercase transition-colors">
                                 ✕ Dismiss
                             </button>
                         </div>
@@ -3970,9 +3971,15 @@
                     <div class="px-4 pb-8 max-w-2xl mx-auto">
                         <div class="py-4 flex items-center justify-between">
                             <span class="text-slate-500 text-sm font-bold uppercase tracking-widest">Running Order</span>
-                            <div class="text-right">
-                                <div class="text-xs text-slate-400 uppercase tracking-widest">Remaining</div>
-                                <div class="font-mono font-black text-2xl ${remaining < 120 ? 'text-red-600' : 'text-slate-800'}">${formatDuration(remaining)}</div>
+                            <div class="flex items-center gap-3">
+                                <div class="text-right">
+                                    <div class="text-xs text-slate-400 uppercase tracking-widest">Remaining</div>
+                                    <div class="font-mono font-black text-2xl ${remaining < 120 ? 'text-red-600' : 'text-slate-800'}">${formatDuration(remaining)}</div>
+                                </div>
+                                <button data-action="presenter-toggle-font" title="Toggle script size"
+                                    class="px-3 py-1.5 rounded-lg ${state.ui.presenter.cardsFontLarge ? 'bg-blue-600 text-white' : 'bg-slate-200 hover:bg-slate-300 text-slate-700'} text-sm transition-colors">
+                                    <i class="fa-solid fa-text-height"></i>
+                                </button>
                             </div>
                         </div>
                         <div class="flex flex-col gap-3">
@@ -5314,6 +5321,7 @@
                 if (action === 'presenter-speed-up')      { state.ui.presenter.scrollSpeed = Math.min(state.ui.presenter.scrollSpeed + 5, 200);     render('main'); return true; }
                 if (action === 'presenter-speed-down')    { state.ui.presenter.scrollSpeed = Math.max(state.ui.presenter.scrollSpeed - 5, 0);       render('main'); return true; }
                 if (action === 'presenter-scroll-toggle') { state.ui.presenter.autoScroll  = !state.ui.presenter.autoScroll;                        render('main'); return true; }
+                if (action === 'presenter-toggle-font')   { state.ui.presenter.cardsFontLarge = !state.ui.presenter.cardsFontLarge;                  render('main'); return true; }
                 if (action === 'presenter-find') {
                     const term = document.getElementById('presenter-search')?.value.trim();
                     if (term) { state.ui.presenter.searchTerm = term; render('main'); }
