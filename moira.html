@@ -4114,7 +4114,7 @@
 
             const tabBtn = (id, label, icon) => `
                 <button data-action="set-settings-tab" data-val="${id}" class="flex-1 py-3 text-sm font-bold border-b-2 transition-colors flex items-center justify-center gap-2 ${state.ui.settingsTab === id ? 'border-blue-600 text-blue-600 bg-blue-50/50' : 'border-slate-200 text-slate-400 hover:text-slate-600'}">
-                    <i class="fa-solid ${icon}"></i> ${label}
+                    <i class="fa-solid ${icon}"></i><span class="hidden md:inline ml-2">${label}</span>
                 </button>
             `;
 
@@ -4138,7 +4138,7 @@
                                     <div class="bg-blue-50 border border-blue-200 rounded-xl p-4">
                                         <div class="flex justify-between items-start mb-2"><h4 class="font-bold text-blue-800">Cloud Sync</h4>${state.connectionState === 'connected' ? `<span class="text-[10px] font-bold uppercase tracking-wider bg-emerald-500 text-white px-2 py-1 rounded-md shadow-sm">Connected</span>` : ''}</div>
                                         <textarea id="config-paste" rows="4" class="w-full border rounded-lg p-3 text-xs font-mono bg-white outline-none mb-4" placeholder="const firebaseConfig = { ... }"></textarea>
-                                        <div class="grid grid-cols-2 gap-4">
+                                        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
                                             <div><label class="form-label-sm">apiKey</label><input type="text" id="config-apikey" value="${escapeHTML(savedConfig.apiKey || '')}" class="form-input-sm"></div>
                                             <div><label class="form-label-sm">authDomain</label><input type="text" id="config-authdomain" value="${escapeHTML(savedConfig.authDomain || '')}" class="form-input-sm"></div>
                                             <div><label class="form-label-sm">projectId</label><input type="text" id="config-projectid" value="${escapeHTML(savedConfig.projectId || '')}" class="form-input-sm"></div>
@@ -4249,7 +4249,7 @@
                                     ${state.ui.playoutBackend === 'obs' ? `
                                     <div class="bg-slate-50 border border-slate-200 rounded-xl p-5 space-y-4">
                                         <h4 class="font-bold text-slate-800 flex items-center gap-2"><i class="fa-solid fa-film text-slate-400"></i>OBS WebSocket Connection</h4>
-                                        <div class="grid grid-cols-2 gap-4">
+                                        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
                                             <div>
                                                 <label class="form-label">IP Address</label>
                                                 <input type="text" id="obs-set-ip" value="${escapeHTML(OBS.getConfig().ip)}" placeholder="127.0.0.1" class="form-input">
