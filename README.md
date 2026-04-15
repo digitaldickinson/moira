@@ -23,5 +23,6 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 ## Changelog
 
 ### v2.6.0
-**Presenter fired clips now work properly **
-I noticed a real issue with clip buttons in the presenter view - they only worked locally.  So if you had a presenter view open, it would only trigger sound on the local device. Now it's set that whichever machine initiates TX mode, will become the master machine and playback will be limited to that machine. Outside of TX mode all machines connected to the database and the media folder will preview clips so you can rehearse.
+**Presenter fired clips now work properly**
+
+I noticed a real issue with clip buttons in the presenter view - they only worked locally.  So if you had a presenter view open, it would only trigger sound on the local device. Now it's set that whichever machine initiates TX mode, will become the master machine, and playback will be limited to that machine. Outside of TX mode all machines connected to the database and the media folder will preview clips so you can rehearse.
