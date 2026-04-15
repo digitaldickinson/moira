@@ -15,6 +15,7 @@ But those principles mean it's not perfect. They mean comprises and challenges. 
 
 <img width="663" height="379" alt="image" src="https://github.com/user-attachments/assets/1c9eb518-8cdb-423a-a579-e035f8ab5d44" />
 
+See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Changelog
 
