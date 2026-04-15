@@ -358,6 +358,10 @@
 
         // Unified Guard Helper
         const canMutate = () => state.localMode || (!!auth && !!auth.currentUser);
+        const isPlaybackMaster = () =>
+            !state.localMode &&
+            state.meta.isTXMode &&
+            !!state.radio.directoryHandle;
 
         // ==========================================
         // 3. STARTUP & FIREBASE INIT
@@ -625,8 +629,10 @@
                     state.connectionState = 'connected';
                     if (data) {
                         const incoming = { ...INITIAL_META, ...data };
-                        // Remote stop command from director — honour it if we're playing
-                        if (incoming.presenterClipCommand === 'stop' && state.ui.presenter.playingClipStoryId) {
+                        const prevClipId = state.meta.presenterClipStoryId;
+
+                        // Remote stop command — honour if we're the master currently playing
+                        if (incoming.presenterClipCommand === 'stop' && isPlaybackMaster() && state.ui.presenter.playingClipStoryId) {
                             _stopPresenterCountdown();
                             if (state.ui.presenter.clipAudio) {
                                 state.ui.presenter.clipAudio.pause();
@@ -637,7 +643,20 @@
                             state.ui.presenter.playingClipStoryId = null;
                             updatePresenterClip(null, null);
                         }
+
                         state.meta = incoming;
+
+                        // Remote fire: a new clip request has arrived and we are the master
+                        // Guard: skip if we're already playing this story (prevents double-fire
+                        //        when master's own write echoes back through the snapshot)
+                        if (
+                            isPlaybackMaster() &&
+                            incoming.presenterClipStoryId &&
+                            incoming.presenterClipStoryId !== prevClipId &&
+                            incoming.presenterClipStoryId !== state.ui.presenter.playingClipStoryId
+                        ) {
+                            _executePresenterClipPlayback(incoming.presenterClipStoryId);
+                        }
                     }
                     render('header', 'main');
                 },
@@ -1447,37 +1466,10 @@
             }, 250);
         }
 
-        async function presenterFireClip(storyId) {
+        async function _executePresenterClipPlayback(storyId) {
             const story = state.storiesMap[storyId];
             if (!story?.mediaFile) return;
 
-            // Stop any currently playing presenter clip
-            if (state.ui.presenter.clipAudio) {
-                _stopPresenterCountdown();
-                state.ui.presenter.clipAudio.pause();
-                if (state.ui.presenter.clipAudio.objectUrl)
-                    URL.revokeObjectURL(state.ui.presenter.clipAudio.objectUrl);
-                state.ui.presenter.clipAudio = null;
-            }
-
-            // If same story tapped while playing it was a stop — we're done
-            if (state.ui.presenter.playingClipStoryId === storyId) {
-                state.ui.presenter.playingClipStoryId = null;
-                updatePresenterClip(null, null);
-                render('main');
-                return;
-            }
-
-            // Load file from directory handle
-            if (!state.radio.directoryHandle) {
-                radioLog('Presenter self-fire: no media folder granted.', 'warn');
-                showError(
-                    'Cannot fire clip — no media folder is set. Grant folder access in Settings.',
-                    'Open Settings',
-                    () => { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'playout'; render('modal'); }
-                );
-                return;
-            }
             const file = await radioGetFileFromHandle(story.mediaFile);
             if (!file) return;
 
@@ -1503,9 +1495,9 @@
             state.ui.presenter.clipAudio = audio;
             state.ui.presenter.playingClipStoryId = storyId;
             render('main');
+
             await audio.play().catch(e => {
                 radioLog(`Presenter clip error: ${e.message}`, 'error');
-                // showError here because the presenter may be on a tablet with no radio log visible
                 showError(
                     e.name === 'NotAllowedError'
                         ? 'Clip blocked by browser — tap or click anywhere on the page first, then try again.'
@@ -1516,10 +1508,55 @@
                 state.ui.presenter.playingClipStoryId = null;
                 updatePresenterClip(null, null);
             });
-            // Start countdown after play() resolves so audio.duration is available
+
             if (state.ui.presenter.clipAudio) {
                 _startPresenterCountdown(audio, storyId);
                 updatePresenterClip(storyId, null);
+            }
+        }
+
+        async function presenterFireClip(storyId) {
+            const story = state.storiesMap[storyId];
+            if (!story?.mediaFile) return;
+
+            // Stop any currently playing presenter clip (local teardown only)
+            if (state.ui.presenter.clipAudio) {
+                _stopPresenterCountdown();
+                state.ui.presenter.clipAudio.pause();
+                if (state.ui.presenter.clipAudio.objectUrl)
+                    URL.revokeObjectURL(state.ui.presenter.clipAudio.objectUrl);
+                state.ui.presenter.clipAudio = null;
+            }
+
+            // Tapping the currently-playing story = stop request
+            if (state.ui.presenter.playingClipStoryId === storyId) {
+                state.ui.presenter.playingClipStoryId = null;
+                // Route stop through the command field so master hears it even if this isn't master
+                updatePresenterClip(null, 'stop');
+                render('main');
+                return;
+            }
+
+            // In local mode, always act as master (single-machine, no remote to defer to)
+            if (state.localMode) {
+                if (!state.radio.directoryHandle) {
+                    showError(
+                        'Cannot fire clip — no media folder is set. Grant folder access in Settings.',
+                        'Open Settings',
+                        () => { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'playout'; render('modal'); }
+                    );
+                    return;
+                }
+                await _executePresenterClipPlayback(storyId);
+                return;
+            }
+
+            // Cloud mode: write the request to Firestore — master machine will execute
+            updatePresenterClip(storyId, null);
+
+            // If this machine IS the master, also execute locally
+            if (isPlaybackMaster()) {
+                await _executePresenterClipPlayback(storyId);
             }
         }
         function renderStatusBadge(label, icon, colorClass) {
@@ -5295,8 +5332,10 @@
                     return true;
                 }
                 if (action === 'director-stop-presenter-clip') {
+                    // Write the stop command — master machine's snapshot listener will execute teardown
                     updatePresenterClip(state.meta.presenterClipStoryId, 'stop');
-                    if (state.ui.presenter.playingClipStoryId) {
+                    // If this is the master, also tear down locally without waiting for the echo
+                    if (isPlaybackMaster() && state.ui.presenter.playingClipStoryId) {
                         _stopPresenterCountdown();
                         if (state.ui.presenter.clipAudio) {
                             state.ui.presenter.clipAudio.pause();
