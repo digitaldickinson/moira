@@ -3857,7 +3857,8 @@
         function renderPresenterCards(storyIds) {
             const isLive = state.meta.isTXMode;
             const isRehearsal = state.meta.isRehearsalMode;
-            const selfFire = state.ui.presenter.selfFireEnabled && state.ui.playoutBackend === 'radio' && !!state.radio.directoryHandle;
+            const selfFire = state.ui.presenter.selfFireEnabled && state.ui.playoutBackend === 'radio' &&
+                            (!state.localMode || !!state.radio.directoryHandle);
             const playingId = state.ui.presenter.playingClipStoryId || null;
 
             const activeIdx = storyIds.indexOf(state.meta.activeStoryId);
@@ -4205,7 +4206,7 @@
                                                 <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${state.ui.presenter.selfFireEnabled ? 'translate-x-6' : 'translate-x-1'}"></span>
                                             </button>
                                         </div>
-                                        ${state.ui.presenter.selfFireEnabled && !state.radio.directoryHandle ? `
+                                        ${state.ui.presenter.selfFireEnabled && state.localMode && !state.radio.directoryHandle ? `
                                         <p class="text-xs text-amber-600 font-medium"><i class="fa-solid fa-triangle-exclamation mr-1"></i>Grant a media folder above for self-fire to work.</p>` : ''}
                                     </div>
                                     ` : ''}
