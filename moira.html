@@ -3426,6 +3426,78 @@
                     </div>
                 </div>`;
         }
+        function renderRundownMobileCards(order) {
+            const isRundownLocked = state.meta.rundownLocked && state.meta.editorStaffId !== state.myStaffId;
+            let isBelowLine = false;
+            return order.map((id, idx) => {
+                if (id === 'marker-line') {
+                    isBelowLine = true;
+                    return `<div class="bg-red-600 text-white text-xs font-black uppercase tracking-widest px-4 py-2 rounded-xl flex items-center gap-2">
+                        <i class="fa-solid fa-arrow-down"></i> End of programme
+                    </div>`;
+                }
+                const story = state.storiesMap[id];
+                if (!story) return '';
+
+                if (story.type === 'segment') {
+                    return `<div class="bg-indigo-900 text-white text-xs font-black uppercase tracking-widest px-4 py-2 rounded-xl flex items-center justify-between">
+                        <span><i class="fa-solid fa-scissors mr-2 opacity-40"></i>${escapeHTML(story.slug)}</span>
+                        ${story.duration > 0 ? `<span class="font-mono text-indigo-300">${formatDuration(story.duration)}</span>` : ''}
+                    </div>`;
+                }
+
+                const isActive = state.meta.activeStoryId === id && state.meta.isTXMode;
+                const pres = (state.meta.staff || []).find(s => s.id === story.presenterId)?.name || '';
+                const rep  = (state.meta.staff || []).find(s => s.id === story.reporterId)?.name  || '';
+
+                const cs = story.completed;
+                const checkColour = (!cs || cs === false || cs === null) ? 'text-slate-300'
+                    : cs === 'needs-checking' ? 'text-yellow-500'
+                    : cs === 'checked-ok' ? 'text-emerald-500'
+                    : 'text-red-500';
+
+                let wrapperClass = 'bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm';
+                if (isBelowLine) wrapperClass += ' opacity-60';
+                if (story.isFloated && !isBelowLine) wrapperClass += ' opacity-50';
+
+                let headerClass = 'flex items-center justify-between px-4 py-3';
+                if (isActive) {
+                    wrapperClass += state.meta.isTXMode ? ' border-l-4 border-l-red-500' : ' border-l-4 border-l-amber-400';
+                    headerClass  += state.meta.isTXMode ? ' bg-red-50' : ' bg-amber-50';
+                }
+
+                const isFirst = idx === 0;
+                const isLast  = idx === order.length - 1;
+
+                return `<div class="${wrapperClass}">
+                    <div class="${headerClass}">
+                        <div class="flex items-center gap-2 min-w-0">
+                            ${isActive ? `<span class="w-2 h-2 rounded-full ${state.meta.isTXMode ? 'bg-red-500' : 'bg-amber-400'} animate-pulse shrink-0"></span>` : ''}
+                            ${story.mediaFile ? '<i class="fa-solid fa-photo-film text-amber-500 shrink-0"></i>' : ''}
+                            <span class="font-semibold truncate max-w-[50%]">${escapeHTML(story.slug)}</span>
+                            ${story.isFloated ? `<span class="text-[10px] font-bold bg-amber-100 text-amber-700 border border-amber-200 px-1.5 py-0.5 rounded uppercase tracking-wide shrink-0">Floated</span>` : ''}
+                        </div>
+                        <div class="flex items-center gap-2 shrink-0">
+                            <span class="bg-slate-100 border px-2 py-0.5 rounded text-xs font-mono font-bold">${escapeHTML(story.format || '')}</span>
+                            <span class="font-mono text-sm text-slate-600">${story.isFloated ? `<span class="line-through text-slate-400">${formatDuration(story.duration)}</span>` : formatDuration(story.duration)}</span>
+                        </div>
+                    </div>
+                    ${(pres || rep) ? `<div class="text-xs text-slate-500 px-4 pb-2 flex gap-3">
+                        ${rep  ? `<span class="font-bold text-blue-700">${escapeHTML(rep)}</span>`  : ''}
+                        ${pres ? `<span>${escapeHTML(pres)}</span>` : ''}
+                    </div>` : ''}
+                    <div class="flex gap-2 px-4 pb-3 flex-wrap">
+                        <button data-action="edit-story" data-id="${id}" class="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-colors"><i class="fa-solid fa-pen mr-1"></i>Edit</button>
+                        <button data-action="toggle-complete" data-id="${id}" class="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs transition-colors ${checkColour}" title="Toggle check status"><i class="fa-solid fa-circle mr-1"></i>Check</button>
+                        <button data-action="toggle-float" data-id="${id}" class="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs transition-colors ${story.isFloated ? 'text-amber-500' : 'text-slate-600'}" title="${story.isFloated ? 'Un-float' : 'Float'}"><i class="fa-solid fa-circle-pause mr-1"></i>Float</button>
+                        ${!isRundownLocked ? `
+                        <button data-action="move-story-up" data-id="${id}" class="px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 text-xs transition-colors" ${isFirst ? 'disabled' : ''}>▲</button>
+                        <button data-action="move-story-down" data-id="${id}" class="px-2 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 text-xs transition-colors" ${isLast ? 'disabled' : ''}>▼</button>` : ''}
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
         /**
          * Renders the Newsroom / Rundown view. Builds the TX/RX timing bar, the
          * sortable story table with per-row clock times and clip/staff badges,
@@ -3553,7 +3625,7 @@
             }).join('');
 
             const txRxBar = `
-                <div class="flex items-center gap-6 bg-slate-100 border border-slate-200 text-slate-700 px-6 py-3 rounded-xl mb-4">
+                <div class="flex flex-wrap gap-y-2 items-center gap-6 bg-slate-100 border border-slate-200 text-slate-700 px-6 py-3 rounded-xl mb-4">
                     <span class="text-xs font-black uppercase tracking-widest text-slate-400">Timing</span>
                     <div class="flex items-center gap-2">
                         <label class="text-xs font-bold uppercase tracking-wide text-slate-500">TX</label>
@@ -3633,11 +3705,11 @@
 
 
             return `<div class="max-w-7xl mx-auto p-6 pb-24">
-                <div class="flex justify-between items-end mb-4">
+                <div class="flex flex-wrap gap-3 items-center justify-between mb-4">
                     <div class="flex items-center gap-3">
                         <h2 class="text-3xl font-bold text-slate-800"><i class="fa-solid fa-bars-staggered mr-3 text-slate-400"></i>Rundown</h2>
                     </div>
-                    <div class="flex items-center gap-4">
+                    <div class="flex flex-wrap gap-2 items-center">
                         ${state.meta.isTXMode ? `
                         <div class="flex items-center gap-3 bg-red-50 border border-red-200 px-4 py-2 rounded-xl">
                             <span class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
@@ -3665,27 +3737,32 @@
                     </div>
                     <button data-action="clear-trash" class="ml-auto text-amber-400 hover:text-amber-700 text-xs font-bold px-2 py-1 rounded transition-colors" title="Discard all deleted stories">Clear</button>
                 </div>` : ''}
-                <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                    <table class="w-full text-left border-collapse">
-                        <thead>
-                            <tr class="bg-slate-50 border-b border-slate-200 text-xs uppercase tracking-wider text-slate-500">
-                                <th class="px-4 py-3 w-10 text-center"><i class="fa-solid fa-arrows-up-down"></i></th>
-                                <th class="px-4 py-3">Slug</th>
-                                <th class="px-4 py-3">Fmt</th>
-                                <th class="px-4 py-3">Staff</th>
-                                <th class="px-4 py-3">Dur</th>
-                                <th class="px-4 py-3">Clock</th>
-                                <th class="px-4 py-3">Preview</th>
-                                <th class="px-4 py-3 text-center">Checked</th>
-                                <th class="px-4 py-3 text-center">Float</th>
-                                <th class="px-4 py-3 text-right">Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="rundown-table-body">
-                            ${rows}
-                            <tr data-story-id="end-of-list" class="h-16 bg-transparent"><td colspan="10"></td></tr>
-                        </tbody>
-                    </table>
+                <div class="hidden md:block">
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <table class="w-full text-left border-collapse">
+                            <thead>
+                                <tr class="bg-slate-50 border-b border-slate-200 text-xs uppercase tracking-wider text-slate-500">
+                                    <th class="px-4 py-3 w-10 text-center"><i class="fa-solid fa-arrows-up-down"></i></th>
+                                    <th class="px-4 py-3">Slug</th>
+                                    <th class="px-4 py-3">Fmt</th>
+                                    <th class="px-4 py-3">Staff</th>
+                                    <th class="px-4 py-3">Dur</th>
+                                    <th class="px-4 py-3">Clock</th>
+                                    <th class="px-4 py-3">Preview</th>
+                                    <th class="px-4 py-3 text-center">Checked</th>
+                                    <th class="px-4 py-3 text-center">Float</th>
+                                    <th class="px-4 py-3 text-right">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="rundown-table-body">
+                                ${rows}
+                                <tr data-story-id="end-of-list" class="h-16 bg-transparent"><td colspan="10"></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="md:hidden flex flex-col gap-3">
+                    ${renderRundownMobileCards(state.meta.order || [])}
                 </div>
             </div>`;
         }
@@ -5171,6 +5248,16 @@
                     };
                     updateActivePointer(updates);
                     await syncPlayoutToActive(firstId);
+                    return true;
+                }
+                if (action === 'move-story-up') {
+                    const idx = state.meta.order.indexOf(id);
+                    if (idx > 0) await reorderStory(id, state.meta.order[idx - 1]);
+                    return true;
+                }
+                if (action === 'move-story-down') {
+                    const idx = state.meta.order.indexOf(id);
+                    if (idx < state.meta.order.length - 1) await reorderStory(id, state.meta.order[idx + 2]);
                     return true;
                 }
                 return false;
