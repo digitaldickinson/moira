@@ -2423,7 +2423,7 @@
                             <div>${tallyLabel}</div>
                             <span id="radio-tc-${d.id}" class="${timeClass}">${fmtRadioTC(d.audio ? d.audio.currentTime : 0)}</span>
                         </div>
-                        <div class="bg-slate-200 rounded-full h-1 cursor-pointer" id="radio-prog-bg-${d.id}" data-action="radio-scrub" data-deck="${d.id}">
+                        <div class="bg-slate-200 rounded-full h-1 cursor-pointer" id="radio-prog-bg-${d.id}" data-action="radio-scrub" data-id="${d.id}">
                             <div id="radio-prog-${d.id}" class="h-1 rounded-full ${isPlaying ? 'bg-red-400' : 'bg-blue-300'} transition-colors" style="width:${d.duration > 0 && d.audio ? (d.audio.currentTime / d.duration * 100).toFixed(1) : 0}%"></div>
                         </div>
                         <div class="flex flex-col gap-0.5 bg-slate-50 border border-slate-100 rounded px-3 py-2 min-h-[40px]">
@@ -2434,16 +2434,16 @@
                         </div>
                         ${renderPPMStrip(d.id)}
                         <div class="flex justify-center gap-2">
-                            <button data-action="radio-play"  data-deck="${d.id}" ${canPlay  ? '' : 'disabled'} class="${canPlay  ? btnOn('bg-green-500 border-green-600 hover:bg-green-400') : btnOff}" title="Play">
+                            <button data-action="radio-play"  data-id="${d.id}" ${canPlay  ? '' : 'disabled'} class="${canPlay  ? btnOn('bg-green-500 border-green-600 hover:bg-green-400') : btnOff}" title="Play">
                                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd"/></svg>
                             </button>
-                            <button data-action="radio-pause" data-deck="${d.id}" ${canPause ? '' : 'disabled'} class="${canPause ? btnOn('bg-amber-400 border-amber-500 hover:bg-amber-300') : btnOff}" title="Pause">
+                            <button data-action="radio-pause" data-id="${d.id}" ${canPause ? '' : 'disabled'} class="${canPause ? btnOn('bg-amber-400 border-amber-500 hover:bg-amber-300') : btnOff}" title="Pause">
                                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"/></svg>
                             </button>
-                            <button data-action="radio-stop"  data-deck="${d.id}" ${canStop  ? '' : 'disabled'} class="${canStop  ? btnOn('bg-red-500 border-red-600 hover:bg-red-400') : btnOff}" title="Stop">
+                            <button data-action="radio-stop"  data-id="${d.id}" ${canStop  ? '' : 'disabled'} class="${canStop  ? btnOn('bg-red-500 border-red-600 hover:bg-red-400') : btnOff}" title="Stop">
                                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clip-rule="evenodd"/></svg>
                             </button>
-                            <button data-action="radio-cue"   data-deck="${d.id}" ${canCue   ? '' : 'disabled'} class="${canCue   ? btnOn('bg-blue-500 border-blue-600 hover:bg-blue-400') : btnOff}" title="Cue to 0">
+                            <button data-action="radio-cue"   data-id="${d.id}" ${canCue   ? '' : 'disabled'} class="${canCue   ? btnOn('bg-blue-500 border-blue-600 hover:bg-blue-400') : btnOff}" title="Cue to 0">
                                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 19l-7-7 7-7m8 14l-7-7 7-7"/></svg>
                             </button>
                             <label class="p-2 rounded border border-slate-300 bg-slate-100 hover:bg-slate-200 text-slate-600 cursor-pointer transition-colors" title="Load audio file">
