@@ -360,7 +360,6 @@
         const canMutate = () => state.localMode || (!!auth && !!auth.currentUser);
         const isPlaybackMaster = () =>
             !state.localMode &&
-            state.meta.isTXMode &&
             !!state.radio.directoryHandle;
 
         // ==========================================
