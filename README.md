@@ -16,3 +16,19 @@ But those principles mean it's not perfect. They mean comprises and challenges. 
 <img width="663" height="379" alt="image" src="https://github.com/user-attachments/assets/1c9eb518-8cdb-423a-a579-e035f8ab5d44" />
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
+
+## Changelog
+
+### v2.6.0
+**Presenter Clip Remote Handshake**
+I noticed a real issue with clip buttons in the presenter view - they only worked locally.  So if you had a presenter view open, it would only trigger sound on the local device. Now it's set that whichever machine initiates TX mode, will become the master machine and playback will be limited to that machine. Outside of TX mode all machines connected to the database and the media folder will preview clips so you can rehearse.
+
+- **Remote audio routing during TX**: Presenter clip buttons now route audio through the Studio PC (the machine with the media folder open) during a live TX, regardless of which device fires the request. Previously, audio played on whichever machine tapped the button.
+- **Rehearsal mode**: Outside of TX, any machine with the media folder connected plays clips locally. Students and journalists can run through their bulletin and hear clips on their own machine without involving the Studio PC.
+- **Audio Master indicator**: The TX status bar shows a green `AUDIO MASTER` badge on the machine acting as the audio output for presenter clips.
+- **Presenter buttons on all clients**: Clip fire buttons now appear in the presenter view on all connected machines during TX, not just the machine with the media folder.
+- **Button state sync**: The PLAY/STOP state of clip buttons reflects what the master is playing across all clients, not just the local machine.
+- **Stop from any device**: Tapping a playing clip's button on any client (including non-master) now correctly stops playback on the master.
+
+### v2.5
+Stable Management Build
