@@ -1470,6 +1470,15 @@
             const story = state.storiesMap[storyId];
             if (!story?.mediaFile) return;
 
+            // Stop any clip already playing before starting a new one
+            if (state.ui.presenter.clipAudio) {
+                _stopPresenterCountdown();
+                state.ui.presenter.clipAudio.pause();
+                if (state.ui.presenter.clipAudio.objectUrl)
+                    URL.revokeObjectURL(state.ui.presenter.clipAudio.objectUrl);
+                state.ui.presenter.clipAudio = null;
+            }
+
             const file = await radioGetFileFromHandle(story.mediaFile);
             if (!file) return;
 
@@ -1528,8 +1537,11 @@
                 state.ui.presenter.clipAudio = null;
             }
 
-            // Tapping the currently-playing story = stop request
-            if (state.ui.presenter.playingClipStoryId === storyId) {
+            // Tapping the currently-playing story = stop request.
+            // Use Firestore state as fallback so non-master clients (which have no local
+            // playback state) can still detect "I'm tapping what's currently playing".
+            const effectivePlayingId = state.ui.presenter.playingClipStoryId || state.meta.presenterClipStoryId;
+            if (effectivePlayingId === storyId) {
                 state.ui.presenter.playingClipStoryId = null;
                 // Route stop through the command field so master hears it even if this isn't master
                 updatePresenterClip(null, 'stop');
@@ -3806,7 +3818,9 @@
          */
         function renderPresenterScriptWithFire(script, storyId) {
             if (!script) return '<p class="text-base text-slate-500 italic">No script.</p>';
-            const playingId = state.ui.presenter.playingClipStoryId;
+            // Prefer local state; fall back to Firestore state so non-master UIs reflect
+            // what the master is playing without needing a local Audio element.
+            const playingId = state.ui.presenter.playingClipStoryId || state.meta.presenterClipStoryId;
             const isPlaying = playingId === storyId;
 
             // Split on CLIP tags to interleave text and buttons
