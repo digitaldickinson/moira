@@ -2631,10 +2631,16 @@
                         for (const [deck, inputName] of [['A', 'VT A Player'], ['B', 'VT B Player']]) {
                             const res = await _ws.call('GetMediaInputStatus', { inputName });
                             const d = state.obs['deck' + deck];
+                            const prevState = d.state;
                             d.cursor   = res.mediaCursor   || 0;
                             d.duration = res.mediaDuration || 0;
                             d.state    = res.mediaState ? res.mediaState.replace('OBS_MEDIA_STATE_', '') : 'UNKNOWN';
                             _updateDeckDisplay(deck, d);
+                            // Alert operator when a playing clip reaches its end and holds on last frame
+                            if (prevState === 'PLAYING' && d.state === 'ENDED' && d.loadedStoryId) {
+                                const endedStory = state.storiesMap[d.loadedStoryId];
+                                showToast(`Deck ${deck} — "${endedStory?.slug || 'clip'}" ended. Holding on last frame.`);
+                            }
                         }
                     } catch(e) { /* silently drop telemetry errors */ }
                 }, 250);
@@ -2832,16 +2838,23 @@
 
                 try {
                     await _ws.call('SetInputSettings', { inputName, inputSettings: { local_file: fullPath } });
-                    // Fire play then give OBS 500ms to parse file headers before pausing and cueing.
-                    // The 250ms telemetry poll picks up duration once it becomes available.
                     await _ws.call('TriggerMediaInputAction', { inputName, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY' });
-                    setTimeout(async () => {
+                    // Poll until OBS confirms the clip is playing before pausing and cueing to 0.
+                    // Replaces the old fixed 500ms timeout which was unreliable on slow machines
+                    // or with large files. Cap at 3s (30 × 100ms) to avoid hanging indefinitely.
+                    let ready = false;
+                    for (let i = 0; i < 30; i++) {
+                        await new Promise(r => setTimeout(r, 100));
                         try {
-                            await _ws.call('TriggerMediaInputAction', { inputName, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE' });
-                            await _ws.call('SetMediaInputCursor', { inputName, mediaCursor: 0 });
-                            _log(`Deck ${deck} cued: "${story.slug}"`, 'success');
-                        } catch(e) { _log(`Deck ${deck} cue failed: ${e.message}`, 'error'); }
-                    }, 500);
+                            const st = await _ws.call('GetMediaInputStatus', { inputName });
+                            const ms = st.mediaState?.replace('OBS_MEDIA_STATE_', '') || '';
+                            if (ms === 'PLAYING' || ms === 'BUFFERING') { ready = true; break; }
+                        } catch(e) { /* keep polling */ }
+                    }
+                    if (!ready) _log(`Deck ${deck}: OBS did not confirm PLAYING within 3s — cueing anyway`, 'warn');
+                    await _ws.call('TriggerMediaInputAction', { inputName, mediaAction: 'OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE' });
+                    await _ws.call('SetMediaInputCursor', { inputName, mediaCursor: 0 });
+                    _log(`Deck ${deck} cued: "${story.slug}"`, 'success');
                 } catch(e) {
                     _log(`Load failed for Deck ${deck}: ${e.message}`, 'error');
                 }

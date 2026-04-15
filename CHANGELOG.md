@@ -9,7 +9,10 @@ All notable changes to Moira will be documented in this file.
   - Settings modal scrolls correctly on iPad (fixed `min-h-0` flexbox overflow).
   - Presenter cards: font-size toggle button (`fa-text-height`) scales script text between normal and large for easier reading on mobile.
   - Autocue control buttons enlarged to 44 × 44 px minimum tap targets; iOS safe-area inset applied to the fixed bottom bar.
-  - Rundown: toolbar and timing bar wrap on narrow screens; desktop table hidden on mobile in favour of a card-based layout with Edit / Check / Float / ▲ / ▼ actions per story.
+  - Rundown: toolbar and timing bar wrap on narrow screens; desktop table hidden below `lg` breakpoint in favour of a card-based layout with Edit / Check / Float / ▲ / ▼ actions per story.
+  - Touch drag-and-drop on iPad via `mobile-drag-drop` polyfill (hold 400 ms to initiate); ▲ / ▼ buttons remain as offline fallback.
+  - Story edit modal form fields stack to single column on mobile; script textarea no longer clips on portrait phones.
+  - Alert popover and toast/error notifications constrained to viewport width on narrow screens.
 
 ### Fixed
 - **Studio radio deck buttons always triggered Deck A**: Play, Pause, Stop, Cue, and scrub bar used `data-deck` but the click handler read `data-id`, so Deck B controls silently operated Deck A instead.
