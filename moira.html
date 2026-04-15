@@ -3391,22 +3391,22 @@
             else connectionBadge = renderStatusBadge('Local Mode', 'fa-hard-drive', 'bg-amber-100 text-amber-800 border border-amber-200');
 
             return `
-                <div class="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
+                <div class="bg-white border-b border-slate-200 px-3 py-2 md:px-6 md:py-3 flex items-center justify-between">
                     <div class="flex items-center gap-4">
-                        <h1 class="text-xl font-bold tracking-tight text-slate-800"><i class="fa-solid fa-satellite-dish text-blue-500 mr-2"></i>Moira</h1>
+                        <h1 class="text-xl font-bold tracking-tight text-slate-800"><i class="fa-solid fa-satellite-dish text-blue-500 mr-2"></i><span class="hidden md:inline">Moira</span></h1>
                         <div class="flex bg-slate-100 p-1 rounded-lg ml-4">
-                            <button data-action="set-mode" data-val="newsroom" class="px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${state.mode === 'newsroom' ? TAB_ACTIVE : TAB_INACTIVE}">Newsroom</button>
-                            <button data-action="set-mode" data-val="presenter" class="px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${state.mode === 'presenter' ? TAB_ACTIVE : TAB_INACTIVE}">${state.mode === 'presenter' ? (state.ui.presenter.presenterMode === 'autocue' ? 'Autocue' : 'Presenter') : 'Presenter'}</button>
-                            <button data-action="set-mode" data-val="director" class="px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${state.mode === 'director' ? TAB_ACTIVE : TAB_INACTIVE}">Studio</button>
+                            <button data-action="set-mode" data-val="newsroom" class="px-2 py-1.5 rounded-md text-xs font-medium transition-colors sm:px-4 sm:text-sm ${state.mode === 'newsroom' ? TAB_ACTIVE : TAB_INACTIVE}">Newsroom</button>
+                            <button data-action="set-mode" data-val="presenter" class="px-2 py-1.5 rounded-md text-xs font-medium transition-colors sm:px-4 sm:text-sm ${state.mode === 'presenter' ? TAB_ACTIVE : TAB_INACTIVE}">${state.mode === 'presenter' ? (state.ui.presenter.presenterMode === 'autocue' ? 'Autocue' : 'Presenter') : 'Presenter'}</button>
+                            <button data-action="set-mode" data-val="director" class="px-2 py-1.5 rounded-md text-xs font-medium transition-colors sm:px-4 sm:text-sm ${state.mode === 'director' ? TAB_ACTIVE : TAB_INACTIVE}">Studio</button>
                         </div>
-                        <button data-action="open-staff-modal" class="ml-2 flex items-center px-3 py-1.5 rounded-md text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-blue-600 transition-colors">
+                        <button data-action="open-staff-modal" class="ml-2 hidden md:flex items-center px-3 py-1.5 rounded-md text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-blue-600 transition-colors">
                             <i class="fa-solid fa-users mr-1"></i> Staff ${staffCount > 0 ? `<span class="ml-1.5 bg-blue-100 text-blue-700 text-[10px] font-bold px-1.5 py-0.5 rounded-full">${staffCount}</span>` : ''}
                         </button>
                         ${(()=>{
                             const me = (state.meta.staff||[]).find(s=>s.id===state.myStaffId);
                             const isEditor = state.meta.editorStaffId === state.myStaffId;
-                            if (!me) return `<span class="text-xs text-slate-400 italic px-2">Not checked in</span>`;
-                            return `<span class="flex items-center gap-1.5 bg-blue-50 border border-blue-200 text-blue-800 px-3 py-1 rounded-full text-xs font-bold">
+                            if (!me) return `<span class="hidden sm:inline text-xs text-slate-400 italic px-2">Not checked in</span>`;
+                            return `<span class="hidden sm:flex items-center gap-1.5 bg-blue-50 border border-blue-200 text-blue-800 px-3 py-1 rounded-full text-xs font-bold">
                                 <span class="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_4px_#10b981]"></span>
                                 ${escapeHTML(me.name)}
                                 <span class="opacity-60 font-normal">${escapeHTML(me.role)}</span>
@@ -3415,7 +3415,7 @@
                         })()}
                     </div>
                     <div class="flex items-center gap-3">
-                        <div class="flex items-center bg-slate-100 p-1 rounded-lg border border-slate-200">
+                        <div class="hidden md:flex items-center bg-slate-100 p-1 rounded-lg border border-slate-200">
                             <span class="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-2">Newsroom</span>
                             <input type="text" id="header-room-input" value="${escapeHTML(state.roomDisplayName)}" class="bg-white border border-slate-300 rounded px-2 py-1 text-sm font-bold text-slate-800 w-24 outline-none focus:border-blue-500">
                             <button data-action="join-room" class="ml-1 bg-slate-800 hover:bg-slate-700 text-white px-2 py-1 rounded text-sm font-medium transition-colors shadow-sm">Join</button>
