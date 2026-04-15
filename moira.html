@@ -360,6 +360,7 @@
         const canMutate = () => state.localMode || (!!auth && !!auth.currentUser);
         const isPlaybackMaster = () =>
             !state.localMode &&
+            state.meta.isTXMode &&
             !!state.radio.directoryHandle;
 
         // ==========================================
@@ -1548,7 +1549,7 @@
                 return;
             }
 
-            // In local mode, always act as master (single-machine, no remote to defer to)
+            // Local mode — always play here (single machine, no Firestore)
             if (state.localMode) {
                 if (!state.radio.directoryHandle) {
                     showError(
@@ -1562,10 +1563,25 @@
                 return;
             }
 
-            // Cloud mode: write the request to Firestore — master machine will execute
+            // Cloud mode, not in TX — rehearsal/testing: play locally if folder is available.
+            // Each machine hears its own clips; no remote handshake needed outside of a live show.
+            if (!state.meta.isTXMode) {
+                if (!state.radio.directoryHandle) {
+                    showError(
+                        'Cannot fire clip — no media folder is set. Grant folder access in Settings.',
+                        'Open Settings',
+                        () => { state.ui.isSettingsModalOpen = true; state.ui.settingsTab = 'playout'; render('modal'); }
+                    );
+                    return;
+                }
+                await _executePresenterClipPlayback(storyId);
+                return;
+            }
+
+            // Cloud mode, TX live — remote handshake: write to Firestore, master executes
             updatePresenterClip(storyId, null);
 
-            // If this machine IS the master, also execute locally
+            // If this machine IS the master, also execute locally without waiting for echo
             if (isPlaybackMaster()) {
                 await _executePresenterClipPlayback(storyId);
             }
