@@ -16,4 +16,4 @@ These were identified during the v2.7.0 mobile audit but deferred.
 
 ## Features / Ideas (backlog)
 
-*(Add future feature ideas here)*
+- [ ] **Take a proper look at OBS integration for video** 
