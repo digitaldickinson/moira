@@ -3,7 +3,7 @@
 <img width="1439" height="685" alt="image" src="https://github.com/user-attachments/assets/fec69e13-aaa1-478c-817c-4bea9f53fab8" />
 
 
-Try Moira at https://digitaldickinson.github.io/moira/moira.html 
+Try Moira at [https://digitaldickinson.github.io/moira/moira.html](https://digitaldickinson.github.io/moira/moira.html) 
 
 ## Core Principles.
 Moira is designed to be a robust, multiuser, newsroom computer system. Think iNews, ENPS, CUEZ or Burli but simpler. Simpler to use and simpler to set up. 
