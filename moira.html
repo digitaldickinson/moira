@@ -56,6 +56,13 @@
         .moira-toast { animation: toast-in 0.2s ease-out forwards; }
         .moira-toast.leaving { animation: toast-out 0.4s ease-in forwards; }
 
+        /* ── TOUCH REORDER: hide grip, show ▲/▼ on coarse-pointer devices ── */
+        .row-reorder-btns { display: none; }
+        @media (pointer: coarse) {
+            .row-drag-icon  { display: none; }
+            .row-reorder-btns { display: flex; flex-direction: column; align-items: center; gap: 1px; }
+        }
+
         /* ── SEGMENT BREAK ROWS ── */
         .segment-row td { padding: 0; }
         .segment-divider { display: flex; align-items: center; gap: 0; background: #eef2ff; color: #3730a3; border-top: 1px solid #c7d2fe; border-bottom: 1px solid #c7d2fe; }
@@ -380,7 +387,7 @@
             if (!_errorContainer) {
                 _errorContainer = document.createElement('div');
                 _errorContainer.id = 'moira-error-container';
-                _errorContainer.style.cssText = 'position:fixed;bottom:1rem;right:1rem;z-index:9998;display:flex;flex-direction:column;gap:0.5rem;pointer-events:none;max-width:26rem;';
+                _errorContainer.style.cssText = 'position:fixed;bottom:1rem;right:1rem;left:1rem;z-index:9998;display:flex;flex-direction:column;gap:0.5rem;pointer-events:none;max-width:min(26rem,calc(100vw - 2rem));margin-left:auto;';
                 document.body.appendChild(_errorContainer);
             }
 
@@ -409,7 +416,7 @@
             if (!_toastContainer) {
                 _toastContainer = document.createElement('div');
                 _toastContainer.id = 'moira-toast-container';
-                _toastContainer.style.cssText = 'position:fixed;top:1rem;right:1rem;z-index:9999;display:flex;flex-direction:column;gap:0.5rem;pointer-events:none;max-width:22rem;';
+                _toastContainer.style.cssText = 'position:fixed;top:1rem;right:1rem;left:1rem;z-index:9999;display:flex;flex-direction:column;gap:0.5rem;pointer-events:none;max-width:min(22rem,calc(100vw - 2rem));margin-left:auto;';
                 document.body.appendChild(_toastContainer);
             }
 
@@ -3527,7 +3534,7 @@
             const _alertMe = (state.meta.staff||[]).find(s => s.id === state.myStaffId);
             const canAlert = !!_alertMe && (_alertMe.role === 'Producer' || isEditor);
 
-            const rows = (state.meta.order || []).map(id => {
+            const rows = (state.meta.order || []).map((id, idx) => {
                 if (id === 'marker-line') {
                     isBelowLine = true;
                     return `<tr class="bg-red-50 border-y-4 border-red-200 shadow-inner" data-story-id="${id}" draggable="true">
@@ -3581,7 +3588,13 @@
                 }
 
                 return `<tr class="${rowClasses}" data-story-id="${id}" draggable="true">
-                    <td class="px-3 py-1.5 text-center w-10 ${(isRundownLocked || isLocked) ? 'text-slate-200 cursor-not-allowed' : 'text-slate-400 cursor-grab active:cursor-grabbing hover:text-blue-500'}" title="${isLocked ? `Locked by ${escapeHTML(story.lockedByName)}` : ''}"><i class="fa-solid fa-grip-vertical"></i></td>
+                    <td class="px-3 py-1.5 text-center w-10 ${(isRundownLocked || isLocked) ? 'text-slate-200 cursor-not-allowed' : 'text-slate-400 cursor-grab active:cursor-grabbing hover:text-blue-500'}" title="${isLocked ? `Locked by ${escapeHTML(story.lockedByName)}` : ''}">
+                        <i class="row-drag-icon fa-solid fa-grip-vertical"></i>
+                        ${!isRundownLocked && !isLocked ? `<div class="row-reorder-btns">
+                            <button data-action="move-story-up"   data-id="${id}" class="text-slate-400 hover:text-blue-500 text-xs leading-none py-0.5 px-1" ${idx === 0 ? 'disabled' : ''}>▲</button>
+                            <button data-action="move-story-down" data-id="${id}" class="text-slate-400 hover:text-blue-500 text-xs leading-none py-0.5 px-1" ${idx === (state.meta.order||[]).length - 1 ? 'disabled' : ''}>▼</button>
+                        </div>` : ''}
+                    </td>
                     <td class="px-3 py-1.5 font-semibold w-1/4">
                         ${isActive ? `<span class="inline-block w-2 h-2 ${state.meta.isTXMode ? 'bg-red-500' : 'bg-amber-400'} rounded-full animate-pulse mr-2"></span>` : ''}
                         ${story.mediaFile ? '<i class="fa-solid fa-photo-film text-amber-500 mr-2"></i>' : ''}
@@ -3671,7 +3684,7 @@
                                 ${state.meta.presenterAlert ? `<span class="absolute -top-1 -right-1 w-2.5 h-2.5 bg-red-500 rounded-full border-2 border-white animate-pulse"></span>` : ''}
                             </button>
                             ${state.ui.alertPanelOpen ? `
-                            <div class="absolute right-0 top-full mt-2 w-96 bg-slate-800 border border-slate-600 rounded-xl shadow-2xl z-50 overflow-hidden">
+                            <div class="absolute right-0 top-full mt-2 w-[min(24rem,calc(100vw-2rem))] bg-slate-800 border border-slate-600 rounded-xl shadow-2xl z-50 overflow-hidden">
                                 <div class="px-4 py-3 border-b border-slate-700 flex items-center justify-between">
                                     <span class="text-xs font-black text-slate-300 uppercase tracking-widest"><i class="fa-solid fa-bullhorn text-amber-400 mr-2"></i>Alert Presenter</span>
                                     <button data-action="toggle-alert-panel" class="text-slate-500 hover:text-slate-300 text-sm transition-colors"><i class="fa-solid fa-xmark"></i></button>
@@ -3737,7 +3750,7 @@
                     </div>
                     <button data-action="clear-trash" class="ml-auto text-amber-400 hover:text-amber-700 text-xs font-bold px-2 py-1 rounded transition-colors" title="Discard all deleted stories">Clear</button>
                 </div>` : ''}
-                <div class="hidden md:block">
+                <div class="hidden lg:block">
                     <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                         <table class="w-full text-left border-collapse">
                             <thead>
@@ -3761,7 +3774,7 @@
                         </table>
                     </div>
                 </div>
-                <div class="md:hidden flex flex-col gap-3">
+                <div class="lg:hidden flex flex-col gap-3">
                     ${renderRundownMobileCards(state.meta.order || [])}
                 </div>
             </div>`;
@@ -4134,10 +4147,10 @@
                             </button>
                         </div>`;
                     })() : ''}
-                    <div class="p-6 overflow-y-auto flex-1 space-y-5">
+                    <div class="p-6 overflow-y-auto flex-1 min-h-0 space-y-5">
                         <input type="hidden" id="edit-rev" value="${story.rev}">
-                        <div class="grid grid-cols-4 gap-4"><div class="col-span-3"><label class="text-sm font-semibold block mb-1">Slug</label><input type="text" id="edit-slug" value="${escapeHTML(story.slug)}" class="w-full border rounded-lg px-4 py-2.5 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}></div><div class="col-span-1"><label class="text-sm font-semibold block mb-1">Format</label><select id="edit-format" class="w-full border rounded-lg px-4 py-2.5 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${formatOptions}</select></div></div>
-                        <div class="grid grid-cols-3 gap-4">
+                        <div class="grid grid-cols-1 gap-4 sm:grid-cols-4"><div class="sm:col-span-3"><label class="text-sm font-semibold block mb-1">Slug</label><input type="text" id="edit-slug" value="${escapeHTML(story.slug)}" class="w-full border rounded-lg px-4 py-2.5 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}></div><div class="sm:col-span-1"><label class="text-sm font-semibold block mb-1">Format</label><select id="edit-format" class="w-full border rounded-lg px-4 py-2.5 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${formatOptions}</select></div></div>
+                        <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
                             <div><label class="text-sm font-semibold block mb-1">Presenter</label><select id="edit-presenter" class="w-full border rounded-lg px-4 py-2 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${staffOptions(story.presenterId, 'Presenter')}</select></div>
                             <div><label class="text-sm font-semibold block mb-1">Reporter</label><select id="edit-reporter" class="w-full border rounded-lg px-4 py-2 outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}>${staffOptions(story.reporterId, 'Reporter')}</select></div>
                             <div>
@@ -4157,7 +4170,7 @@
                             </div>
                         </div>
                         <div><label class="text-sm font-semibold block mb-1">Media File</label><div class="flex gap-2"><input type="text" id="edit-media-file" value="${escapeHTML(story.mediaFile || '')}" class="flex-1 border rounded-lg px-4 py-2 font-mono outline-none focus:border-blue-500" ${isLocked ? 'disabled' : ''}><button data-action="browse-media" class="px-4 py-2 bg-slate-100 border rounded-lg text-sm font-medium hover:bg-slate-200" ${isLocked ? 'disabled' : ''}>Browse</button><input type="file" id="media-file-picker" class="hidden"></div></div>
-                        <div class="flex flex-col h-64">
+                        <div class="flex flex-col min-h-[12rem] md:h-64">
                             <div class="flex items-baseline justify-between mb-1">
                                 <label class="text-sm font-semibold">Presenter Script</label>
                                 <span id="edit-script-stats" class="text-xs font-mono text-slate-400">
@@ -4382,7 +4395,7 @@
                                         <div class="h-px bg-slate-200 w-12 mx-auto mb-4"></div>
                                         <p class="text-sm text-slate-500">It's named after BBC legend <a href="https://en.wikipedia.org/wiki/Moira_Stuart" target="_blank" class="text-blue-500 hover:underline font-bold decoration-2 underline-offset-2">Moira Stuart</a>.</p>
                                     </div>
-                                    <div class="text-center text-[10px] text-slate-400 font-mono uppercase tracking-widest">v2.6.0</div>
+                                    <div class="text-center text-[10px] text-slate-400 font-mono uppercase tracking-widest">v2.7.0</div>
                                 </div>`}
                         </div>
                         <div class="px-6 py-4 border-t border-slate-200 bg-slate-50 rounded-b-2xl flex justify-between items-center">
