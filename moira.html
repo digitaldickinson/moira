@@ -3157,6 +3157,11 @@
                                         ${state.radio.directoryHandle ? `Media: ${escapeHTML(state.radio.directoryHandle.name)}` : 'No Media Folder'}
                                     </span>` : ''}
                                 </div>`}
+                                ${isPlaybackMaster() ? `
+                                <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-900/40 text-emerald-300 border border-emerald-700">
+                                    <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                                    AUDIO MASTER
+                                </span>` : ''}
                             </div>
                             <button data-action="studio-tx-toggle"
                                 class="px-6 py-2 rounded-lg font-black text-sm tracking-widest transition-all shadow-lg ${isLive ? 'bg-slate-700 hover:bg-slate-600 text-white border-2 border-slate-500' : 'bg-red-600 hover:bg-red-500 text-white border-2 border-red-400'}">
