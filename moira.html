@@ -3778,31 +3778,31 @@
             const activeIdx = storyIds.indexOf(state.meta.activeStoryId);
             const atFirst = activeIdx <= 0;
             const atLast = activeIdx === storyIds.length - 1;
-            const btnNav = 'px-4 py-2 rounded font-black text-sm tracking-widest transition-colors';
+            const btnNav = 'px-4 py-3 min-h-[48px] rounded font-black text-sm tracking-widest transition-colors';
             const btnNavOn = `${btnNav} bg-slate-700 hover:bg-slate-600 text-white`;
             const btnNavOff = `${btnNav} bg-slate-900 text-slate-700 cursor-not-allowed`;
 
             const controlsBar = `
-                <div class="fixed bottom-0 left-0 right-0 z-50 flex items-center justify-between px-6 py-3 bg-black/80 backdrop-blur-sm border-t border-slate-800">
+                <div class="fixed bottom-0 left-0 right-0 z-50 flex items-center justify-between px-6 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] bg-black/80 backdrop-blur-sm border-t border-slate-800">
                     <div class="flex items-center gap-3">
                         <span class="text-slate-500 text-xs font-bold uppercase tracking-widest">Size</span>
-                        <button data-action="presenter-font-down" class="w-8 h-8 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">−</button>
+                        <button data-action="presenter-font-down" class="w-11 h-11 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">−</button>
                         <span class="text-white text-xs font-mono w-8 text-center">${fontSize}</span>
-                        <button data-action="presenter-font-up" class="w-8 h-8 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">+</button>
+                        <button data-action="presenter-font-up" class="w-11 h-11 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">+</button>
                     </div>
                     <div class="flex items-center gap-3">
                         <button data-action="presenter-story-prev" ${atFirst ? 'disabled' : ''} class="${atFirst ? btnNavOff : btnNavOn}">◀ Prev</button>
                         <button data-action="presenter-scroll-toggle"
-                            class="px-6 py-2 rounded font-black text-sm tracking-widest transition-colors ${pm.autoScroll ? 'bg-white text-black hover:bg-slate-200' : 'bg-slate-700 text-white hover:bg-slate-600'}">
+                            class="px-6 py-3 min-h-[48px] rounded font-black text-sm tracking-widest transition-colors ${pm.autoScroll ? 'bg-white text-black hover:bg-slate-200' : 'bg-slate-700 text-white hover:bg-slate-600'}">
                             ${pm.autoScroll ? '⏸ PAUSE' : '▶ SCROLL'}
                         </button>
                         <button data-action="presenter-story-next" ${atLast ? 'disabled' : ''} class="${atLast ? btnNavOff : btnNavOn}">Next ▶</button>
                     </div>
                     <div class="flex items-center gap-3">
                         <span class="text-slate-500 text-xs font-bold uppercase tracking-widest">Speed</span>
-                        <button data-action="presenter-speed-down" class="w-8 h-8 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">−</button>
+                        <button data-action="presenter-speed-down" class="w-11 h-11 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">−</button>
                         <span class="text-white text-xs font-mono w-8 text-center">${speed}</span>
-                        <button data-action="presenter-speed-up" class="w-8 h-8 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">+</button>
+                        <button data-action="presenter-speed-up" class="w-11 h-11 rounded bg-slate-800 hover:bg-slate-700 text-white font-black text-lg flex items-center justify-center">+</button>
                     </div>
                 </div>`;
 
@@ -3811,7 +3811,7 @@
                     ${pm.zenMode ? `<div class="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-black/70 text-white text-xs font-bold uppercase tracking-widest px-5 py-2 rounded-full pointer-events-none select-none">Press F or ESC to exit fullscreen</div>` : ''}
                     <div id="presenter-transform-wrapper" style="${transformStyle}"
                         class="transition-transform duration-300 pb-32">
-                        <div style="max-width:65%; margin:0 auto;" class="px-4">
+                        <div class="px-4 max-w-[85%] sm:max-w-[75%] md:max-w-[65%] mx-auto">
                             <div class="py-[40vh]">
                                 ${storiesHtml}
                             </div>
