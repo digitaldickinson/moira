@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Studio Script Merger</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 750px; margin: 40px auto; padding: 20px; background: #f0f2f5; }
+        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.1); border: 1px solid #e1e4e8; }
+        h2 { margin-top: 0; font-size: 1.5rem; border-bottom: 2px solid #f0f2f5; padding-bottom: 10px; }
+        #fileList { list-style: none; padding: 0; margin: 20px 0; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }
+        .file-item { background: #fff; border-bottom: 1px solid #eee; padding: 10px 15px; display: flex; align-items: center; justify-content: space-between; cursor: grab; }
+        .file-item.dragging { opacity: 0.4; background: #f1f3f5; }
+        .remove-btn { background: #ffebe9; color: #cf222e; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
+        .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 25px; }
+        button.main-btn { padding: 16px; border-radius: 8px; font-weight: 700; cursor: pointer; border: none; color: white; }
+        .btn-txt { background: #4b5563; }
+        .btn-word { background: #1a73e8; }
+        button:disabled { background: #e4e6eb; color: #bcc0c4; cursor: not-allowed; }
+        #status { margin-top: 20px; text-align: center; font-size: 0.85rem; font-weight: 600; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>Script Merger Pro</h2>
+    <input type="file" id="filePicker" accept=".rtf,.txt" multiple>
+    <ul id="fileList"></ul>
+    <div class="actions">
+        <button id="txtBtn" class="main-btn btn-txt" disabled onclick="exportFile('txt')">Export Autocue (.txt)</button>
+        <button id="docBtn" class="main-btn btn-word" disabled onclick="exportFile('doc')">Export Studio Script (.doc)</button>
+    </div>
+    <div id="status">Ready</div>
+</div>
+
+<script>
+    const filePicker = document.getElementById('filePicker');
+    const fileList = document.getElementById('fileList');
+    const status = document.getElementById('status');
+    let selectedFiles = [];
+
+    filePicker.addEventListener('change', (e) => {
+        selectedFiles = [...selectedFiles, ...Array.from(e.target.files)];
+        updateUI();
+        filePicker.value = ""; 
+    });
+
+    function updateUI() {
+        renderList();
+        const hasFiles = selectedFiles.length > 0;
+        document.querySelectorAll('.main-btn').forEach(b => b.disabled = !hasFiles);
+        status.innerText = hasFiles ? `${selectedFiles.length} files in queue.` : "Ready";
+    }
+
+    function renderList() {
+        fileList.innerHTML = '';
+        selectedFiles.forEach((file, index) => {
+            const li = document.createElement('li');
+            li.className = 'file-item';
+            li.draggable = true;
+            li.dataset.id = index;
+            li.innerHTML = `<span>☰ ${file.name}</span>`;
+            const btn = document.createElement('button');
+            btn.className = 'remove-btn';
+            btn.textContent = 'Remove';
+            btn.onclick = () => { selectedFiles.splice(index, 1); updateUI(); };
+            li.appendChild(btn);
+            li.addEventListener('dragstart', () => li.classList.add('dragging'));
+            li.addEventListener('dragend', () => li.classList.remove('dragging'));
+            fileList.appendChild(li);
+        });
+    }
+
+    fileList.addEventListener('dragover', e => {
+        e.preventDefault();
+        const dragging = document.querySelector('.dragging');
+        const afterElement = [...fileList.querySelectorAll('.file-item:not(.dragging)')].reduce((closest, child) => {
+            const box = child.getBoundingClientRect();
+            const offset = e.clientY - box.top - box.height / 2;
+            if (offset < 0 && offset > closest.offset) return { offset: offset, element: child };
+            return closest;
+        }, { offset: Number.NEGATIVE_INFINITY }).element;
+        if (afterElement == null) fileList.appendChild(dragging);
+        else fileList.insertBefore(dragging, afterElement);
+    });
+
+    async function exportFile(type) {
+        status.innerText = "Processing...";
+        const orderedItems = [...fileList.querySelectorAll('.file-item')];
+        let txtOutput = "";
+        let docOutput = `<html><head><meta charset='utf-8'><style>
+            @page { size: 8.5in 11in; margin: 0.5in; }
+            body { font-family: 'Arial', sans-serif; font-size: 11pt; }
+            table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+            td { vertical-align: top; padding: 12px; border: 1px solid #ccc; }
+            .left-col { width: 25%; font-weight: bold; text-transform: uppercase; }
+            .right-col { width: 75%; line-height: 1.5; }
+            .tag-style { font-weight: bold; color: #444; }
+        </style></head><body>`;
+
+        for (const item of orderedItems) {
+            const file = selectedFiles[item.dataset.id];
+            const baseName = file.name.replace(/\.[^/.]+$/, "").toUpperCase();
+            let content = await file.text();
+
+            // Format (**NAME**) to [Name]
+            content = content.replace(/\(\*\*(.*?)\*\*\)/g, (match, p1) => {
+                return `[${p1.charAt(0).toUpperCase() + p1.slice(1).toLowerCase()}]`;
+            });
+
+            // Extract technical tags ([On cam], [Take sot]) for the left column
+            const techTags = [...content.matchAll(/\[(On cam|Take sot)\]/gi)].map(m => m[0]);
+            const sideTagsHtml = techTags.map(t => `<div>${t}</div>`).join("");
+
+            txtOutput += `\n\n## ${baseName}\n\n${content}\n\n`;
+
+            docOutput += `
+                <table>
+                    <tr>
+                        <td class="left-col">${baseName}<br><br>${sideTagsHtml}</td>
+                        <td class="right-col">${content.replace(/\n/g, '<br>')}</td>
+                    </tr>
+                </table>`;
+        }
+
+        docOutput += "</body></html>";
+        const blob = type === 'txt' 
+            ? new Blob([txtOutput], { type: 'text/plain;charset=utf-8' })
+            : new Blob([docOutput], { type: 'application/msword' });
+
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = type === 'txt' ? "autocue.txt" : "studio_script.doc";
+        a.click();
+        status.innerText = "Exported!";
+    }
+</script>
+</body>
+</html>

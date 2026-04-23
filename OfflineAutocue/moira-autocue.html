@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Moira:Autocue</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --font-size: 48px;
+    --bar-h: 72px;
+    --accent: #3b82f6;
+  }
+
+  html, body {
+    height: 100%; background: #000; color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow: hidden;
+  }
+
+  /* ── LOAD SCREEN ── */
+  #load-screen {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 1.5rem; background: #000; z-index: 200;
+    overflow-y: auto; padding: 2rem;
+  }
+  #load-screen.hidden { display: none; }
+
+  .load-logo { font-size: 2rem; font-weight: 900; letter-spacing: 0.25em; text-transform: uppercase; }
+  .load-logo span { color: #3b82f6; }
+  .load-subtitle { font-size: 0.75rem; font-weight: 700; letter-spacing: 0.2em; text-transform: uppercase; color: #475569; }
+
+  /* Load screen two-column action area */
+  .load-actions {
+    display: flex; gap: 1.5rem; align-items: stretch; flex-wrap: wrap; justify-content: center;
+    width: 100%; max-width: 680px;
+  }
+  .load-col {
+    flex: 1; min-width: 240px;
+    display: flex; flex-direction: column; gap: 0.75rem;
+  }
+  .load-col-label {
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.15em;
+    text-transform: uppercase; color: #334155; text-align: center;
+  }
+  .load-divider {
+    width: 1px; background: #1e293b; align-self: stretch; flex-shrink: 0;
+  }
+
+  .load-btn {
+    display: flex; align-items: center; justify-content: center; gap: 0.75rem;
+    padding: 1rem 2rem; background: #1e40af; color: #fff;
+    border: none; border-radius: 0.75rem;
+    font-size: 1rem; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase;
+    cursor: pointer; transition: background 150ms; white-space: nowrap;
+  }
+  .load-btn:hover { background: #2563eb; }
+  .load-btn svg { width: 22px; height: 22px; flex-shrink: 0; }
+
+  /* Paste textarea */
+  #paste-area {
+    width: 100%; height: 140px;
+    background: #0f172a; color: #e2e8f0;
+    border: 1px solid #1e293b; border-radius: 0.75rem;
+    padding: 0.75rem 1rem; font-size: 0.875rem; font-family: inherit;
+    resize: none; outline: none; line-height: 1.5;
+  }
+  #paste-area:focus { border-color: #3b82f6; }
+  #paste-area::placeholder { color: #334155; }
+
+  .btn-secondary {
+    display: flex; align-items: center; justify-content: center; gap: 0.5rem;
+    padding: 0.75rem 1.5rem;
+    background: #1e293b; color: #94a3b8;
+    border: 1px solid #334155; border-radius: 0.75rem;
+    font-size: 0.875rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    cursor: pointer; transition: background 150ms;
+  }
+  .btn-secondary:hover { background: #334155; color: #fff; }
+
+  /* Clear storage */
+  #btn-clear-storage {
+    font-size: 0.65rem; color: #334155; background: none; border: none;
+    cursor: pointer; letter-spacing: 0.08em; text-transform: uppercase;
+    text-decoration: underline; transition: color 150ms;
+  }
+  #btn-clear-storage:hover { color: #64748b; }
+
+  .load-hint {
+    font-size: 0.7rem; font-weight: 600; letter-spacing: 0.06em;
+    color: #334155; text-transform: uppercase; text-align: center; line-height: 1.9;
+  }
+  .load-hint kbd {
+    background: #1e293b; color: #94a3b8;
+    padding: 0.1rem 0.4rem; border-radius: 0.25rem;
+    font-family: monospace; font-size: 0.8em;
+  }
+
+  /* ── PRESENTER WAIT SCREEN ── */
+  #presenter-wait {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 1.5rem; background: #000; z-index: 200;
+  }
+  #presenter-wait.hidden { display: none; }
+
+  .wait-pulse {
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #3b82f6; animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%       { opacity: 0.3; transform: scale(0.7); }
+  }
+
+  /* ── SCROLL CANVAS ── */
+  #scroll-canvas {
+    position: fixed; inset: 0; overflow: hidden; background: #000;
+  }
+  #scroll-canvas.hidden { display: none; }
+
+  #transform-wrapper { width: 100%; height: 100%; transform-origin: center top; }
+
+  #script-inner {
+    max-width: 75%; margin: 0 auto;
+    padding: 40vh 1rem calc(var(--bar-h) + 60px) 1rem;
+  }
+
+  .para-block {
+    font-size: var(--font-size);
+    line-height: 1.7; font-weight: 500;
+    letter-spacing: 0.02em; color: #fff;
+    margin-bottom: 3rem; word-break: break-word;
+  }
+
+  .section-head {
+    display: flex; align-items: center; gap: 0.6em;
+    margin-bottom: 1em;
+  }
+  .section-head-pill {
+    /* Scales with --font-size via the .para-block context */
+    font-size: 0.55em; font-weight: 900;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: #000;
+    background: #fde047;           /* yellow-300 */
+    padding: 0.25em 0.75em;
+    border-radius: 0.4em;
+    white-space: nowrap;
+    display: inline-block;
+  }
+  .section-line { flex: 1; height: 2px; background: #fde04733; border-radius: 1px; }
+
+  /* ── READING LINE ── */
+  #reading-line {
+    position: fixed;
+    left: 0; right: 0;
+    /* sits at 38% down — natural eye resting position */
+    top: 38%;
+    height: 3px;
+    background: rgba(59, 130, 246, 0.35);
+    box-shadow: 0 0 0 9999px rgba(0,0,0,0.18);
+    pointer-events: none;
+    z-index: 90;
+    transition: opacity 0.3s;
+  }
+  /* Fade edges */
+  #reading-line::before, #reading-line::after {
+    content: ''; position: absolute; top: -40px;
+    width: 100%; height: 43px;
+    background: linear-gradient(to bottom, transparent, rgba(59,130,246,0.08));
+    pointer-events: none;
+  }
+  #reading-line::after {
+    top: 3px;
+    background: linear-gradient(to top, transparent, rgba(59,130,246,0.08));
+  }
+  #reading-line.hidden { opacity: 0; pointer-events: none; }
+
+  /* ── CONTROLS BAR ── */
+  #controls {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    height: var(--bar-h);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 1.5rem;
+    background: rgba(0,0,0,0.85);
+    backdrop-filter: blur(6px);
+    border-top: 1px solid #1e293b;
+    z-index: 100; gap: 1rem;
+    transition: opacity 0.5s, transform 0.5s;
+  }
+  #controls.hidden { display: none; }
+  #controls.autohide {
+    opacity: 0;
+    transform: translateY(100%);
+    pointer-events: none;
+  }
+
+  .ctrl-group { display: flex; align-items: center; gap: 0.6rem; flex-shrink: 0; }
+  .ctrl-label { font-size: 0.65rem; font-weight: 700; letter-spacing: 0.15em; text-transform: uppercase; color: #475569; }
+  .ctrl-val { font-family: monospace; font-size: 0.8rem; color: #94a3b8; min-width: 2.5rem; text-align: center; }
+
+  .icon-btn {
+    width: 42px; height: 42px;
+    display: flex; align-items: center; justify-content: center;
+    background: #1e293b; border: none; border-radius: 0.5rem;
+    color: #fff; font-size: 1.1rem; font-weight: 900;
+    cursor: pointer; transition: background 150ms; flex-shrink: 0;
+  }
+  .icon-btn:hover { background: #334155; }
+  .icon-btn.active { background: #1d4ed8; }
+  .icon-btn svg { width: 18px; height: 18px; pointer-events: none; }
+
+  #btn-scroll {
+    padding: 0 1.5rem; height: 48px; width: auto;
+    font-size: 0.85rem; font-weight: 900; letter-spacing: 0.1em; border-radius: 0.5rem;
+  }
+  #btn-scroll.scrolling { background: #fff; color: #000; }
+  #btn-scroll.scrolling:hover { background: #e2e8f0; }
+
+  #btn-open-presenter {
+    padding: 0 1rem; height: 42px;
+    font-size: 0.7rem; font-weight: 900; letter-spacing: 0.08em;
+    text-transform: uppercase; border-radius: 0.5rem;
+    background: #1e293b; color: #94a3b8;
+    border: 1px solid #334155;
+    cursor: pointer; transition: background 150ms; white-space: nowrap;
+  }
+  #btn-open-presenter:hover { background: #334155; color: #fff; }
+
+  /* Sync indicator (presenter tab) */
+  #sync-indicator {
+    display: flex; align-items: center; gap: 0.5rem;
+    padding: 0 1rem; height: 42px;
+    border-radius: 0.5rem; background: #0f172a; border: 1px solid #1e293b;
+  }
+  .sync-dot { width: 8px; height: 8px; border-radius: 50%; background: #475569; transition: background 200ms; }
+  .sync-dot.live { background: #22c55e; }
+  #sync-label { font-size: 0.65rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #475569; }
+
+  /* ── PROGRESS BAR ── */
+  #progress-bar {
+    position: fixed; top: 0; left: 0;
+    height: 3px; background: var(--accent);
+    z-index: 150; width: 0%;
+  }
+  #progress-bar.hidden { display: none; }
+
+  /* ── CLOCK (presenter tab, top-right) ── */
+  #clock {
+    position: fixed; top: 1rem; right: 1.25rem;
+    z-index: 150; display: none;
+    font-family: monospace; font-size: 1.4rem; font-weight: 700;
+    color: #475569; letter-spacing: 0.05em;
+    pointer-events: none;
+  }
+
+  /* ── TIME REMAINING (both tabs, top-left when loaded) ── */
+  #time-remaining {
+    position: fixed; top: 1rem; left: 1.25rem;
+    z-index: 150; display: none;
+    font-family: monospace; font-size: 1rem; font-weight: 700;
+    color: #334155; letter-spacing: 0.05em;
+    pointer-events: none;
+  }
+  #time-remaining.warning { color: #d97706; }
+  #time-remaining.urgent  { color: #dc2626; }
+
+  /* ── MODE BADGE ── */
+  #mode-badge {
+    position: fixed; top: 1rem; left: 50%; transform: translateX(-50%);
+    z-index: 150; display: none;
+    background: #1d4ed8; color: #fff;
+    font-size: 0.65rem; font-weight: 900;
+    letter-spacing: 0.2em; text-transform: uppercase;
+    padding: 0.35rem 1rem; border-radius: 999px; pointer-events: none;
+  }
+
+  /* ── STATUS TOAST ── */
+  #status-badge {
+    position: fixed; top: 1rem; left: 50%; transform: translateX(-50%);
+    z-index: 160;
+    background: rgba(0,0,0,0.7); color: #fff;
+    font-size: 0.65rem; font-weight: 700;
+    letter-spacing: 0.15em; text-transform: uppercase;
+    padding: 0.35rem 1rem; border-radius: 999px;
+    pointer-events: none; opacity: 0; transition: opacity 0.4s;
+  }
+  #status-badge.visible { opacity: 1; }
+
+  /* ── DROP OVERLAY ── */
+  #drop-overlay {
+    position: fixed; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(37,99,235,0.15);
+    border: 4px dashed #3b82f6;
+    z-index: 300; font-size: 1.5rem; font-weight: 900;
+    letter-spacing: 0.1em; text-transform: uppercase; color: #3b82f6;
+  }
+  #drop-overlay.active { display: flex; }
+</style>
+</head>
+<body>
+
+<input type="file" id="file-input" accept=".txt" style="display:none">
+
+<!-- ── CONTROLLER LOAD SCREEN ── -->
+<div id="load-screen">
+  <div class="load-logo">Moira: <span>Autocue</span></div>
+  <div class="load-subtitle"> Offline Autocue </div>
+
+  <div class="load-actions">
+    <!-- File open column -->
+    <div class="load-col">
+      <span class="load-col-label">Open file</span>
+      <button class="load-btn" id="btn-open-file">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+        </svg>
+        Open .txt File
+      </button>
+      <div class="load-hint" style="font-size:0.6rem;">Or drag &amp; drop a file anywhere</div>
+    </div>
+
+    <div class="load-divider"></div>
+
+    <!-- Paste column -->
+    <div class="load-col">
+      <span class="load-col-label">Paste script</span>
+      <textarea id="paste-area" placeholder="Paste your script here…&#10;&#10;Start sections with ## Section Name&#10;Wrap *words* in asterisks to bold them"></textarea>
+      <button class="btn-secondary" id="btn-load-paste">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+        </svg>
+        Load Pasted Script
+      </button>
+    </div>
+  </div>
+
+  <div class="load-hint">
+    <kbd>##</kbd> section header &nbsp;·&nbsp; <kbd>*word*</kbd> bold &nbsp;·&nbsp; <kbd>[CUE]</kbd> tag pill<br>
+    <kbd>Space</kbd> scroll &nbsp;·&nbsp; <kbd>+</kbd><kbd>−</kbd> size &nbsp;·&nbsp; <kbd>[</kbd><kbd>]</kbd> speed &nbsp;·&nbsp; <kbd>F</kbd> fullscreen &nbsp;·&nbsp; <kbd>M</kbd> mirror
+  </div>
+
+  <button id="btn-clear-storage">Clear saved script from memory</button>
+</div>
+
+<!-- ── PRESENTER WAIT SCREEN ── -->
+<div id="presenter-wait" class="hidden">
+  <div class="load-logo">Moira <span>Presenter</span></div>
+  <div class="load-subtitle">Waiting for operator to load script…</div>
+  <div class="wait-pulse"></div>
+  <div class="load-hint">This tab will update automatically when the operator loads a file</div>
+</div>
+
+<!-- ── OVERLAYS ── -->
+<div id="reading-line" class="hidden"></div>
+<div id="progress-bar" class="hidden"></div>
+<div id="clock"></div>
+<div id="time-remaining"></div>
+<div id="mode-badge">● Presenter</div>
+<div id="status-badge"></div>
+
+<!-- ── SCROLL CANVAS ── -->
+<div id="scroll-canvas" class="hidden">
+  <div id="transform-wrapper">
+    <div id="script-inner"></div>
+  </div>
+</div>
+
+<!-- ── CONTROLS BAR ── -->
+<div id="controls" class="hidden">
+  <div class="ctrl-group">
+    <span class="ctrl-label">Size</span>
+    <button class="icon-btn" id="btn-font-down">−</button>
+    <span class="ctrl-val" id="lbl-font">48</span>
+    <button class="icon-btn" id="btn-font-up">+</button>
+  </div>
+  <div class="ctrl-group" style="flex:1; justify-content:center; gap:0.5rem;" id="centre-controls"></div>
+  <div class="ctrl-group" id="right-controls"></div>
+</div>
+
+<div id="drop-overlay">Drop .txt file here</div>
+
+<script>
+// =============================================
+// CONSTANTS
+// =============================================
+const SYNC_SCRIPT_KEY = 'moira_ac_script';
+const SYNC_STATE_KEY  = 'moira_ac_sync';
+const IS_PRESENTER    = location.hash === '#presenter';
+
+// =============================================
+// STATE
+// =============================================
+const state = {
+  fontSize:       48,
+  scrollSpeed:    40,
+  scrolling:      false,
+  mirrorX:        IS_PRESENTER,
+  mirrorY:        false,
+  showReadingLine: true,
+  offsetY:        0,
+  totalHeight:    0,
+  lastTimestamp:  null,
+  loaded:         false,
+};
+
+// =============================================
+// DOM
+// =============================================
+const $ = id => document.getElementById(id);
+const loadScreen       = $('load-screen');
+const presenterWait    = $('presenter-wait');
+const scrollCanvas     = $('scroll-canvas');
+const controls         = $('controls');
+const scriptInner      = $('script-inner');
+const transformWrapper = $('transform-wrapper');
+const progressBar      = $('progress-bar');
+const readingLine      = $('reading-line');
+const statusBadge      = $('status-badge');
+const dropOverlay      = $('drop-overlay');
+const fileInput        = $('file-input');
+const modeBadge        = $('mode-badge');
+const centreControls   = $('centre-controls');
+const rightControls    = $('right-controls');
+const btnFontUp        = $('btn-font-up');
+const btnFontDown      = $('btn-font-down');
+const lblFont          = $('lbl-font');
+const clockEl          = $('clock');
+const timeRemainingEl  = $('time-remaining');
+
+// =============================================
+// SVG ICONS
+// =============================================
+const SVG_MIRROR_X   = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="3" x2="12" y2="21" stroke-dasharray="3 3"/><polyline points="8 7 3 12 8 17"/><polyline points="16 7 21 12 16 17"/></svg>`;
+const SVG_MIRROR_Y   = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12" stroke-dasharray="3 3"/><polyline points="7 8 12 3 17 8"/><polyline points="7 16 12 21 17 16"/></svg>`;
+const SVG_FULLSCREEN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>`;
+const SVG_FILE       = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`;
+const SVG_LINE       = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6" opacity="0.3"/><line x1="3" y1="18" x2="21" y2="18" opacity="0.3"/></svg>`;
+
+// =============================================
+// BUILD CONTROLS
+// =============================================
+function buildControllerControls() {
+  centreControls.innerHTML = `
+    <button class="icon-btn" id="btn-mirror-x" title="Mirror horizontal (M)">${SVG_MIRROR_X}</button>
+    <button class="icon-btn" id="btn-mirror-y" title="Mirror vertical">${SVG_MIRROR_Y}</button>
+    <button class="icon-btn" id="btn-reading-line" title="Toggle reading line (R)">${SVG_LINE}</button>
+    <button class="icon-btn" id="btn-scroll" title="Scroll (Space)">▶ SCROLL</button>
+    <button id="btn-open-presenter" title="Open synced presenter tab">📺 Open Presenter Tab</button>
+    <button class="icon-btn" id="btn-load-new" title="Load new file">${SVG_FILE}</button>
+    <button class="icon-btn" id="btn-fullscreen" title="Fullscreen (F)">${SVG_FULLSCREEN}</button>`;
+
+  rightControls.innerHTML = `
+    <span class="ctrl-label">Speed</span>
+    <button class="icon-btn" id="btn-speed-down" title="Slower ([)">−</button>
+    <span class="ctrl-val" id="lbl-speed">40</span>
+    <button class="icon-btn" id="btn-speed-up" title="Faster (])">+</button>`;
+
+  $('btn-mirror-x').addEventListener('click', toggleMirrorX);
+  $('btn-mirror-y').addEventListener('click', toggleMirrorY);
+  $('btn-reading-line').addEventListener('click', toggleReadingLine);
+  $('btn-scroll').addEventListener('click', () => { if (state.loaded) setScrolling(!state.scrolling); });
+  $('btn-open-presenter').addEventListener('click', openPresenterTab);
+  $('btn-load-new').addEventListener('click', () => fileInput.click());
+  $('btn-fullscreen').addEventListener('click', toggleFullscreen);
+  $('btn-speed-up').addEventListener('click', () => { adjustSpeed(5); });
+  $('btn-speed-down').addEventListener('click', () => { adjustSpeed(-5); });
+
+  updateReadingLineBtn();
+}
+
+function buildPresenterControls() {
+  centreControls.innerHTML = `
+    <button class="icon-btn" id="btn-mirror-x" title="Mirror horizontal (M)">${SVG_MIRROR_X}</button>
+    <button class="icon-btn" id="btn-mirror-y" title="Mirror vertical">${SVG_MIRROR_Y}</button>
+    <button class="icon-btn" id="btn-reading-line" title="Toggle reading line (R)">${SVG_LINE}</button>
+    <div id="sync-indicator">
+      <div class="sync-dot" id="sync-dot"></div>
+      <span id="sync-label">Waiting</span>
+    </div>
+    <button class="icon-btn" id="btn-fullscreen" title="Fullscreen (F)">${SVG_FULLSCREEN}</button>`;
+
+  rightControls.innerHTML = '';
+
+  $('btn-mirror-x').addEventListener('click', toggleMirrorX);
+  $('btn-mirror-y').addEventListener('click', toggleMirrorY);
+  $('btn-reading-line').addEventListener('click', toggleReadingLine);
+  $('btn-fullscreen').addEventListener('click', toggleFullscreen);
+
+  updateReadingLineBtn();
+}
+
+// =============================================
+// SHARED ACTIONS
+// =============================================
+function toggleMirrorX() {
+  state.mirrorX = !state.mirrorX; applyMirror();
+  showStatus(state.mirrorX ? 'Mirror X on' : 'Mirror X off');
+}
+function toggleMirrorY() {
+  state.mirrorY = !state.mirrorY; applyMirror();
+  showStatus(state.mirrorY ? 'Mirror Y on' : 'Mirror Y off');
+}
+function toggleReadingLine() {
+  state.showReadingLine = !state.showReadingLine; applyReadingLine();
+  showStatus(state.showReadingLine ? 'Reading line on' : 'Reading line off');
+}
+function toggleFullscreen() {
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen().catch(() => showStatus('Fullscreen not available'));
+  } else { document.exitFullscreen(); }
+}
+function openPresenterTab() {
+  window.open(location.href.split('#')[0] + '#presenter', '_blank');
+  showStatus('Presenter tab opened');
+}
+// Re-anchor the dead-reckoning origin to right now.
+// Must be called before any change that would make the scroll loop
+// compute a wrong position on the next frame (speed change, stop).
+function reanchor() {
+  if (state.scrolling) {
+    const elapsed = (Date.now() - state.scrollStartedAt) / 1000;
+    state.offsetY = Math.min(
+      state.totalHeight,
+      state.scrollStartOffsetY + state.scrollSpeed * elapsed
+    );
+    state.scrollStartedAt    = Date.now();
+    state.scrollStartOffsetY = state.offsetY;
+  }
+}
+
+function adjustSpeed(delta) {
+  reanchor();  // freeze current position before speed changes
+  state.scrollSpeed = Math.max(5, Math.min(200, state.scrollSpeed + delta));
+  const lbl = $('lbl-speed'); if (lbl) lbl.textContent = state.scrollSpeed;
+  syncWriteState();
+}
+
+// =============================================
+// SCRIPT PARSING & RENDERING
+// =============================================
+function escapeHTML(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function formatScript(text) {
+  return escapeHTML(text)
+    // Line breaks
+    .replace(/\n/g, '<br>')
+    // [CLIP:mm:ss] → amber pill
+    .replace(/\[CLIP:(\d+):(\d{2})\]/gi,
+      '<br><span style="font-size:0.55em;background:#f59e0b;color:#000;padding:0.25em 0.75em;border-radius:0.4em;font-weight:900;text-transform:uppercase;letter-spacing:0.1em;display:inline-block;margin:0.4em 0;">$&</span><br>')
+    // any other [tag] → slate pill
+    .replace(/\[(?!CLIP:)(.*?)\]/g,
+      '<br><span style="font-size:0.55em;background:#ea580c22;color:#fb923c;border:1px solid #ea580c55;padding:0.25em 0.75em;border-radius:0.4em;font-weight:900;text-transform:uppercase;letter-spacing:0.1em;display:inline-block;margin:0.4em 0;">[$1]</span><br>')
+    // *bold* → <strong>
+    .replace(/\*([^*\n]+)\*/g,
+      '<strong style="font-weight:900;color:#fff;">$1</strong>')
+    // collapse triple+ <br>
+    .replace(/(<br>\s*){3,}/g, '<br><br>');
+}
+
+function parseScript(text) {
+  const lines = text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
+  const blocks = []; let paraLines = [];
+  function flush() {
+    const c = paraLines.join('\n').trim();
+    if (c) blocks.push({ type:'para', content:c });
+    paraLines = [];
+  }
+  for (const line of lines) {
+    if (/^##\s*/.test(line)) {
+      flush();
+      blocks.push({ type:'section', content: line.replace(/^##\s*/,'').trim() || '—' });
+    } else if (!line.trim()) { flush(); }
+    else { paraLines.push(line); }
+  }
+  flush();
+  return blocks;
+}
+
+function renderBlocks(blocks) {
+  if (!blocks.length) return '<p style="color:#475569;font-size:1.5rem;">No content found.</p>';
+  return blocks.map(b => b.type === 'section'
+    ? `<div class="para-block section-head"><span class="section-head-pill">✦ ${escapeHTML(b.content)}</span><span class="section-line"></span></div>`
+    : `<div class="para-block">${formatScript(b.content)}</div>`
+  ).join('');
+}
+
+// =============================================
+// LOAD TEXT
+// =============================================
+function loadText(text, filename) {
+  scriptInner.innerHTML = renderBlocks(parseScript(text));
+  state.offsetY = 0;
+  state.scrolling = false;
+  state.loaded = true;
+  applyFontSize(); applyMirror(); applyReadingLine();
+  applyScrollPosition(); updateScrollBtn();
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    recalcHeight();
+    progressBar.classList.remove('hidden');
+    timeRemainingEl.style.display = 'block';
+    updateProgress(); updateTimeRemaining();
+  }));
+  loadScreen.classList.add('hidden');
+  presenterWait.classList.add('hidden');
+  scrollCanvas.classList.remove('hidden');
+  controls.classList.remove('hidden');
+  showStatus(filename || 'Script loaded');
+}
+
+function handleFile(file) {
+  if (!file || !file.name.toLowerCase().endsWith('.txt')) { showStatus('Please choose a .txt file'); return; }
+  const reader = new FileReader();
+  reader.onload = e => {
+    const text = e.target.result;
+    loadText(text, file.name);
+    syncWriteScript(text, file.name);
+  };
+  reader.onerror = () => showStatus('Could not read file');
+  reader.readAsText(file, 'UTF-8');
+}
+
+function handlePaste() {
+  const text = $('paste-area').value.trim();
+  if (!text) { showStatus('Nothing pasted yet'); return; }
+  loadText(text, 'Pasted script');
+  syncWriteScript(text, 'Pasted script');
+}
+
+// =============================================
+// SCROLL LOOP
+// =============================================
+function recalcHeight() {
+  state.totalHeight = Math.max(0, scriptInner.scrollHeight - window.innerHeight + 72);
+}
+
+function applyScrollPosition() {
+  scriptInner.style.transform = `translateY(${-state.offsetY}px)`;
+}
+
+// Returns sorted array of offsetY values for each ## section header.
+// The initial top-of-script (0) is included so ArrowUp from the first
+// header returns to the top.
+function getSectionOffsets() {
+  const offsets = [0];
+  const innerTop = scriptInner.getBoundingClientRect().top + state.offsetY;
+  document.querySelectorAll('#script-inner .section-head').forEach(el => {
+    // Position relative to the scroll origin
+    const elTop = el.getBoundingClientRect().top + state.offsetY - innerTop;
+    offsets.push(Math.max(0, elTop));
+  });
+  return offsets.sort((a, b) => a - b);
+}
+
+function jumpToNextSection() {
+  const offsets = getSectionOffsets();
+  // Find first offset meaningfully beyond current position
+  const next = offsets.find(o => o > state.offsetY + 10);
+  if (next !== undefined) {
+    state.offsetY = Math.min(state.totalHeight, next);
+    if (state.scrolling) {
+      // Re-anchor dead reckoning from new position
+      state.scrollStartedAt    = Date.now();
+      state.scrollStartOffsetY = state.offsetY;
+    }
+    applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState();
+  }
+}
+
+function jumpToPrevSection() {
+  const offsets = getSectionOffsets();
+  // Find last offset meaningfully before current position
+  const prev = [...offsets].reverse().find(o => o < state.offsetY - 10);
+  if (prev !== undefined) {
+    state.offsetY = Math.max(0, prev);
+    if (state.scrolling) {
+      state.scrollStartedAt    = Date.now();
+      state.scrollStartOffsetY = state.offsetY;
+    }
+    applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState();
+  }
+}
+
+function updateProgress() {
+  progressBar.style.width = (state.totalHeight > 0 ? Math.min(100, (state.offsetY / state.totalHeight) * 100) : 0) + '%';
+}
+
+// ── TIME REMAINING ──
+function updateTimeRemaining() {
+  if (!state.loaded || !timeRemainingEl) return;
+  const remaining = state.totalHeight - state.offsetY;
+  if (state.scrollSpeed <= 0 || remaining <= 0) {
+    timeRemainingEl.textContent = '0:00';
+    timeRemainingEl.className = '';
+    return;
+  }
+  const secs = Math.ceil(remaining / state.scrollSpeed);
+  const mm = Math.floor(secs / 60);
+  const ss = String(secs % 60).padStart(2, '0');
+  timeRemainingEl.textContent = `${mm}:${ss}`;
+  // Colour coding: < 30s urgent, < 60s warning
+  timeRemainingEl.className = secs < 30 ? 'urgent' : secs < 60 ? 'warning' : '';
+}
+
+// presenterSync holds the last intent packet received from the controller.
+let presenterSync = null;
+
+function scrollLoop() {
+  if (IS_PRESENTER) {
+    if (presenterSync && presenterSync.scrolling && state.loaded && state.totalHeight > 0) {
+      const elapsed  = (Date.now() - presenterSync.startedAt) / 1000;
+      const progress = Math.min(1, presenterSync.startProgress + presenterSync.progressRate * elapsed);
+      state.offsetY  = progress * state.totalHeight;
+      applyScrollPosition(); updateProgress(); updateTimeRemaining();
+    }
+  } else if (state.scrolling && state.loaded) {
+    const elapsed = (Date.now() - state.scrollStartedAt) / 1000;
+    state.offsetY = Math.min(state.totalHeight, state.scrollStartOffsetY + state.scrollSpeed * elapsed);
+    if (state.offsetY >= state.totalHeight) {
+      state.offsetY = state.totalHeight;
+      setScrolling(false);
+    } else {
+      applyScrollPosition(); updateProgress(); updateTimeRemaining();
+    }
+  }
+  requestAnimationFrame(scrollLoop);
+}
+
+function setScrolling(val) {
+  if (!val) reanchor();  // capture exact position before stopping
+  state.scrolling = val;
+  if (val) {
+    state.scrollStartedAt    = Date.now();
+    state.scrollStartOffsetY = state.offsetY;
+  }
+  updateScrollBtn();
+  applyScrollPosition(); updateProgress(); updateTimeRemaining();
+  syncWriteState();
+}
+
+function updateScrollBtn() {
+  const btn = $('btn-scroll');
+  if (!btn) return;
+  btn.textContent = state.scrolling ? '⏸ PAUSE' : '▶ SCROLL';
+  btn.classList.toggle('scrolling', state.scrolling);
+}
+
+// =============================================
+// DISPLAY FUNCTIONS
+// =============================================
+function applyFontSize() {
+  document.documentElement.style.setProperty('--font-size', state.fontSize + 'px');
+  lblFont.textContent = state.fontSize;
+}
+
+function applyMirror() {
+  transformWrapper.style.transform = `scale(${state.mirrorX ? -1 : 1}, ${state.mirrorY ? -1 : 1})`;
+  transformWrapper.style.transformOrigin = 'center top';
+  const bx = $('btn-mirror-x'), by = $('btn-mirror-y');
+  if (bx) bx.classList.toggle('active', state.mirrorX);
+  if (by) by.classList.toggle('active', state.mirrorY);
+}
+
+function applyReadingLine() {
+  readingLine.classList.toggle('hidden', !state.showReadingLine);
+  updateReadingLineBtn();
+}
+
+function updateReadingLineBtn() {
+  const btn = $('btn-reading-line');
+  if (btn) btn.classList.toggle('active', state.showReadingLine);
+}
+
+// =============================================
+// CLOCK (presenter tab)
+// =============================================
+function startClock() {
+  function tick() {
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2,'0');
+    const mm = String(now.getMinutes()).padStart(2,'0');
+    const ss = String(now.getSeconds()).padStart(2,'0');
+    clockEl.textContent = `${hh}:${mm}:${ss}`;
+  }
+  tick();
+  setInterval(tick, 1000);
+}
+
+// =============================================
+// AUTO-HIDE CONTROLS
+// =============================================
+let _hideTimer = null;
+function resetAutoHide() {
+  controls.classList.remove('autohide');
+  clearTimeout(_hideTimer);
+  _hideTimer = setTimeout(() => {
+    if (state.loaded) controls.classList.add('autohide');
+  }, 3000);
+}
+
+function initAutoHide() {
+  ['mousemove','mousedown','touchstart','keydown'].forEach(ev => {
+    document.addEventListener(ev, resetAutoHide, { passive: true });
+  });
+  resetAutoHide();
+}
+
+// =============================================
+// STATUS TOAST
+// =============================================
+let _statusTimer = null;
+function showStatus(msg) {
+  statusBadge.textContent = msg;
+  statusBadge.classList.add('visible');
+  clearTimeout(_statusTimer);
+  _statusTimer = setTimeout(() => statusBadge.classList.remove('visible'), 2500);
+}
+
+// =============================================
+// SYNC LAYER — intent-based dead reckoning
+//
+// We sync *intent*, not position. On scroll start the controller writes:
+//   startedAt, startOffsetY, speed
+// The presenter derives its own offsetY each frame as:
+//   offsetY = startOffsetY + speed × (now − startedAt) / 1000
+// Both tabs do identical arithmetic — zero drift.
+// syncWriteState() is called only on state-change events, never per-frame.
+// =============================================
+
+function syncWriteScript(text, filename) {
+  try { localStorage.setItem(SYNC_SCRIPT_KEY, JSON.stringify({ text, filename })); } catch(e) {}
+}
+
+function syncWriteState() {
+  if (IS_PRESENTER) return;
+  if (state.totalHeight <= 0) return;
+  // Sync proportional progress (0–1) and rate (proportion/sec) rather than
+  // raw pixels, so different window sizes stay perfectly in step.
+  const startProgress  = (state.scrollStartOffsetY || state.offsetY) / state.totalHeight;
+  const progressRate   = state.scrollSpeed / state.totalHeight;  // proportion per second
+  const progress       = state.offsetY / state.totalHeight;
+  try {
+    localStorage.setItem(SYNC_STATE_KEY, JSON.stringify({
+      scrolling:       state.scrolling,
+      startedAt:       state.scrollStartedAt || null,
+      startProgress,   // anchor position as proportion
+      progressRate,    // scroll rate as proportion/sec
+      progress,        // current position as proportion (used when stopped)
+      fontSize:        state.fontSize,
+      showReadingLine: state.showReadingLine,
+    }));
+  } catch(e) {}
+}
+
+let _flashTimer = null;
+function flashSyncDot() {
+  const dot = $('sync-dot'), lbl = $('sync-label');
+  if (!dot) return;
+  dot.classList.add('live');
+  if (lbl) lbl.textContent = 'Live';
+  clearTimeout(_flashTimer);
+  _flashTimer = setTimeout(() => {
+    dot.classList.remove('live');
+    if (lbl) lbl.textContent = 'Synced';
+  }, 500);
+}
+
+window.addEventListener('storage', e => {
+  if (!IS_PRESENTER) return;
+
+  if (e.key === SYNC_SCRIPT_KEY && e.newValue) {
+    try { const { text, filename } = JSON.parse(e.newValue); loadText(text, filename); } catch(err) {}
+    return;
+  }
+
+  if (e.key === SYNC_STATE_KEY && e.newValue && state.loaded) {
+    try {
+      const pkt = JSON.parse(e.newValue);
+      presenterSync = pkt;
+
+      if (typeof pkt.fontSize === 'number' && pkt.fontSize !== state.fontSize) {
+        state.fontSize = pkt.fontSize; applyFontSize();
+        requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+      }
+      if (typeof pkt.showReadingLine === 'boolean' && pkt.showReadingLine !== state.showReadingLine) {
+        state.showReadingLine = pkt.showReadingLine; applyReadingLine();
+      }
+      // If not scrolling, snap to the proportional position scaled to our own totalHeight
+      if (!pkt.scrolling && typeof pkt.progress === 'number') {
+        state.offsetY = pkt.progress * state.totalHeight;
+        applyScrollPosition(); updateProgress(); updateTimeRemaining();
+      }
+      // If scrolling, the rAF loop derives position from startProgress + progressRate * elapsed
+      flashSyncDot();
+    } catch(err) {}
+  }
+});
+
+function presenterCheckExistingScript() {
+  try {
+    const raw = localStorage.getItem(SYNC_SCRIPT_KEY);
+    if (raw) { const { text, filename } = JSON.parse(raw); loadText(text, filename); }
+  } catch(e) {}
+  // Also load the latest state packet so position is correct on late-join
+  try {
+    const rawState = localStorage.getItem(SYNC_STATE_KEY);
+    if (rawState) {
+      const pkt = JSON.parse(rawState);
+      presenterSync = pkt;
+      if (typeof pkt.fontSize === 'number') { state.fontSize = pkt.fontSize; applyFontSize(); }
+      if (!pkt.scrolling && typeof pkt.progress === 'number' && state.totalHeight > 0) {
+        state.offsetY = pkt.progress * state.totalHeight;
+        applyScrollPosition(); updateProgress(); updateTimeRemaining();
+      }
+    }
+  } catch(e) {}
+}
+
+function clearStorage() {
+  try {
+    localStorage.removeItem(SYNC_SCRIPT_KEY);
+    localStorage.removeItem(SYNC_STATE_KEY);
+    showStatus('Saved script cleared');
+  } catch(e) {}
+}
+
+// =============================================
+// KEYBOARD
+// =============================================
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+  if (IS_PRESENTER) {
+    if (e.key === 'm' || e.key === 'M') toggleMirrorX();
+    if (e.key === 'r' || e.key === 'R') toggleReadingLine();
+    if (e.key === 'f' || e.key === 'F') toggleFullscreen();
+    if (e.key === 'Escape' && document.fullscreenElement) document.exitFullscreen();
+    return;
+  }
+
+  switch (e.key) {
+    case ' ': case 'Spacebar':
+      e.preventDefault(); if (state.loaded) setScrolling(!state.scrolling); break;
+    case '+': case '=':
+      state.fontSize = Math.min(state.fontSize + 4, 120); applyFontSize();
+      requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+      syncWriteState(); break;
+    case '-': case '_':
+      state.fontSize = Math.max(state.fontSize - 4, 20); applyFontSize();
+      requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+      syncWriteState(); break;
+    case '[':
+      e.preventDefault(); adjustSpeed(-5); break;
+    case ']':
+      e.preventDefault(); adjustSpeed(5); break;
+    case 'j': case 'J':
+      e.preventDefault();
+      if (state.scrollSpeed > 5) {
+        adjustSpeed(-5);
+        if (!state.scrolling && state.loaded) setScrolling(true);
+      } else {
+        // Already at minimum speed — stop
+        setScrolling(false);
+      }
+      break;
+    case 'k': case 'K':
+      e.preventDefault();
+      setScrolling(false);
+      break;
+    case 'l': case 'L':
+      e.preventDefault();
+      adjustSpeed(5);
+      if (!state.scrolling && state.loaded) setScrolling(true);
+      break;
+    case 'r': case 'R':
+      toggleReadingLine(); syncWriteState(); break;
+    case 'ArrowUp':
+      e.preventDefault(); jumpToPrevSection(); break;
+    case 'ArrowDown':
+      e.preventDefault(); jumpToNextSection(); break;
+    case 'f': case 'F': toggleFullscreen(); break;
+    case 'm': case 'M': toggleMirrorX(); break;
+    case 'Home':
+      e.preventDefault(); state.offsetY = 0;
+      applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState(); break;
+    case 'End':
+      e.preventDefault(); state.offsetY = state.totalHeight;
+      applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState(); break;
+    case 'Escape':
+      if (document.fullscreenElement) document.exitFullscreen(); break;
+  }
+});
+
+// =============================================
+// WHEEL & TOUCH (controller only)
+// =============================================
+scrollCanvas.addEventListener('wheel', e => {
+  if (IS_PRESENTER) return;
+  e.preventDefault();
+  if (state.scrolling) setScrolling(false);
+  state.offsetY = Math.max(0, Math.min(state.totalHeight, state.offsetY + e.deltaY));
+  applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState();
+}, { passive: false });
+
+let _touchY = null;
+scrollCanvas.addEventListener('touchstart', e => { if (!IS_PRESENTER) _touchY = e.touches[0].clientY; }, { passive: true });
+scrollCanvas.addEventListener('touchmove', e => {
+  if (IS_PRESENTER || _touchY === null) return;
+  const dy = _touchY - e.touches[0].clientY; _touchY = e.touches[0].clientY;
+  if (state.scrolling) setScrolling(false);
+  state.offsetY = Math.max(0, Math.min(state.totalHeight, state.offsetY + dy));
+  applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState();
+}, { passive: true });
+scrollCanvas.addEventListener('touchend', () => { _touchY = null; }, { passive: true });
+
+// =============================================
+// FONT BUTTONS (both modes)
+// =============================================
+btnFontUp.addEventListener('click', () => {
+  state.fontSize = Math.min(state.fontSize + 4, 120); applyFontSize();
+  requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+  syncWriteState();
+});
+btnFontDown.addEventListener('click', () => {
+  state.fontSize = Math.max(state.fontSize - 4, 20); applyFontSize();
+  requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+  syncWriteState();
+});
+
+// =============================================
+// FILE & PASTE HANDLING (controller only)
+// =============================================
+if (!IS_PRESENTER) {
+  $('btn-open-file').addEventListener('click', () => fileInput.click());
+  $('btn-load-paste').addEventListener('click', handlePaste);
+  $('btn-clear-storage').addEventListener('click', clearStorage);
+
+  fileInput.addEventListener('change', e => {
+    if (e.target.files[0]) handleFile(e.target.files[0]);
+    fileInput.value = '';
+  });
+  document.addEventListener('dragover', e => { e.preventDefault(); dropOverlay.classList.add('active'); });
+  document.addEventListener('dragleave', e => {
+    if (!e.relatedTarget || e.relatedTarget === document.documentElement)
+      dropOverlay.classList.remove('active');
+  });
+  document.addEventListener('drop', e => {
+    e.preventDefault(); dropOverlay.classList.remove('active');
+    const file = e.dataTransfer?.files?.[0]; if (file) handleFile(file);
+  });
+}
+
+window.addEventListener('resize', () => {
+  if (state.loaded) requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+});
+
+// =============================================
+// INIT
+// =============================================
+if (IS_PRESENTER) {
+  loadScreen.classList.add('hidden');
+  presenterWait.classList.remove('hidden');
+  modeBadge.style.display = 'block';
+  clockEl.style.display = 'block';
+  document.title = 'Moira — Presenter View';
+  controls.classList.remove('hidden');
+  buildPresenterControls();
+  applyMirror();
+  applyReadingLine();
+  startClock();
+  presenterCheckExistingScript();
+} else {
+  loadScreen.classList.remove('hidden');
+  buildControllerControls();
+  applyMirror();
+  applyReadingLine();
+}
+
+initAutoHide();
+requestAnimationFrame(scrollLoop);
+</script>
+</body>
+</html>
