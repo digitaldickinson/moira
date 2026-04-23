@@ -154,6 +154,13 @@
   }
   .section-line { flex: 1; height: 2px; background: #fde04733; border-radius: 1px; }
 
+  .pill-clip, .pill-tag {
+    font-size: 0.55em; font-weight: 900; letter-spacing: 0.1em; text-transform: uppercase;
+    padding: 0.25em 0.75em; border-radius: 0.4em; display: inline-block; margin: 0.4em 0;
+  }
+  .pill-clip { background: #f59e0b; color: #000; }
+  .pill-tag  { background: #ea580c22; color: #fb923c; border: 1px solid #ea580c55; }
+
   /* ── READING LINE ── */
   #reading-line {
     position: fixed;
@@ -405,7 +412,6 @@ const state = {
   showReadingLine: true,
   offsetY:        0,
   totalHeight:    0,
-  lastTimestamp:  null,
   loaded:         false,
 };
 
@@ -413,6 +419,7 @@ const state = {
 // DOM
 // =============================================
 const $ = id => document.getElementById(id);
+const afterLayout = fn => requestAnimationFrame(() => requestAnimationFrame(fn));
 const loadScreen       = $('load-screen');
 const presenterWait    = $('presenter-wait');
 const scrollCanvas     = $('scroll-canvas');
@@ -463,7 +470,7 @@ function buildControllerControls() {
 
   $('btn-mirror-x').addEventListener('click', toggleMirrorX);
   $('btn-mirror-y').addEventListener('click', toggleMirrorY);
-  $('btn-reading-line').addEventListener('click', toggleReadingLine);
+  $('btn-reading-line').addEventListener('click', () => { toggleReadingLine(); syncWriteState(); });
   $('btn-scroll').addEventListener('click', () => { if (state.loaded) setScrolling(!state.scrolling); });
   $('btn-open-presenter').addEventListener('click', openPresenterTab);
   $('btn-load-new').addEventListener('click', () => fileInput.click());
@@ -554,10 +561,10 @@ function formatScript(text) {
     .replace(/\n/g, '<br>')
     // [CLIP:mm:ss] → amber pill
     .replace(/\[CLIP:(\d+):(\d{2})\]/gi,
-      '<br><span style="font-size:0.55em;background:#f59e0b;color:#000;padding:0.25em 0.75em;border-radius:0.4em;font-weight:900;text-transform:uppercase;letter-spacing:0.1em;display:inline-block;margin:0.4em 0;">$&</span><br>')
+      '<br><span class="pill-clip">$&</span><br>')
     // any other [tag] → slate pill
     .replace(/\[(?!CLIP:)(.*?)\]/g,
-      '<br><span style="font-size:0.55em;background:#ea580c22;color:#fb923c;border:1px solid #ea580c55;padding:0.25em 0.75em;border-radius:0.4em;font-weight:900;text-transform:uppercase;letter-spacing:0.1em;display:inline-block;margin:0.4em 0;">[$1]</span><br>')
+      '<br><span class="pill-tag">[$1]</span><br>')
     // *bold* → <strong>
     .replace(/\*([^*\n]+)\*/g,
       '<strong style="font-weight:900;color:#fff;">$1</strong>')
@@ -602,12 +609,12 @@ function loadText(text, filename) {
   state.loaded = true;
   applyFontSize(); applyMirror(); applyReadingLine();
   applyScrollPosition(); updateScrollBtn();
-  requestAnimationFrame(() => requestAnimationFrame(() => {
+  afterLayout(() => {
     recalcHeight();
     progressBar.classList.remove('hidden');
     timeRemainingEl.style.display = 'block';
     updateProgress(); updateTimeRemaining();
-  }));
+  });
   loadScreen.classList.add('hidden');
   presenterWait.classList.add('hidden');
   scrollCanvas.classList.remove('hidden');
@@ -644,6 +651,9 @@ function recalcHeight() {
 function applyScrollPosition() {
   scriptInner.style.transform = `translateY(${-state.offsetY}px)`;
 }
+function updateScrollUI() {
+  applyScrollPosition(); updateProgress(); updateTimeRemaining();
+}
 
 // Returns sorted array of offsetY values for each ## section header.
 // The initial top-of-script (0) is included so ArrowUp from the first
@@ -670,7 +680,7 @@ function jumpToNextSection() {
       state.scrollStartedAt    = Date.now();
       state.scrollStartOffsetY = state.offsetY;
     }
-    applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState();
+    updateScrollUI(); syncWriteState();
   }
 }
 
@@ -684,7 +694,7 @@ function jumpToPrevSection() {
       state.scrollStartedAt    = Date.now();
       state.scrollStartOffsetY = state.offsetY;
     }
-    applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState();
+    updateScrollUI(); syncWriteState();
   }
 }
 
@@ -718,7 +728,7 @@ function scrollLoop() {
       const elapsed  = (Date.now() - presenterSync.startedAt) / 1000;
       const progress = Math.min(1, presenterSync.startProgress + presenterSync.progressRate * elapsed);
       state.offsetY  = progress * state.totalHeight;
-      applyScrollPosition(); updateProgress(); updateTimeRemaining();
+      updateScrollUI();
     }
   } else if (state.scrolling && state.loaded) {
     const elapsed = (Date.now() - state.scrollStartedAt) / 1000;
@@ -727,7 +737,7 @@ function scrollLoop() {
       state.offsetY = state.totalHeight;
       setScrolling(false);
     } else {
-      applyScrollPosition(); updateProgress(); updateTimeRemaining();
+      updateScrollUI();
     }
   }
   requestAnimationFrame(scrollLoop);
@@ -741,7 +751,7 @@ function setScrolling(val) {
     state.scrollStartOffsetY = state.offsetY;
   }
   updateScrollBtn();
-  applyScrollPosition(); updateProgress(); updateTimeRemaining();
+  updateScrollUI();
   syncWriteState();
 }
 
@@ -762,7 +772,6 @@ function applyFontSize() {
 
 function applyMirror() {
   transformWrapper.style.transform = `scale(${state.mirrorX ? -1 : 1}, ${state.mirrorY ? -1 : 1})`;
-  transformWrapper.style.transformOrigin = 'center top';
   const bx = $('btn-mirror-x'), by = $('btn-mirror-y');
   if (bx) bx.classList.toggle('active', state.mirrorX);
   if (by) by.classList.toggle('active', state.mirrorY);
@@ -835,7 +844,7 @@ function showStatus(msg) {
 // =============================================
 
 function syncWriteScript(text, filename) {
-  try { localStorage.setItem(SYNC_SCRIPT_KEY, JSON.stringify({ text, filename })); } catch(e) {}
+  try { localStorage.setItem(SYNC_SCRIPT_KEY, JSON.stringify({ text, filename })); } catch(e) { console.warn('syncWriteScript:', e); }
 }
 
 function syncWriteState() {
@@ -856,7 +865,7 @@ function syncWriteState() {
       fontSize:        state.fontSize,
       showReadingLine: state.showReadingLine,
     }));
-  } catch(e) {}
+  } catch(e) { console.warn('syncWriteState:', e); }
 }
 
 let _flashTimer = null;
@@ -876,7 +885,7 @@ window.addEventListener('storage', e => {
   if (!IS_PRESENTER) return;
 
   if (e.key === SYNC_SCRIPT_KEY && e.newValue) {
-    try { const { text, filename } = JSON.parse(e.newValue); loadText(text, filename); } catch(err) {}
+    try { const { text, filename } = JSON.parse(e.newValue); loadText(text, filename); } catch(err) { console.warn('storage script sync:', err); }
     return;
   }
 
@@ -887,7 +896,7 @@ window.addEventListener('storage', e => {
 
       if (typeof pkt.fontSize === 'number' && pkt.fontSize !== state.fontSize) {
         state.fontSize = pkt.fontSize; applyFontSize();
-        requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+        afterLayout(recalcHeight);
       }
       if (typeof pkt.showReadingLine === 'boolean' && pkt.showReadingLine !== state.showReadingLine) {
         state.showReadingLine = pkt.showReadingLine; applyReadingLine();
@@ -895,11 +904,11 @@ window.addEventListener('storage', e => {
       // If not scrolling, snap to the proportional position scaled to our own totalHeight
       if (!pkt.scrolling && typeof pkt.progress === 'number') {
         state.offsetY = pkt.progress * state.totalHeight;
-        applyScrollPosition(); updateProgress(); updateTimeRemaining();
+        updateScrollUI();
       }
       // If scrolling, the rAF loop derives position from startProgress + progressRate * elapsed
       flashSyncDot();
-    } catch(err) {}
+    } catch(err) { console.warn('storage state sync:', err); }
   }
 });
 
@@ -907,7 +916,7 @@ function presenterCheckExistingScript() {
   try {
     const raw = localStorage.getItem(SYNC_SCRIPT_KEY);
     if (raw) { const { text, filename } = JSON.parse(raw); loadText(text, filename); }
-  } catch(e) {}
+  } catch(e) { console.warn('presenterCheckExistingScript script:', e); }
   // Also load the latest state packet so position is correct on late-join
   try {
     const rawState = localStorage.getItem(SYNC_STATE_KEY);
@@ -917,10 +926,10 @@ function presenterCheckExistingScript() {
       if (typeof pkt.fontSize === 'number') { state.fontSize = pkt.fontSize; applyFontSize(); }
       if (!pkt.scrolling && typeof pkt.progress === 'number' && state.totalHeight > 0) {
         state.offsetY = pkt.progress * state.totalHeight;
-        applyScrollPosition(); updateProgress(); updateTimeRemaining();
+        updateScrollUI();
       }
     }
-  } catch(e) {}
+  } catch(e) { console.warn('presenterCheckExistingScript state:', e); }
 }
 
 function clearStorage() {
@@ -928,7 +937,7 @@ function clearStorage() {
     localStorage.removeItem(SYNC_SCRIPT_KEY);
     localStorage.removeItem(SYNC_STATE_KEY);
     showStatus('Saved script cleared');
-  } catch(e) {}
+  } catch(e) { console.warn('clearStorage:', e); }
 }
 
 // =============================================
@@ -950,11 +959,11 @@ document.addEventListener('keydown', e => {
       e.preventDefault(); if (state.loaded) setScrolling(!state.scrolling); break;
     case '+': case '=':
       state.fontSize = Math.min(state.fontSize + 4, 120); applyFontSize();
-      requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+      afterLayout(recalcHeight);
       syncWriteState(); break;
     case '-': case '_':
       state.fontSize = Math.max(state.fontSize - 4, 20); applyFontSize();
-      requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+      afterLayout(recalcHeight);
       syncWriteState(); break;
     case '[':
       e.preventDefault(); adjustSpeed(-5); break;
@@ -989,10 +998,10 @@ document.addEventListener('keydown', e => {
     case 'm': case 'M': toggleMirrorX(); break;
     case 'Home':
       e.preventDefault(); state.offsetY = 0;
-      applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState(); break;
+      updateScrollUI(); syncWriteState(); break;
     case 'End':
       e.preventDefault(); state.offsetY = state.totalHeight;
-      applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState(); break;
+      updateScrollUI(); syncWriteState(); break;
     case 'Escape':
       if (document.fullscreenElement) document.exitFullscreen(); break;
   }
@@ -1006,7 +1015,7 @@ scrollCanvas.addEventListener('wheel', e => {
   e.preventDefault();
   if (state.scrolling) setScrolling(false);
   state.offsetY = Math.max(0, Math.min(state.totalHeight, state.offsetY + e.deltaY));
-  applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState();
+  updateScrollUI(); syncWriteState();
 }, { passive: false });
 
 let _touchY = null;
@@ -1016,7 +1025,7 @@ scrollCanvas.addEventListener('touchmove', e => {
   const dy = _touchY - e.touches[0].clientY; _touchY = e.touches[0].clientY;
   if (state.scrolling) setScrolling(false);
   state.offsetY = Math.max(0, Math.min(state.totalHeight, state.offsetY + dy));
-  applyScrollPosition(); updateProgress(); updateTimeRemaining(); syncWriteState();
+  updateScrollUI(); syncWriteState();
 }, { passive: true });
 scrollCanvas.addEventListener('touchend', () => { _touchY = null; }, { passive: true });
 
@@ -1025,12 +1034,12 @@ scrollCanvas.addEventListener('touchend', () => { _touchY = null; }, { passive: 
 // =============================================
 btnFontUp.addEventListener('click', () => {
   state.fontSize = Math.min(state.fontSize + 4, 120); applyFontSize();
-  requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+  afterLayout(recalcHeight);
   syncWriteState();
 });
 btnFontDown.addEventListener('click', () => {
   state.fontSize = Math.max(state.fontSize - 4, 20); applyFontSize();
-  requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+  afterLayout(recalcHeight);
   syncWriteState();
 });
 
@@ -1058,7 +1067,7 @@ if (!IS_PRESENTER) {
 }
 
 window.addEventListener('resize', () => {
-  if (state.loaded) requestAnimationFrame(() => requestAnimationFrame(recalcHeight));
+  if (state.loaded) afterLayout(recalcHeight);
 });
 
 // =============================================
