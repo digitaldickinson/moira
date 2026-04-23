@@ -3,7 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <title>Moira:ScriptMerge — Script & prompter</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"
+            integrity="sha384-rRoXxn2yHlrZYB587Ki9RO1tONhLdM6XfORg7Rw4uwH4/Fh/5nP7IUX91bkaKUgs"
+            crossorigin="anonymous"></script>
     <style>
         :root {
             --accent: #3b82f6;
@@ -16,19 +18,19 @@
 
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-        body { 
-            background: var(--bg); 
-            color: var(--text); 
+        body {
+            background: var(--bg);
+            color: var(--text);
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            max-width: 800px; 
-            margin: 40px auto; 
-            padding: 20px; 
+            max-width: 800px;
+            margin: 40px auto;
+            padding: 20px;
         }
 
-        .card { 
-            background: var(--card-bg); 
-            padding: 2.5rem; 
-            border-radius: 1rem; 
+        .card {
+            background: var(--card-bg);
+            padding: 2.5rem;
+            border-radius: 1rem;
             border: 1px solid var(--border);
             box-shadow: 0 10px 30px rgba(0,0,0,0.5);
         }
@@ -41,19 +43,19 @@
         .hint b { color: var(--text); }
 
         #fileList { list-style: none; padding: 0; margin: 20px 0; border: 1px solid var(--border); border-radius: 0.75rem; background: rgba(0,0,0,0.2); }
-        
-        .file-item { 
-            background: transparent; border-bottom: 1px solid var(--border); padding: 1rem; 
+
+        .file-item {
+            background: transparent; border-bottom: 1px solid var(--border); padding: 1rem;
             display: flex; align-items: center; justify-content: space-between;
             cursor: grab; transition: background 150ms;
         }
         .file-item:last-child { border-bottom: none; }
         .file-item.dragging { opacity: 0.3; background: var(--border); }
-        
+
         .file-info { display: flex; align-items: center; flex-grow: 1; gap: 1rem; }
         .file-info::before { content: "☰"; color: var(--text-dim); font-weight: bold; }
-        
-        .story-name { 
+
+        .story-name {
             background: transparent; border: 1px solid transparent; color: var(--text);
             padding: 0.5rem; border-radius: 0.5rem; width: 80%;
             font-weight: 600; cursor: text;
@@ -61,27 +63,27 @@
         .story-name:hover { background: rgba(255,255,255,0.05); }
         .story-name:focus { outline: none; border-color: var(--accent); background: #000; }
 
-        .remove-btn { 
-            background: rgba(220, 38, 38, 0.1); color: #ef4444; border: 1px solid rgba(220, 38, 38, 0.2); 
-            padding: 0.5rem 1rem; border-radius: 0.5rem; cursor: pointer; font-weight: 700; font-size: 0.7rem; 
+        .remove-btn {
+            background: rgba(220, 38, 38, 0.1); color: #ef4444; border: 1px solid rgba(220, 38, 38, 0.2);
+            padding: 0.5rem 1rem; border-radius: 0.5rem; cursor: pointer; font-weight: 700; font-size: 0.7rem;
             text-transform: uppercase; letter-spacing: 0.05em; transition: all 150ms;
         }
         .remove-btn:hover { background: #dc2626; color: white; }
 
         .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 2rem; }
-        
-        .main-btn { 
+
+        .main-btn {
             padding: 1.25rem; border-radius: 0.75rem; font-weight: 900; letter-spacing: 0.1em;
             text-transform: uppercase; cursor: pointer; border: none; transition: 150ms;
         }
         .btn-txt { background: #1e293b; color: var(--text-dim); border: 1px solid var(--border); }
         .btn-txt:hover:not(:disabled) { background: #334155; color: white; }
-        
+
         .btn-word { background: #1e40af; color: white; }
         .btn-word:hover:not(:disabled) { background: #2563eb; }
-        
+
         button:disabled { opacity: 0.3; cursor: not-allowed; }
-        
+
         #filePicker { display: none; }
         .upload-label {
             display: block; text-align: center; padding: 2rem; border: 2px dashed var(--border);
@@ -98,20 +100,20 @@
 <div class="card">
     <div class="logo">Moira: <span>ScriptMerge</span></div>
     <div class="subtitle">Script & Prompt Preparation</div>
-    
+
     <p class="hint">Combine <b>.docx</b> and <b>.txt</b> files into a single running order. <br>Drag to reorder. Click a name to rename the story segment.</p>
-    
+
     <label for="filePicker" class="upload-label">
         <svg style="width:24px; vertical-align:middle; margin-right:10px" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.5"><path d="M12 4v16m8-8H4"></path></svg>
         Add Stories (.docx / .txt)
     </label>
     <input type="file" id="filePicker" accept=".docx,.txt" multiple>
-    
+
     <ul id="fileList"></ul>
 
     <div class="actions">
-        <button id="txtBtn" class="main-btn btn-txt" disabled onclick="exportFile('txt')">Export Prompt (.txt)</button>
-        <button id="docBtn" class="main-btn btn-word" disabled onclick="exportFile('doc')">Export Script (.doc)</button>
+        <button id="txtBtn" class="main-btn btn-txt" disabled>Export Prompt (.txt)</button>
+        <button id="docBtn" class="main-btn btn-word" disabled>Export Script (.doc)</button>
     </div>
     <div id="status">System Ready</div>
 </div>
@@ -120,23 +122,38 @@
     const filePicker = document.getElementById('filePicker');
     const fileList = document.getElementById('fileList');
     const status = document.getElementById('status');
+    const mainBtns = document.querySelectorAll('.main-btn');
     let selectedFiles = [];
+    let draggedElement = null;
+
+    // Precompiled regexes used in export
+    const RE_MOIRA_BOLD = /\(\*\*(.*?)\*\*\)/g;
+    const RE_TECH_TAG   = /\[(On cam|Take sot)\]/gi;
+    const RE_ANY_TAG    = /\[(.*?)\]/g;
+
+    function escapeHTML(str) {
+        return str
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
 
     filePicker.addEventListener('change', (e) => {
         const newFiles = Array.from(e.target.files).map(f => ({
             file: f,
-            name: f.name.replace(/\.[^/.]+$/, "") 
+            name: f.name.replace(/\.[^/.]+$/, "")
         }));
         selectedFiles = [...selectedFiles, ...newFiles];
         updateUI();
-        filePicker.value = ""; 
+        filePicker.value = "";
     });
 
     function updateUI() {
         renderList();
         const hasFiles = selectedFiles.length > 0;
-        document.querySelectorAll('.main-btn').forEach(b => b.disabled = !hasFiles);
-        status.innerText = hasFiles ? `${selectedFiles.length} stories in sequence` : "System Ready";
+        mainBtns.forEach(b => b.disabled = !hasFiles);
+        status.textContent = hasFiles ? `${selectedFiles.length} stories in sequence` : "System Ready";
     }
 
     function renderList() {
@@ -146,18 +163,19 @@
             li.className = 'file-item';
             li.draggable = true;
             li.dataset.id = index;
-            
+
             const info = document.createElement('div');
             info.className = 'file-info';
-            
+
             const nameSpan = document.createElement('span');
             nameSpan.className = 'story-name';
             nameSpan.contentEditable = true;
             nameSpan.textContent = item.name;
-            
+
             nameSpan.addEventListener('blur', () => {
                 selectedFiles[index].name = nameSpan.textContent;
             });
+            // Prevent drag triggering when user clicks to edit the name
             nameSpan.addEventListener('mousedown', (e) => e.stopPropagation());
 
             info.appendChild(nameSpan);
@@ -166,30 +184,36 @@
             const remove = document.createElement('button');
             remove.className = 'remove-btn';
             remove.textContent = 'Remove';
-            remove.onclick = (e) => {
+            remove.addEventListener('click', (e) => {
                 e.stopPropagation();
                 selectedFiles.splice(index, 1);
                 updateUI();
-            };
+            });
 
             li.appendChild(remove);
-            li.addEventListener('dragstart', () => li.classList.add('dragging'));
-            li.addEventListener('dragend', () => li.classList.remove('dragging'));
+            li.addEventListener('dragstart', () => {
+                draggedElement = li;
+                li.classList.add('dragging');
+            });
+            li.addEventListener('dragend', () => {
+                li.classList.remove('dragging');
+                draggedElement = null;
+            });
             fileList.appendChild(li);
         });
     }
 
     fileList.addEventListener('dragover', e => {
         e.preventDefault();
-        const dragging = document.querySelector('.dragging');
+        if (!draggedElement) return;
         const afterElement = [...fileList.querySelectorAll('.file-item:not(.dragging)')].reduce((closest, child) => {
             const box = child.getBoundingClientRect();
             const offset = e.clientY - box.top - box.height / 2;
             if (offset < 0 && offset > closest.offset) return { offset: offset, element: child };
             return closest;
         }, { offset: Number.NEGATIVE_INFINITY }).element;
-        if (afterElement == null) fileList.appendChild(dragging);
-        else fileList.insertBefore(dragging, afterElement);
+        if (afterElement == null) fileList.appendChild(draggedElement);
+        else fileList.insertBefore(draggedElement, afterElement);
     });
 
     async function getFileText(file) {
@@ -203,59 +227,73 @@
     }
 
     async function exportFile(type) {
-        status.innerText = "Processing Sequence...";
-        const orderedItems = [...fileList.querySelectorAll('.file-item')];
-        let txtOutput = "";
-        
-        let docOutput = `<html><head><meta charset='utf-8'><style>
-            @page { size: 8.5in 11in; margin: 0.5in; }
-            body { font-family: 'Arial', sans-serif; font-size: 11pt; color: #000; }
-            table { width: 100%; border-collapse: collapse; margin-bottom: 20px; page-break-inside: avoid; }
-            td { vertical-align: top; padding: 15px; border: 1px solid #ccc; }
-            .left-col { width: 25%; font-weight: bold; text-transform: uppercase; font-size: 10pt; background: #f8f9fa; }
-            .right-col { width: 75%; padding-left: 15px; line-height: 1.6; }
-            .tag { font-weight: bold; background-color: #fef08a; padding: 0 4px; border-radius: 2px; }
-            .slug { color: #2563eb; text-decoration: underline; margin-bottom: 10px; display: block; font-size: 12pt; }
-        </style></head><body>`;
+        status.textContent = "Processing Sequence...";
+        try {
+            const orderedItems = [...fileList.querySelectorAll('.file-item')];
+            let txtOutput = "";
 
-        for (const item of orderedItems) {
-            const storyData = selectedFiles[item.dataset.id];
-            const cleanName = storyData.name.toUpperCase();
-            let content = await getFileText(storyData.file);
+            let docOutput = `<html><head><meta charset='utf-8'><style>
+                @page { size: 8.5in 11in; margin: 0.5in; }
+                body { font-family: 'Arial', sans-serif; font-size: 11pt; color: #000; }
+                table { width: 100%; border-collapse: collapse; margin-bottom: 20px; page-break-inside: avoid; }
+                td { vertical-align: top; padding: 15px; border: 1px solid #ccc; }
+                .left-col { width: 25%; font-weight: bold; text-transform: uppercase; font-size: 10pt; background: #f8f9fa; }
+                .right-col { width: 75%; padding-left: 15px; line-height: 1.6; }
+                .tag { font-weight: bold; background-color: #fef08a; padding: 0 4px; border-radius: 2px; }
+                .slug { color: #2563eb; text-decoration: underline; margin-bottom: 10px; display: block; font-size: 12pt; }
+            </style></head><body>`;
 
-            // Moira-style bold cleanup if any
-            content = content.replace(/\(\*\*(.*?)\*\*\)/g, (match, p1) => {
-                return `[${p1.charAt(0).toUpperCase() + p1.slice(1).toLowerCase()}]`;
-            });
+            for (const item of orderedItems) {
+                const storyData = selectedFiles[item.dataset.id];
+                if (!storyData) continue;
+                const cleanName = escapeHTML(storyData.name.toUpperCase());
+                let content = await getFileText(storyData.file);
 
-            const techTags = [...content.matchAll(/\[(On cam|Take sot)\]/gi)].map(m => m[0]);
-            const sideTagsHtml = techTags.map(t => `<div>${t}</div>`).join("");
+                // Moira-style bold cleanup if any
+                content = content.replace(RE_MOIRA_BOLD, (match, p1) => {
+                    return `[${p1.charAt(0).toUpperCase() + p1.slice(1).toLowerCase()}]`;
+                });
 
-            txtOutput += `\n\n## ${cleanName}\n\n${content}\n\n`;
+                const techTags = [...content.matchAll(RE_TECH_TAG)].map(m => m[0]);
+                const sideTagsHtml = techTags.map(t => `<div>${escapeHTML(t)}</div>`).join("");
 
-            docOutput += `
-                <table>
-                    <tr>
-                        <td class="left-col">
-                            <span class="slug">${cleanName}</span>
-                            ${sideTagsHtml}
-                        </td>
-                        <td class="right-col">${content.replace(/\n/g, '<br>').replace(/\[(.*?)\]/g, '<span class="tag">[$1]</span>')}</td>
-                    </tr>
-                </table>`;
+                txtOutput += `\n\n## ${storyData.name.toUpperCase()}\n\n${content}\n\n`;
+
+                const safeContent = escapeHTML(content)
+                    .replace(/\n/g, '<br>')
+                    .replace(RE_ANY_TAG, '<span class="tag">[$1]</span>');
+
+                docOutput += `
+                    <table>
+                        <tr>
+                            <td class="left-col">
+                                <span class="slug">${cleanName}</span>
+                                ${sideTagsHtml}
+                            </td>
+                            <td class="right-col">${safeContent}</td>
+                        </tr>
+                    </table>`;
+            }
+
+            docOutput += "</body></html>";
+            const blob = type === 'txt'
+                ? new Blob([txtOutput], { type: 'text/plain;charset=utf-8' })
+                : new Blob([docOutput], { type: 'application/msword' });
+
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = type === 'txt' ? "moira_prompt.txt" : "moira_studio_script.doc";
+            a.click();
+            URL.revokeObjectURL(a.href);
+            status.textContent = "Export Complete";
+        } catch (err) {
+            console.error('Export failed:', err);
+            status.textContent = "Export failed — check console";
         }
-
-        docOutput += "</body></html>";
-        const blob = type === 'txt' 
-            ? new Blob([txtOutput], { type: 'text/plain;charset=utf-8' })
-            : new Blob([docOutput], { type: 'application/msword' });
-
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = type === 'txt' ? "moira_prompt.txt" : "moira_studio_script.doc";
-        a.click();
-        status.innerText = "Export Complete";
     }
+
+    document.getElementById('txtBtn').addEventListener('click', () => exportFile('txt'));
+    document.getElementById('docBtn').addEventListener('click', () => exportFile('doc'));
 </script>
 </body>
 </html>
