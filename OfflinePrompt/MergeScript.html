@@ -2,34 +2,118 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Studio Script Merger</title>
+    <title>Moira:ScriptMerge — Script & prompter</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
     <style>
-        body { font-family: system-ui, sans-serif; max-width: 750px; margin: 40px auto; padding: 20px; background: #f0f2f5; }
-        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.1); border: 1px solid #e1e4e8; }
-        h2 { margin-top: 0; font-size: 1.5rem; border-bottom: 2px solid #f0f2f5; padding-bottom: 10px; }
-        #fileList { list-style: none; padding: 0; margin: 20px 0; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }
-        .file-item { background: #fff; border-bottom: 1px solid #eee; padding: 10px 15px; display: flex; align-items: center; justify-content: space-between; cursor: grab; }
-        .file-item.dragging { opacity: 0.4; background: #f1f3f5; }
-        .remove-btn { background: #ffebe9; color: #cf222e; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 0.8rem; }
-        .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 25px; }
-        button.main-btn { padding: 16px; border-radius: 8px; font-weight: 700; cursor: pointer; border: none; color: white; }
-        .btn-txt { background: #4b5563; }
-        .btn-word { background: #1a73e8; }
-        button:disabled { background: #e4e6eb; color: #bcc0c4; cursor: not-allowed; }
-        #status { margin-top: 20px; text-align: center; font-size: 0.85rem; font-weight: 600; }
+        :root {
+            --accent: #3b82f6;
+            --bg: #000000;
+            --card-bg: #0f172a;
+            --border: #1e293b;
+            --text: #f8f9fa;
+            --text-dim: #94a3b8;
+        }
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body { 
+            background: var(--bg); 
+            color: var(--text); 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            max-width: 800px; 
+            margin: 40px auto; 
+            padding: 20px; 
+        }
+
+        .card { 
+            background: var(--card-bg); 
+            padding: 2.5rem; 
+            border-radius: 1rem; 
+            border: 1px solid var(--border);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+
+        .logo { font-size: 1.5rem; font-weight: 900; letter-spacing: 0.2em; text-transform: uppercase; margin-bottom: 0.5rem; }
+        .logo span { color: var(--accent); }
+        .subtitle { font-size: 0.75rem; font-weight: 700; letter-spacing: 0.2em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 2rem; }
+
+        .hint { color: var(--text-dim); font-size: 0.8rem; margin-bottom: 1.5rem; letter-spacing: 0.05em; line-height: 1.6; }
+        .hint b { color: var(--text); }
+
+        #fileList { list-style: none; padding: 0; margin: 20px 0; border: 1px solid var(--border); border-radius: 0.75rem; background: rgba(0,0,0,0.2); }
+        
+        .file-item { 
+            background: transparent; border-bottom: 1px solid var(--border); padding: 1rem; 
+            display: flex; align-items: center; justify-content: space-between;
+            cursor: grab; transition: background 150ms;
+        }
+        .file-item:last-child { border-bottom: none; }
+        .file-item.dragging { opacity: 0.3; background: var(--border); }
+        
+        .file-info { display: flex; align-items: center; flex-grow: 1; gap: 1rem; }
+        .file-info::before { content: "☰"; color: var(--text-dim); font-weight: bold; }
+        
+        .story-name { 
+            background: transparent; border: 1px solid transparent; color: var(--text);
+            padding: 0.5rem; border-radius: 0.5rem; width: 80%;
+            font-weight: 600; cursor: text;
+        }
+        .story-name:hover { background: rgba(255,255,255,0.05); }
+        .story-name:focus { outline: none; border-color: var(--accent); background: #000; }
+
+        .remove-btn { 
+            background: rgba(220, 38, 38, 0.1); color: #ef4444; border: 1px solid rgba(220, 38, 38, 0.2); 
+            padding: 0.5rem 1rem; border-radius: 0.5rem; cursor: pointer; font-weight: 700; font-size: 0.7rem; 
+            text-transform: uppercase; letter-spacing: 0.05em; transition: all 150ms;
+        }
+        .remove-btn:hover { background: #dc2626; color: white; }
+
+        .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 2rem; }
+        
+        .main-btn { 
+            padding: 1.25rem; border-radius: 0.75rem; font-weight: 900; letter-spacing: 0.1em;
+            text-transform: uppercase; cursor: pointer; border: none; transition: 150ms;
+        }
+        .btn-txt { background: #1e293b; color: var(--text-dim); border: 1px solid var(--border); }
+        .btn-txt:hover:not(:disabled) { background: #334155; color: white; }
+        
+        .btn-word { background: #1e40af; color: white; }
+        .btn-word:hover:not(:disabled) { background: #2563eb; }
+        
+        button:disabled { opacity: 0.3; cursor: not-allowed; }
+        
+        #filePicker { display: none; }
+        .upload-label {
+            display: block; text-align: center; padding: 2rem; border: 2px dashed var(--border);
+            border-radius: 0.75rem; cursor: pointer; color: var(--accent); font-weight: 800;
+            text-transform: uppercase; letter-spacing: 0.1em; transition: 150ms; margin-bottom: 1.5rem;
+        }
+        .upload-label:hover { border-color: var(--accent); background: rgba(59, 130, 246, 0.05); }
+
+        #status { margin-top: 2rem; text-align: center; font-size: 0.7rem; letter-spacing: 0.2em; text-transform: uppercase; color: var(--accent); opacity: 0.8; }
     </style>
 </head>
 <body>
 
 <div class="card">
-    <h2>Script Merger Pro</h2>
-    <input type="file" id="filePicker" accept=".rtf,.txt" multiple>
+    <div class="logo">Moira: <span>ScriptMerge</span></div>
+    <div class="subtitle">Script & Prompt Preparation</div>
+    
+    <p class="hint">Combine <b>.docx</b> and <b>.txt</b> files into a single running order. <br>Drag to reorder. Click a name to rename the story segment.</p>
+    
+    <label for="filePicker" class="upload-label">
+        <svg style="width:24px; vertical-align:middle; margin-right:10px" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.5"><path d="M12 4v16m8-8H4"></path></svg>
+        Add Stories (.docx / .txt)
+    </label>
+    <input type="file" id="filePicker" accept=".docx,.txt" multiple>
+    
     <ul id="fileList"></ul>
+
     <div class="actions">
-        <button id="txtBtn" class="main-btn btn-txt" disabled onclick="exportFile('txt')">Export Autocue (.txt)</button>
-        <button id="docBtn" class="main-btn btn-word" disabled onclick="exportFile('doc')">Export Studio Script (.doc)</button>
+        <button id="txtBtn" class="main-btn btn-txt" disabled onclick="exportFile('txt')">Export Prompt (.txt)</button>
+        <button id="docBtn" class="main-btn btn-word" disabled onclick="exportFile('doc')">Export Script (.doc)</button>
     </div>
-    <div id="status">Ready</div>
+    <div id="status">System Ready</div>
 </div>
 
 <script>
@@ -39,7 +123,11 @@
     let selectedFiles = [];
 
     filePicker.addEventListener('change', (e) => {
-        selectedFiles = [...selectedFiles, ...Array.from(e.target.files)];
+        const newFiles = Array.from(e.target.files).map(f => ({
+            file: f,
+            name: f.name.replace(/\.[^/.]+$/, "") 
+        }));
+        selectedFiles = [...selectedFiles, ...newFiles];
         updateUI();
         filePicker.value = ""; 
     });
@@ -48,22 +136,43 @@
         renderList();
         const hasFiles = selectedFiles.length > 0;
         document.querySelectorAll('.main-btn').forEach(b => b.disabled = !hasFiles);
-        status.innerText = hasFiles ? `${selectedFiles.length} files in queue.` : "Ready";
+        status.innerText = hasFiles ? `${selectedFiles.length} stories in sequence` : "System Ready";
     }
 
     function renderList() {
         fileList.innerHTML = '';
-        selectedFiles.forEach((file, index) => {
+        selectedFiles.forEach((item, index) => {
             const li = document.createElement('li');
             li.className = 'file-item';
             li.draggable = true;
             li.dataset.id = index;
-            li.innerHTML = `<span>☰ ${file.name}</span>`;
-            const btn = document.createElement('button');
-            btn.className = 'remove-btn';
-            btn.textContent = 'Remove';
-            btn.onclick = () => { selectedFiles.splice(index, 1); updateUI(); };
-            li.appendChild(btn);
+            
+            const info = document.createElement('div');
+            info.className = 'file-info';
+            
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'story-name';
+            nameSpan.contentEditable = true;
+            nameSpan.textContent = item.name;
+            
+            nameSpan.addEventListener('blur', () => {
+                selectedFiles[index].name = nameSpan.textContent;
+            });
+            nameSpan.addEventListener('mousedown', (e) => e.stopPropagation());
+
+            info.appendChild(nameSpan);
+            li.appendChild(info);
+
+            const remove = document.createElement('button');
+            remove.className = 'remove-btn';
+            remove.textContent = 'Remove';
+            remove.onclick = (e) => {
+                e.stopPropagation();
+                selectedFiles.splice(index, 1);
+                updateUI();
+            };
+
+            li.appendChild(remove);
             li.addEventListener('dragstart', () => li.classList.add('dragging'));
             li.addEventListener('dragend', () => li.classList.remove('dragging'));
             fileList.appendChild(li);
@@ -83,41 +192,55 @@
         else fileList.insertBefore(dragging, afterElement);
     });
 
+    async function getFileText(file) {
+        if (file.name.toLowerCase().endsWith('.docx')) {
+            const arrayBuffer = await file.arrayBuffer();
+            const result = await mammoth.extractRawText({ arrayBuffer: arrayBuffer });
+            return result.value;
+        } else {
+            return await file.text();
+        }
+    }
+
     async function exportFile(type) {
-        status.innerText = "Processing...";
+        status.innerText = "Processing Sequence...";
         const orderedItems = [...fileList.querySelectorAll('.file-item')];
         let txtOutput = "";
+        
         let docOutput = `<html><head><meta charset='utf-8'><style>
             @page { size: 8.5in 11in; margin: 0.5in; }
-            body { font-family: 'Arial', sans-serif; font-size: 11pt; }
-            table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
-            td { vertical-align: top; padding: 12px; border: 1px solid #ccc; }
-            .left-col { width: 25%; font-weight: bold; text-transform: uppercase; }
-            .right-col { width: 75%; line-height: 1.5; }
-            .tag-style { font-weight: bold; color: #444; }
+            body { font-family: 'Arial', sans-serif; font-size: 11pt; color: #000; }
+            table { width: 100%; border-collapse: collapse; margin-bottom: 20px; page-break-inside: avoid; }
+            td { vertical-align: top; padding: 15px; border: 1px solid #ccc; }
+            .left-col { width: 25%; font-weight: bold; text-transform: uppercase; font-size: 10pt; background: #f8f9fa; }
+            .right-col { width: 75%; padding-left: 15px; line-height: 1.6; }
+            .tag { font-weight: bold; background-color: #fef08a; padding: 0 4px; border-radius: 2px; }
+            .slug { color: #2563eb; text-decoration: underline; margin-bottom: 10px; display: block; font-size: 12pt; }
         </style></head><body>`;
 
         for (const item of orderedItems) {
-            const file = selectedFiles[item.dataset.id];
-            const baseName = file.name.replace(/\.[^/.]+$/, "").toUpperCase();
-            let content = await file.text();
+            const storyData = selectedFiles[item.dataset.id];
+            const cleanName = storyData.name.toUpperCase();
+            let content = await getFileText(storyData.file);
 
-            // Format (**NAME**) to [Name]
+            // Moira-style bold cleanup if any
             content = content.replace(/\(\*\*(.*?)\*\*\)/g, (match, p1) => {
                 return `[${p1.charAt(0).toUpperCase() + p1.slice(1).toLowerCase()}]`;
             });
 
-            // Extract technical tags ([On cam], [Take sot]) for the left column
             const techTags = [...content.matchAll(/\[(On cam|Take sot)\]/gi)].map(m => m[0]);
             const sideTagsHtml = techTags.map(t => `<div>${t}</div>`).join("");
 
-            txtOutput += `\n\n## ${baseName}\n\n${content}\n\n`;
+            txtOutput += `\n\n## ${cleanName}\n\n${content}\n\n`;
 
             docOutput += `
                 <table>
                     <tr>
-                        <td class="left-col">${baseName}<br><br>${sideTagsHtml}</td>
-                        <td class="right-col">${content.replace(/\n/g, '<br>')}</td>
+                        <td class="left-col">
+                            <span class="slug">${cleanName}</span>
+                            ${sideTagsHtml}
+                        </td>
+                        <td class="right-col">${content.replace(/\n/g, '<br>').replace(/\[(.*?)\]/g, '<span class="tag">[$1]</span>')}</td>
                     </tr>
                 </table>`;
         }
@@ -129,9 +252,9 @@
 
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = type === 'txt' ? "autocue.txt" : "studio_script.doc";
+        a.download = type === 'txt' ? "moira_prompt.txt" : "moira_studio_script.doc";
         a.click();
-        status.innerText = "Exported!";
+        status.innerText = "Export Complete";
     }
 </script>
 </body>
