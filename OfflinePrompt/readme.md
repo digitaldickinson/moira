@@ -51,6 +51,8 @@ Plain `.txt` files. The app also accepts pasted text directly on the load screen
 <img width="1249" height="1024" alt="image" src="https://github.com/user-attachments/assets/3c9b0124-226a-4f07-8c09-384438530da6" />
 
 
+If you want to generate text files properly formatted from multiple scripts, why not try Moira:Prompt:Script Merger at https://digitaldickinson.github.io/moira/OfflinePrompt/MergeScript.html 
+
 ## Controls
 
 ### Keyboard (Operator)
