@@ -8,6 +8,8 @@ A single-file, offline prompter built for broadcast emergencies. No server, no i
 
 Try it at https://digitaldickinson.github.io/moira/OfflinePrompt/moira-prompt.html 
 
+This was developed as part of the Moira newsroom system - https://github.com/digitaldickinson/moira 
+
 ---
 
 ## Quick Start
